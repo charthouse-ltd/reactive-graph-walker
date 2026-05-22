@@ -373,13 +373,13 @@ pub async fn prune_nodes(pool: &PgPool, min_importance: f32, days_untouched: i32
 
 /// Save self-model state to database (persistence across restarts)
 pub async fn save_self_model(pool: &PgPool, model: &crate::core::SelfModel) -> Result<(), sqlx::Error> {
-    let json = serde_json::to_value(model).unwrap_or_default();
+    let json_str = serde_json::to_string(model).unwrap_or_default();
     sqlx::query(
         "INSERT INTO runtime_settings (key, value, updated_at) \
          VALUES ('rgw_self_model', $1, NOW()) \
          ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()"
     )
-    .bind(json)
+    .bind(&json_str)
     .execute(pool)
     .await?;
     Ok(())
@@ -387,13 +387,13 @@ pub async fn save_self_model(pool: &PgPool, model: &crate::core::SelfModel) -> R
 
 /// Load self-model state from database (restore on startup)
 pub async fn load_self_model(pool: &PgPool) -> Result<Option<crate::core::SelfModel>, sqlx::Error> {
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+    let row: Option<(String,)> = sqlx::query_as(
         "SELECT value FROM runtime_settings WHERE key = 'rgw_self_model'"
     )
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.and_then(|(v,)| serde_json::from_value(v).ok()))
+    Ok(row.and_then(|(s,)| serde_json::from_str(&s).ok()))
 }
 
 /// Get detailed graph stats for API

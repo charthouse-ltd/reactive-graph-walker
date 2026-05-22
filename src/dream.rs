@@ -125,22 +125,27 @@ pub async fn dream(
         };
     }
 
-    // Phase 1: Inject noise — temporarily perturb edge weights
-    // (We don't actually modify the DB — we perturb in-memory during walks)
-
-    // Phase 2: Run many fast parallel walks with noise
-    let rt = tokio::runtime::Handle::current();
+    // Phase 2: Run many fast parallel walks with noise.
+    // WRAPPED in spawn_blocking: rayon's par_iter + block_on DB calls
+    // must NOT run on the async runtime's worker threads (deadlocks on
+    // constrained CPUs). The blocking pool absorbs the load.
     let pool_clone = pool.clone();
     let noise = config.noise_magnitude;
     let steps = config.steps;
+    let seeds = all_seeds.clone();
 
-    let dream_results: Vec<DreamWalkResult> = (0..config.n_walks)
-        .into_par_iter()
-        .map(|i| {
-            let seed = all_seeds[i % all_seeds.len()];
-            dream_walk_single(&pool_clone, seed, noise, steps, &rt)
-        })
-        .collect();
+    let dream_results: Vec<DreamWalkResult> = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        (0..config.n_walks)
+            .into_par_iter()
+            .map(|i| {
+                let seed = seeds[i % seeds.len()];
+                dream_walk_single(&pool_clone, seed, noise, steps, &rt)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
 
     // Phase 3: Analyze dream walks for novel connections
     let mut connections: Vec<DreamConnection> = Vec::new();
