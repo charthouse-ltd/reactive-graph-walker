@@ -32,6 +32,16 @@ pub struct MemoryEdge {
     pub traversal_count: i32,
 }
 
+/// A knowledge vector — immutable reference material from the compendium.
+/// Walkers cross-reference these to ground cognition in verified truth.
+#[derive(Debug, Clone)]
+pub struct KnowledgeNode {
+    pub id: i32,
+    pub skill_name: String,
+    pub layer: String,
+    pub title: String,
+}
+
 /// Connect to PostgreSQL
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
@@ -425,4 +435,46 @@ pub async fn detailed_stats(pool: &PgPool) -> Result<serde_json::Value, sqlx::Er
         })).collect::<Vec<_>>(),
         "domain_distribution": domain_dist.iter().map(|(d, c)| (d.clone(), *c)).collect::<std::collections::HashMap<_, _>>(),
     }))
+}
+
+/// Find knowledge vectors matching a domain (skill_name).
+/// Used by walkers to cross-reference memory nodes against immutable
+/// reference material — grounding cognition in verified truth.
+pub async fn find_knowledge_by_domain(
+    pool: &PgPool,
+    domain: &str,
+    limit: i32,
+) -> Result<Vec<KnowledgeNode>, sqlx::Error> {
+    if domain.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT id, skill_name, layer, COALESCE(title, '') as title \
+         FROM knowledge_vectors \
+         WHERE skill_name = $1 \
+         LIMIT $2"
+    )
+    .bind(domain)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(|r| KnowledgeNode {
+        id: r.get("id"),
+        skill_name: r.get("skill_name"),
+        layer: r.get("layer"),
+        title: r.get("title"),
+    }).collect())
+}
+
+/// Get all distinct knowledge domains (skill_names) as a HashSet.
+/// Pre-fetched by walk_parallel / dream() so sync walk functions
+/// can do O(1) domain lookups without an async DB call.
+pub async fn all_knowledge_domains(pool: &PgPool) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT skill_name FROM knowledge_vectors WHERE skill_name != ''"
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(s,)| s).collect())
 }

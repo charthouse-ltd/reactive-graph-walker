@@ -174,6 +174,11 @@ impl Diverger {
         tokio::spawn(async move {
             let walk_semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_walks));
 
+            // ── Pre-fetch knowledge domains once for all diverger walks ──
+            let knowledge_domains = Arc::new(
+                crate::db::all_knowledge_domains(&pool).await.unwrap_or_default()
+            );
+
             tracing::info!("[diverger] Reactor started. Waiting for edge changes...");
 
             // Circuit breaker state
@@ -232,11 +237,9 @@ impl Diverger {
                         });
 
                         // Apply energy decay since this node was last updated.
-                        // (energy leaks over time — prevents unbounded accumulation)
-                        // Decay is clocked off last_update, NOT last_fired: a node
-                        // that has never fired has last_fired=0 (epoch), which would
-                        // make dt astronomical and wipe all injected energy before it
-                        // could ever accumulate to threshold.
+                        // Decay is clocked off last_update, NOT last_fired: a node that
+                        // has never fired has last_fired=0 (epoch) → dt astronomical →
+                        // injected energy wiped before it can accumulate to threshold.
                         let dt = (now - node.last_update).max(0.0) as f32;
                         node.energy = (node.energy - config.energy_decay_rate * dt).max(0.0);
                         node.last_update = now;
@@ -293,11 +296,11 @@ impl Diverger {
 
                     let sm_walk = self_model.clone();
                     let julian_url = julian_url_outer.clone();
-                    tokio::spawn(async move {
-                        // Preload the seed's neighborhood (radius 1) before walking.
+                        let kd = knowledge_domains.clone();
+                        tokio::spawn(async move {
+                        // Preload the seed's neighborhood (radius 1) before walking:
                         // walk_single is cache-only with NO DB fallback, so without a
-                        // preload it dead-ends at hop 1 and never reaches the motor's
-                        // hops>=3 gate — spontaneous walks fire but never act.
+                        // preload it dead-ends at hop 1 and never reaches the motor.
                         let cache = std::sync::Arc::new(
                             crate::edge_cache::EdgeCache::new(pool.clone())
                         );
@@ -305,23 +308,21 @@ impl Diverger {
 
                         // Fire the walk on a blocking thread (true parallelism)
                         let cache_walk = cache.clone();
-                        let pool_walk = pool.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let mut sm = sm_walk.blocking_lock().clone();
                             let collective = std::sync::Arc::new(std::sync::Mutex::new(
                                 crate::graph::WalkerCollective::new()
                             ));
                             crate::walker::walk_single(
-                                &pool_walk, &*cache_walk, node_id,
+                                &*cache_walk, node_id,
                                 WalkerBias::all()[node_id as usize % WalkerBias::all().len()],
-                                &emo, steps, &mut sm, &collective, None,
+                                &emo, steps, &mut sm, &collective, None, &kd,
                             )
                         })
                         .await;
 
                         if let Ok(result) = result {
-                            // Hebbian: reinforce the edges this walk traversed
-                            // (also bumps last_traversed / traversal_count).
+                            // Hebbian: reinforce the edges this walk traversed.
                             if !result.edges_traversed.is_empty() {
                                 cache.strengthen_edges(&result.edges_traversed, 0.02);
                             }

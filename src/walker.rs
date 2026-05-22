@@ -26,7 +26,6 @@ use crate::graph::*;
 /// Walkers leave trails (visited nodes, dead ends, surprises) and
 /// read each other's trails to diversify exploration.
 pub fn walk_single(
-    pool: &PgPool,
     cache: &EdgeCache,
     seed_id: i32,
     bias: WalkerBias,
@@ -35,6 +34,7 @@ pub fn walk_single(
     self_model: &mut SelfModel,
     collective: &Arc<Mutex<WalkerCollective>>,
     learned_bias: Option<&crate::graph::LearnedBias>,
+    knowledge_domains: &std::collections::HashSet<String>,
 ) -> WalkerResult {
     let mut result = WalkerResult {
         bias,
@@ -222,6 +222,23 @@ pub fn walk_single(
                 // THIS IS COGNITION: the walk changes the thinker,
                 // the changed thinker changes the walk.
 
+                // ── Knowledge cross-reference: ground walk in verified truth ──
+                // Check the immutable knowledge store to see if this domain
+                // has reference material. Anchoring cognition in the compendium
+                // diversifies the graph and prevents monomania.
+                if knowledge_domains.contains(&next_domain) {
+                    let anchor = Signal::new(
+                        "knowledge_anchor",
+                        &format!(
+                            "Grounded in verified knowledge: {} domain",
+                            next_domain
+                        ),
+                    )
+                    .with_domain(&next_domain)
+                    .with_intensity(0.35);
+                    core::process(anchor, self_model);
+                }
+
                 prev_domain = next_domain;
         }
 
@@ -290,8 +307,6 @@ pub async fn walk_parallel(
         })
         .collect();
 
-    let pool_clone = pool.clone();
-
     // ── Edge cache: preload seed neighborhoods for fast walks ──
     let cache = EdgeCache::new(pool.clone());
     let _ = cache.preload_radius(&seeds).await;
@@ -310,6 +325,10 @@ pub async fn walk_parallel(
     // Create shared stigmergic collective — walkers leave trails for each other
     let collective = Arc::new(Mutex::new(WalkerCollective::new()));
 
+    // ── Pre-fetch knowledge domains for walker cross-reference ──
+    let knowledge_domains = db::all_knowledge_domains(pool).await.unwrap_or_default();
+    tracing::debug!("[walker] Loaded {} knowledge domains for cross-reference", knowledge_domains.len());
+
     let walk_start = Instant::now();
     let results: Vec<(WalkerResult, SelfModel)> = configs
         .par_iter()
@@ -318,11 +337,11 @@ pub async fn walk_parallel(
             let mut sm = base_sm.clone();  // Each walker gets its own copy
             let collective = Arc::clone(&collective);
             let learned = base_sm.learned_biases.get(i);
-            let result = walk_single(&pool_clone, &cache, *seed, *bias, &EmotionalState {
+            let result = walk_single(&cache, *seed, *bias, &EmotionalState {
                 valence: sm.valence,
                 arousal: sm.arousal,
                 energy: sm.energy,
-            }, steps, &mut sm, &collective, learned);
+            }, steps, &mut sm, &collective, learned, &knowledge_domains);
             (result, sm)
         })
         .collect();

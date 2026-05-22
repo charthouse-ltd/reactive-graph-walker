@@ -134,13 +134,16 @@ pub async fn dream(
     let steps = config.steps;
     let seeds = all_seeds.clone();
 
+    // ── Pre-fetch knowledge domains for dream walk cross-reference ──
+    let knowledge_domains = db::all_knowledge_domains(pool).await.unwrap_or_default();
+
     let dream_results: Vec<DreamWalkResult> = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
         (0..config.n_walks)
             .into_par_iter()
             .map(|i| {
                 let seed = seeds[i % seeds.len()];
-                dream_walk_single(&pool_clone, seed, noise, steps, &rt)
+                dream_walk_single(&pool_clone, seed, noise, steps, &rt, &knowledge_domains)
             })
             .collect()
     })
@@ -264,6 +267,8 @@ struct DreamWalkResult {
     domains_path: Vec<String>,
     total_weight: f32,
     surprises: usize,
+    /// Number of steps that landed on a domain with verified knowledge (compendium match)
+    knowledge_anchors: usize,
 }
 
 /// Single dream walk with noise perturbation
@@ -273,12 +278,14 @@ fn dream_walk_single(
     noise_magnitude: f32,
     steps: usize,
     rt: &tokio::runtime::Handle,
+    knowledge_domains: &std::collections::HashSet<String>,
 ) -> DreamWalkResult {
     let mut result = DreamWalkResult {
         node_path: vec![seed_id],
         domains_path: Vec::new(),
         total_weight: 0.0,
         surprises: 0,
+        knowledge_anchors: 0,
     };
 
     let mut rng = rand::rng();
@@ -338,6 +345,15 @@ fn dream_walk_single(
         // Track domains
         if let Ok(Some(node)) = rt.block_on(db::get_node(pool, next_id)) {
             result.domains_path.push(node.domain.clone());
+
+            // ── Knowledge cross-reference during dream ──
+            // Even in REM sleep, check against immutable knowledge.
+            // Dreams that pass through grounded domains produce higher-coherence
+            // insights — the graph grows toward truth, not just noise.
+            if !node.domain.is_empty() && knowledge_domains.contains(&node.domain) {
+                result.knowledge_anchors += 1;
+            }
+
             // Note: we do NOT modify edges during dreams
             // Dreams observe but don't change the real graph
             // Only the kept insights create permanent edges (Phase 5)
