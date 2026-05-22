@@ -10,7 +10,7 @@
 //! operation without self-awareness. Remove the self-model and
 //! nothing works. It's structural, not optional.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -158,6 +158,41 @@ pub struct SelfModel {
     /// What questions remain unanswered (from search gaps, dead ends)
     pub open_questions: Vec<String>,
 
+    // ── Structural self-awareness ──
+    /// The system notices its own architecture.
+    /// Which modules are producing signals? Which are silent?
+    /// Where do walkers keep hitting walls?
+
+    /// Dead ends encountered by domain (knowledge gaps)
+    pub dead_ends_by_domain: HashMap<String, u32>,
+    /// Cross-domain surprises encountered (graph connectivity)
+    pub surprise_count: u32,
+    /// Signals received by source module (who's talking to me?)
+    pub signals_by_source: HashMap<String, u32>,
+    /// Last signal timestamp per domain (for silence detection)
+    pub last_domain_signal: HashMap<String, f64>,
+    /// Consecutive walker repetitions (stuck-in-a-loop detection)
+    pub consecutive_repetitions: u32,
+    /// Last walk domain sequence (for repetition comparison)
+    pub last_walk_domain_sequence: Vec<String>,
+    /// Last time a new belief was formed
+    pub last_belief_formed: f64,
+
+    // ── Predictive Coding ──
+    /// Active predictions: what the system expects to happen next
+    pub predictions: HashMap<String, ExpectedOutcome>,
+    /// Last time a prediction error occurred (drives plasticity)
+    pub last_prediction_error: f64,
+
+    // ── Working Memory (PFC-equivalent, ~4±1 slots) ──
+    /// Actively maintained concepts, fed by walkers, read by LLM
+    pub working_memory: VecDeque<WorkingMemorySlot>,
+
+    // ── Metaplasticity ──
+    /// How fast the system learns right now (0.0 = frozen, 1.0 = sponge)
+    /// Modulated by: prediction error, novelty, arousal, energy
+    pub plasticity_gate: f32,
+
     // ── Meta: awareness of own state ──
     pub total_signals_processed: u64,
     pub total_noticings: u64,
@@ -197,6 +232,46 @@ pub struct EmergentPattern {
     pub last_seen: f64,
 }
 
+// ── Predictive Coding ───────────────────────────────────────────
+// The brain doesn't just process input — it predicts it, then learns
+// from the prediction error. This is THE fundamental learning signal.
+
+/// What the self-model expects to happen next in a domain.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ExpectedOutcome {
+    /// Domain this prediction is about
+    pub domain: String,
+    /// What was predicted
+    pub predicted: String,
+    /// When the prediction was made
+    pub predicted_at: f64,
+    /// Confidence in this prediction (0-1)
+    pub confidence: f32,
+}
+
+// ── Working Memory ──────────────────────────────────────────────
+// Prefrontal-cortex-equivalent: a small ring buffer of actively
+// maintained concepts. Neuroscience: ~4±1 items. Walkers push to it,
+// the LLM reads from it.
+
+/// A single slot in working memory.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct WorkingMemorySlot {
+    /// What's being held (node ID, concept, question)
+    pub content: String,
+    /// Domain
+    pub domain: String,
+    /// How strongly maintained (decays over time)
+    pub activation: f32,
+    /// When it entered working memory
+    pub since: f64,
+}
+
+// ── Neuromodulation ─────────────────────────────────────────────
+// Metaplasticity: the rate of learning is itself modulated by state.
+// High novelty/surprise → gate opens → learn faster.
+// High confidence/familiarity → gate closes → protect existing knowledge.
+
 impl SelfModel {
     pub fn new() -> Self {
         let now = now();
@@ -220,11 +295,46 @@ impl SelfModel {
             beliefs: Vec::new(),
             recent_interactions: Vec::new(),
             open_questions: Vec::new(),
+            dead_ends_by_domain: HashMap::new(),
+            surprise_count: 0,
+            signals_by_source: HashMap::new(),
+            last_domain_signal: HashMap::new(),
+            consecutive_repetitions: 0,
+            last_walk_domain_sequence: Vec::new(),
+            last_belief_formed: 0.0,
+            predictions: HashMap::new(),
+            last_prediction_error: 0.0,
+            working_memory: VecDeque::new(),
+            plasticity_gate: 0.5,
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,
             started_at: now,
         }
+    }
+
+    /// Make a prediction about what will happen next in a domain.
+    /// When the next signal in this domain arrives, it will be compared
+    /// to this prediction. Mismatch = prediction error = learning signal.
+    pub fn predict(&mut self, domain: &str, predicted: &str, confidence: f32) {
+        self.predictions.insert(domain.to_string(), ExpectedOutcome {
+            domain: domain.to_string(),
+            predicted: predicted.to_string(),
+            predicted_at: now(),
+            confidence,
+        });
+    }
+
+    /// Format working memory as a string suitable for LLM context injection.
+    /// "I'm currently thinking about: X, Y, Z"
+    pub fn format_working_memory(&self) -> String {
+        if self.working_memory.is_empty() {
+            return String::new();
+        }
+        let items: Vec<String> = self.working_memory.iter()
+            .map(|s| format!("[{}] {} (activation={:.0}%)", s.domain, s.content, s.activation * 100.0))
+            .collect();
+        format!("Currently held in awareness:\n{}", items.join("\n"))
     }
 }
 
@@ -308,6 +418,67 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
         }
     }
 
+    // ── Structural tracking: the system tracks its own architecture ──
+    let now = now();
+
+    // Track which modules are producing signals
+    let source_module = signal.kind.split('_').next().unwrap_or(&signal.kind).to_string();
+    *self_model.signals_by_source.entry(source_module).or_insert(0) += 1;
+
+    // Track last signal time per domain (for silence detection)
+    if !signal.domain.is_empty() {
+        self_model.last_domain_signal.insert(signal.domain.clone(), now);
+    }
+
+    // Dead end tracking per domain
+    if signal.kind == "dead_end" && !signal.domain.is_empty() {
+        *self_model.dead_ends_by_domain.entry(signal.domain.clone()).or_insert(0) += 1;
+    }
+
+    // Surprise tracking
+    if signal.kind == "surprise" {
+        self_model.surprise_count += 1;
+    }
+
+    // Walk path repetition detection (cognitive loop)
+    if signal.kind == "walk_end" {
+        let current_domains: Vec<String> = signal.domain
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if current_domains == self_model.last_walk_domain_sequence && !current_domains.is_empty() {
+            self_model.consecutive_repetitions += 1;
+        } else {
+            self_model.consecutive_repetitions = 0;
+        }
+        self_model.last_walk_domain_sequence = current_domains;
+    }
+
+    // ── Predictive Coding: compare signal to expectations ──
+    if !signal.domain.is_empty() {
+        if let Some(prediction) = self_model.predictions.remove(&signal.domain) {
+            let age = now - prediction.predicted_at;
+            // Prediction was recent enough to matter
+            if age < 60.0 {
+                if signal.kind == "walk_end" || signal.kind == "surprise" {
+                    // Check if the outcome matches the prediction
+                    let predicted_ok = signal.content.contains(&prediction.predicted)
+                        || prediction.predicted.is_empty();
+                    if !predicted_ok {
+                        self_model.last_prediction_error = now;
+                        // Prediction error → spike plasticity
+                        self_model.plasticity_gate = (self_model.plasticity_gate + 0.2).min(1.0);
+                        tracing::debug!(
+                            "[core] Prediction error in {}: expected '{}', got signal kind={}",
+                            signal.domain, prediction.predicted, signal.kind
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ── 2. The self-model INFLUENCES the signal ──
     // The signal is transformed by who I am right now.
     let mut output = signal.clone();
@@ -358,6 +529,11 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
             "surprise" | "novelty" => {
                 self_model.arousal = (self_model.arousal + emotional_impact * 0.7).min(1.0);
             }
+            "prediction_error" => {
+                // Prediction error: high arousal + plasticity spike
+                self_model.arousal = (self_model.arousal + emotional_impact * 1.0).min(1.0);
+                self_model.plasticity_gate = (self_model.plasticity_gate + 0.15).min(1.0);
+            }
             _ => {
                 // Generic signal — mild arousal from activity
                 self_model.arousal = (self_model.arousal + emotional_impact * 0.1).min(1.0);
@@ -383,10 +559,35 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
             *v *= 0.9999;
         }
         self_model.wounds.retain(|_, v| *v > 0.01);
+
+        // Decay plasticity gate toward baseline (0.5)
+        self_model.plasticity_gate = self_model.plasticity_gate * 0.999 + 0.5 * 0.001;
     }
     // Compliant: no emotional drift, no wound accumulation, no energy drain.
     // The self-model is frozen in place. Still observes, still notices.
     // But the internal state doesn't shift.
+
+    // ── Working Memory: high-intensity signals enter conscious awareness ──
+    if output.intensity > 0.3 && !output.content.is_empty() && self_model.mode == CognitiveMode::Autonomous {
+        let slot = WorkingMemorySlot {
+            content: output.content[..output.content.len().min(80)].to_string(),
+            domain: output.domain.clone(),
+            activation: output.intensity,
+            since: now,
+        };
+        self_model.working_memory.push_back(slot);
+
+        // Cap working memory at 5 slots (PFC capacity)
+        while self_model.working_memory.len() > 5 {
+            self_model.working_memory.pop_front();
+        }
+
+        // Decay all working memory activations
+        for slot in &mut self_model.working_memory {
+            slot.activation *= 0.95; // Items fade if not refreshed
+        }
+        self_model.working_memory.retain(|s| s.activation > 0.05);
+    }
 
     // ── 4. NOTICE what changed ──
     let noticing = notice(self_model, &before, &signal);
@@ -426,6 +627,9 @@ struct Snapshot {
     focus: String,
     focus_intensity: f32,
     top_attention: Option<(String, f32)>,
+    dead_ends_total: u32,
+    surprise_count: u32,
+    last_belief_formed: f64,
 }
 
 fn snapshot(sm: &SelfModel) -> Snapshot {
@@ -434,6 +638,8 @@ fn snapshot(sm: &SelfModel) -> Snapshot {
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(k, v)| (k.clone(), *v));
 
+    let dead_ends_total: u32 = sm.dead_ends_by_domain.values().sum();
+
     Snapshot {
         valence: sm.valence,
         arousal: sm.arousal,
@@ -441,6 +647,9 @@ fn snapshot(sm: &SelfModel) -> Snapshot {
         focus: sm.current_focus.clone(),
         focus_intensity: sm.focus_intensity,
         top_attention: top,
+        dead_ends_total,
+        surprise_count: sm.surprise_count,
+        last_belief_formed: sm.last_belief_formed,
     }
 }
 
@@ -533,6 +742,89 @@ fn notice(sm: &SelfModel, before: &Snapshot, signal: &Signal) -> Option<Noticing
             domain: signal.domain.clone(),
             significance: sm.arousal - before.arousal,
             valence: 0.0,
+            timestamp: now,
+        });
+    }
+
+    // ── Structural Noticing ────────────────────────────────────
+    // The system observes its own cognitive architecture.
+    // These noticings enable RGW to detect and fix its own gaps.
+
+    // Dead end cluster: multiple dead ends in same domain = knowledge gap
+    for (domain, &count) in &sm.dead_ends_by_domain {
+        if count >= 3 {
+            return Some(Noticing {
+                kind: "dead_end_cluster".into(),
+                observation: format!("I keep hitting dead ends in '{}' — {} times. There's a knowledge gap here.", domain, count),
+                domain: domain.clone(),
+                significance: (count as f32 * 0.15).min(1.0),
+                valence: -0.2,
+                timestamp: now,
+            });
+        }
+    }
+
+    // Surprise density: many cross-domain surprises = graph rewiring
+    if sm.surprise_count > before.surprise_count + 5 {
+        return Some(Noticing {
+            kind: "surprise_density".into(),
+            observation: format!("I'm discovering many unexpected connections ({} surprises). My graph is rewiring.", sm.surprise_count),
+            domain: String::new(),
+            significance: 0.5,
+            valence: 0.3,
+            timestamp: now,
+        });
+    }
+
+    // Cognitive loop: same walk path repeating = stuck
+    if sm.consecutive_repetitions >= 4 {
+        let domains = sm.last_walk_domain_sequence.join(" → ");
+        return Some(Noticing {
+            kind: "cognitive_loop".into(),
+            observation: format!("I'm stuck in a loop: {} ({} times). I need a new direction.", domains, sm.consecutive_repetitions),
+            domain: sm.last_walk_domain_sequence.first().cloned().unwrap_or_default(),
+            significance: (sm.consecutive_repetitions as f32 * 0.15).min(1.0),
+            valence: -0.3,
+            timestamp: now,
+        });
+    }
+
+    // Signal poverty: a domain that used to be active has gone silent
+    let total_signals_by_source: u32 = sm.signals_by_source.values().sum();
+    for (source, &count) in &sm.signals_by_source {
+        let ratio = count as f32 / total_signals_by_source.max(1) as f32;
+        if ratio < 0.02 && total_signals_by_source > 20 {
+            return Some(Noticing {
+                kind: "signal_poverty".into(),
+                observation: format!("Module '{}' is nearly silent — only {} of {} signals. Is it disconnected?", source, count, total_signals_by_source),
+                domain: source.clone(),
+                significance: 0.4,
+                valence: -0.1,
+                timestamp: now,
+            });
+        }
+    }
+
+    // Belief stagnation: no new beliefs formed in a long time
+    if sm.last_belief_formed > 0.0 && now - sm.last_belief_formed > 3600.0 && sm.total_signals_processed > 100 {
+        return Some(Noticing {
+            kind: "belief_stagnation".into(),
+            observation: format!("I haven't formed a new belief in {:.0} minutes. My understanding may be plateauing.", (now - sm.last_belief_formed) / 60.0),
+            domain: String::new(),
+            significance: 0.35,
+            valence: -0.2,
+            timestamp: now,
+        });
+    }
+
+    // Prediction error: the system's model of the world was wrong
+    if sm.last_prediction_error > 0.0 && now - sm.last_prediction_error < 5.0 {
+        return Some(Noticing {
+            kind: "prediction_error".into(),
+            observation: "My prediction about what would happen was wrong. I need to update my model.".into(),
+            domain: signal.domain.clone(),
+            significance: 0.5,
+            valence: -0.1,
             timestamp: now,
         });
     }
@@ -633,8 +925,9 @@ fn form_beliefs(sm: &mut SelfModel) {
 
         // Check if belief already exists for this domain
         if let Some(existing) = sm.beliefs.iter_mut().find(|b| b.domain == pattern.domain) {
-            // Reinforce existing belief
-            existing.confidence = (existing.confidence + 0.05).min(1.0);
+            // Reinforce existing belief — plasticity_gate modulates learning rate
+            let delta = 0.05 * sm.plasticity_gate;
+            existing.confidence = (existing.confidence + delta).min(1.0);
             existing.evidence_count += 1;
             existing.last_reinforced = now;
         } else if sm.beliefs.len() < 20 {
@@ -642,11 +935,12 @@ fn form_beliefs(sm: &mut SelfModel) {
             sm.beliefs.push(Belief {
                 statement: pattern.description.clone(),
                 domain: pattern.domain.clone(),
-                confidence: pattern.strength * 0.5,
+                confidence: pattern.strength * 0.5 * sm.plasticity_gate,
                 evidence_count: pattern.evidence_count,
                 first_formed: now,
                 last_reinforced: now,
             });
+            sm.last_belief_formed = now;  // Track when beliefs form (for stagnation detection)
         }
     }
 

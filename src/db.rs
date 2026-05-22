@@ -217,6 +217,162 @@ pub async fn prune_edges(pool: &PgPool, decay_per_day: f32, min_weight: f32) -> 
     Ok((decayed, deleted))
 }
 
+// ── Node Creation & Embedding Writes ────────────────────────────
+// RGW must be able to write back to the graph. The walker discovers
+// patterns → embeds them → creates nodes → creates edges.
+// This closes the autonomous growth loop.
+
+/// Create a new memory node with an embedding vector.
+/// Returns the new node ID. This is how the graph GROWS autonomously.
+pub async fn create_memory_node(
+    pool: &PgPool,
+    content: &str,
+    domain: &str,
+    embedding: &[f32],
+    importance: f32,
+    valence: f32,
+    arousal: f32,
+) -> Result<i32, sqlx::Error> {
+    // pgvector expects the embedding as a formatted string: '[0.1,0.2,...]'
+    let emb_str = format!(
+        "[{}]",
+        embedding.iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let row = sqlx::query(
+        "INSERT INTO memory_vectors (content, domain, embedding, importance, valence, arousal, access_count, created_at) \
+         VALUES ($1, $2, $3::vector, $4, $5, $6, 0, NOW()) \
+         ON CONFLICT (content, domain) DO UPDATE SET \
+             importance = GREATEST(memory_vectors.importance, $4), \
+             access_count = memory_vectors.access_count + 1 \
+         RETURNING id"
+    )
+    .bind(content)
+    .bind(domain)
+    .bind(&emb_str)
+    .bind(importance)
+    .bind(valence)
+    .bind(arousal)
+    .fetch_one(pool)
+    .await?;
+
+    let id: i32 = row.get("id");
+    tracing::debug!("[db] Created/updated memory node {}: {} (domain={})", id, &content[..content.len().min(60)], domain);
+    Ok(id)
+}
+
+/// Update an existing node's embedding (memory reconsolidation).
+/// When the self-model's understanding of a concept changes,
+/// the embedding should drift to reflect the new understanding.
+pub async fn update_node_embedding(
+    pool: &PgPool,
+    node_id: i32,
+    embedding: &[f32],
+) -> Result<(), sqlx::Error> {
+    let emb_str = format!(
+        "[{}]",
+        embedding.iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    sqlx::query(
+        "UPDATE memory_vectors SET embedding = $1::vector, updated_at = NOW() WHERE id = $2"
+    )
+    .bind(&emb_str)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+
+    tracing::debug!("[db] Updated embedding for node {}", node_id);
+    Ok(())
+}
+
+/// Find nodes with embeddings similar to the given vector.
+/// Uses pgvector's cosine distance operator (<=>).
+/// Returns (node_id, similarity_score) ordered by most similar.
+pub async fn find_similar_nodes(
+    pool: &PgPool,
+    embedding: &[f32],
+    limit: i32,
+    threshold: f32,  // max cosine distance (0 = identical, 2 = opposite)
+) -> Result<Vec<(i32, f32, String)>, sqlx::Error> {
+    let emb_str = format!(
+        "[{}]",
+        embedding.iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let rows = sqlx::query(
+        "SELECT id, 1.0 - (embedding <=> $1::vector) AS similarity, \
+                COALESCE(content, '') AS content \
+         FROM memory_vectors \
+         WHERE embedding IS NOT NULL \
+           AND embedding <=> $1::vector < $2 \
+         ORDER BY embedding <=> $1::vector \
+         LIMIT $3"
+    )
+    .bind(&emb_str)
+    .bind(threshold)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(|r| {
+        (r.get("id"), r.get("similarity"), r.get("content"))
+    }).collect())
+}
+
+/// Update node metadata (importance, access_count, valence, arousal).
+pub async fn bump_node(
+    pool: &PgPool,
+    node_id: i32,
+    importance_delta: f32,
+    valence_delta: f32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE memory_vectors SET \
+         importance = LEAST(10.0, GREATEST(0.0, importance + $1)), \
+         valence = LEAST(1.0, GREATEST(-1.0, valence + $2)), \
+         access_count = access_count + 1, \
+         updated_at = NOW() \
+         WHERE id = $3"
+    )
+    .bind(importance_delta)
+    .bind(valence_delta)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Synaptic node pruning: remove nodes with importance below threshold,
+/// or nodes that haven't been accessed in a long time.
+pub async fn prune_nodes(pool: &PgPool, min_importance: f32, days_untouched: i32) -> Result<i64, sqlx::Error> {
+    let deleted = sqlx::query(
+        "DELETE FROM memory_vectors \
+         WHERE (importance < $1 AND access_count < 3) \
+            OR (updated_at < NOW() - ($2 || ' days')::INTERVAL AND importance < 2.0)"
+    )
+    .bind(min_importance)
+    .bind(days_untouched)
+    .execute(pool)
+    .await?
+    .rows_affected() as i64;
+
+    if deleted > 0 {
+        tracing::info!("[db] Pruned {} low-importance/stale nodes", deleted);
+    }
+    Ok(deleted)
+}
+
 /// Save self-model state to database (persistence across restarts)
 pub async fn save_self_model(pool: &PgPool, model: &crate::core::SelfModel) -> Result<(), sqlx::Error> {
     let json = serde_json::to_value(model).unwrap_or_default();

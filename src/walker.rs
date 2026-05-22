@@ -3,8 +3,13 @@
 //! Each walker traverses the graph independently on its own thread (via rayon).
 //! The walk changes the graph: traversed edges get strengthened.
 //! Multiple walkers with different biases produce convergence/divergence signals.
+//!
+//! Walkers now share a stigmergic collective context — they leave trails
+//! for each other (visited nodes, dead ends, surprise domains) and
+//! modulate edge scoring based on what other walkers have discovered.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rand::Rng;
@@ -16,6 +21,9 @@ use crate::db;
 use crate::graph::*;
 
 /// Run a single walker through the graph.
+/// Now accepts a shared WalkerCollective for inter-walker stigmergy.
+/// Walkers leave trails (visited nodes, dead ends, surprises) and
+/// read each other's trails to diversify exploration.
 pub fn walk_single(
     pool: &PgPool,
     seed_id: i32,
@@ -24,6 +32,7 @@ pub fn walk_single(
     steps: usize,
     rt: &tokio::runtime::Handle,
     self_model: &mut SelfModel,
+    collective: &Arc<Mutex<WalkerCollective>>,
 ) -> WalkerResult {
     let mut result = WalkerResult {
         bias,
@@ -57,6 +66,10 @@ pub fn walk_single(
 
         if edges.is_empty() {
             result.dead_ends += 1;
+            // Write dead end to collective so other walkers avoid this node
+            if let Ok(mut c) = collective.try_lock() {
+                c.dead_end_nodes.insert(current_id);
+            }
             // Self-model notices: dead end
             let signal = Signal::new("dead_end", &format!("No edges from node {}", current_id))
                 .with_intensity(0.2);
@@ -65,8 +78,10 @@ pub fn walk_single(
         }
 
         // Score each edge — mode determines whether emotion participates
+        // In Autonomous mode: full context scoring (collective + self-model)
+        // In Compliant mode: pure weight-based, no emotional/collective influence
         let scored: Vec<(&db::MemoryEdge, f32)> = if self_model.mode == core::CognitiveMode::Compliant {
-            // Compliant: pure weight-based scoring, no emotional influence
+            // Compliant: pure weight-based scoring, no emotional/collective influence
             edges.iter().map(|e| {
                 let score = bias.score_edge_compliant(
                     &e.edge_type,
@@ -76,19 +91,44 @@ pub fn walk_single(
                 (e, score)
             }).collect()
         } else {
-            // Autonomous: the self-model's emotional state colors scoring
+            // Autonomous: full context scoring
+            // Read collective state (non-blocking try_lock)
+            let collective_lock = collective.try_lock().ok();
+            let collective_snapshot: Option<&WalkerCollective> = collective_lock.as_deref();
             let current_emotion = EmotionalState {
                 valence: self_model.valence,
                 arousal: self_model.arousal,
                 energy: self_model.energy,
             };
+
+            // Extract working memory domains for scoring
+            let wm_domains: HashSet<String> = self_model.working_memory
+                .iter()
+                .map(|s| s.domain.clone())
+                .collect();
+
             edges.iter().map(|e| {
-                let score = bias.score_edge(
+                let next_id = if e.source_id == current_id { e.target_id } else { e.source_id };
+                // Fetch domain for the next node (fallback to empty if unavailable)
+                let next_domain = rt.block_on(db::get_node(pool, next_id))
+                    .ok()
+                    .flatten()
+                    .map(|n| n.domain)
+                    .unwrap_or_default();
+
+                let score = bias.score_edge_with_context(
                     &e.edge_type,
                     e.weight,
                     e.emotional_charge,
                     e.traversal_count,
                     &current_emotion,
+                    collective_snapshot,
+                    next_id,
+                    &next_domain,
+                    &self_model.beliefs,
+                    &self_model.wounds,
+                    &self_model.competencies,
+                    &wm_domains,
                 );
                 (e, score)
             }).collect()
@@ -129,6 +169,22 @@ pub fn walk_single(
         if let Ok(Some(node)) = rt.block_on(db::get_node(pool, next_id)) {
             if !node.domain.is_empty() {
                 let is_surprise = !prev_domain.is_empty() && prev_domain != node.domain;
+
+                // ── WRITE to collective: leave trails for other walkers ──
+                if let Ok(mut c) = collective.try_lock() {
+                    *c.visited_nodes.entry(next_id).or_insert(0) += 1;
+                    if !node.domain.is_empty() {
+                        *c.active_domains.entry(node.domain.clone()).or_insert(0) += 1;
+                    }
+                    if is_surprise {
+                        c.surprise_domains.insert(node.domain.clone());
+                    }
+                    // Drift collective emotion toward this walker's state
+                    let alpha = 0.1; // Slow drift — collective is stable
+                    c.drift_valence = c.drift_valence * (1.0 - alpha) + self_model.valence * alpha;
+                    c.drift_arousal = c.drift_arousal * (1.0 - alpha) + self_model.arousal * alpha;
+                }
+
                 if is_surprise {
                     result.surprises += 1;
                 }
@@ -227,16 +283,20 @@ pub async fn walk_parallel(
     // Like the brain: process in parallel, integrate in global workspace
     let base_sm = self_model.lock().unwrap().clone();
 
+    // Create shared stigmergic collective — walkers leave trails for each other
+    let collective = Arc::new(Mutex::new(WalkerCollective::new()));
+
     let walk_start = Instant::now();
     let results: Vec<(WalkerResult, SelfModel)> = configs
         .par_iter()
         .map(|(seed, bias)| {
             let mut sm = base_sm.clone();  // Each walker gets its own copy
+            let collective = Arc::clone(&collective);
             let result = walk_single(&pool_clone, *seed, *bias, &EmotionalState {
                 valence: sm.valence,
                 arousal: sm.arousal,
                 energy: sm.energy,
-            }, steps, &rt, &mut sm);
+            }, steps, &rt, &mut sm, &collective);
             (result, sm)
         })
         .collect();

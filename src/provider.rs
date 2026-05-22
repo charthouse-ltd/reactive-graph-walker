@@ -122,12 +122,12 @@ impl Provider {
         if complexity < self.config.cloud_threshold {
             // Try local first
             if let Some(ref llm) = self.local {
-                match llm.chat(system, user, max_tokens, temperature) {
+                match llm.chat(system, user, max_tokens, temperature).await {
                     Ok(text) => {
                         return GenerateResult {
                             tokens_generated: text.split_whitespace().count() as u32,
                             text,
-                            model_used: ModelUsed::Local("qwen-local".into()),
+                            model_used: ModelUsed::Local(llm.model_name().into()),
                             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
                         };
                     }
@@ -165,6 +165,10 @@ impl Provider {
                     model_cfg.api_url.as_deref().unwrap_or("https://api.groq.com/openai"),
                     &model_cfg.api_key, &model_cfg.model, system, user, max_tokens, temperature,
                 ).await,
+                "deepseek" => generate_openai_compat(
+                    model_cfg.api_url.as_deref().unwrap_or("https://api.deepseek.com"),
+                    &model_cfg.api_key, &model_cfg.model, system, user, max_tokens, temperature,
+                ).await,
                 other => {
                     tracing::warn!("[provider] Unknown provider: {}", other);
                     continue;
@@ -193,7 +197,7 @@ impl Provider {
 
         // Fallback: local even if complex (better than nothing)
         if let Some(ref llm) = self.local {
-            if let Ok(text) = llm.chat(system, user, max_tokens, temperature) {
+            if let Ok(text) = llm.chat(system, user, max_tokens, temperature).await {
                 return GenerateResult {
                     tokens_generated: text.split_whitespace().count() as u32,
                     text,

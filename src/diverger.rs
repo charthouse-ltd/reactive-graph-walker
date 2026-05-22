@@ -292,10 +292,13 @@ impl Diverger {
                         // Fire the walk on a rayon thread (true parallelism)
                         let result = tokio::task::spawn_blocking(move || {
                             let mut sm = sm_walk.lock().unwrap().clone();
+                            let collective = std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::graph::WalkerCollective::new()
+                            ));
                             crate::walker::walk_single(
                                 &pool, node_id,
                                 WalkerBias::all()[node_id as usize % WalkerBias::all().len()],
-                                &emo, steps, &rt, &mut sm,
+                                &emo, steps, &rt, &mut sm, &collective,
                             )
                         })
                         .await;
