@@ -32,17 +32,16 @@ pub fn init() -> anyhow::Result<()> {
 }
 
 /// Embed a single text string. Returns a 768-dim vector.
-/// Prepends "search_document:" prefix for pgvector compatibility
-/// (matches Julian's Python-embedded memory_vectors format).
+/// Do NOT prepend a prefix manually: fastembed auto-applies the nomic
+/// "search_document:" passage prefix inside `.embed()`, exactly like
+/// Julian's Python `model.embed()` (see memory.py). Prepending it here
+/// double-prefixes ("search_document: search_document: …") and collapses
+/// cosine similarity against Julian's stored vectors → 0 matches.
 pub fn embed_text(text: &str) -> anyhow::Result<Vec<f32>> {
     let mut lock = EMBEDDER.lock().unwrap();
     let model = lock.as_mut().ok_or_else(|| anyhow::anyhow!("Embedder not initialized"))?;
 
-    // nomic-embed-text requires the "search_document:" prefix for
-    // document/passage embeddings to produce correct vectors.
-    // Without this, embeddings won't match Python-generated pgvector data.
-    let prefixed = format!("search_document: {}", text);
-    let embeddings = model.embed(vec![prefixed], None)?;
+    let embeddings = model.embed(vec![text], None)?;
     embeddings
         .into_iter()
         .next()

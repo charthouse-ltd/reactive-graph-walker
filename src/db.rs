@@ -61,7 +61,7 @@ pub async fn graph_stats(pool: &PgPool) -> Result<GraphStats, sqlx::Error> {
 pub async fn edges_from(pool: &PgPool, node_id: i32) -> Result<Vec<MemoryEdge>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, source_id, target_id, edge_type, \
-         COALESCE(weight, 0.5) as weight, COALESCE(emotional_charge, 0.0) as emotional_charge, \
+         COALESCE(weight, 0.5)::real as weight, COALESCE(emotional_charge, 0.0)::real as emotional_charge, \
          COALESCE(traversal_count, 0) as traversal_count \
          FROM memory_edges \
          WHERE source_id = $1 OR target_id = $1 \
@@ -87,8 +87,8 @@ pub async fn edges_from(pool: &PgPool, node_id: i32) -> Result<Vec<MemoryEdge>, 
 pub async fn get_node(pool: &PgPool, id: i32) -> Result<Option<MemoryNode>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, COALESCE(domain, '') as domain, \
-         COALESCE(valence, 0.0) as valence, COALESCE(arousal, 0.5) as arousal, \
-         COALESCE(importance, 5.0) as importance, COALESCE(access_count, 0) as access_count \
+         COALESCE(valence, 0.0)::real as valence, COALESCE(arousal, 0.5)::real as arousal, \
+         COALESCE(importance, 5.0)::real as importance, COALESCE(access_count, 0) as access_count \
          FROM memory_vectors WHERE id = $1"
     )
     .bind(id)
@@ -243,7 +243,7 @@ pub async fn create_memory_node(
     );
 
     let row = sqlx::query(
-        "INSERT INTO memory_vectors (content, domain, embedding, importance, valence, arousal, access_count, created_at) \
+        "INSERT INTO memory_vectors (document, domain, embedding, importance, valence, arousal, access_count, created_at) \
          VALUES ($1, $2, $3::vector, $4, $5, $6, 0, NOW()) \
          RETURNING id"
     )
@@ -308,8 +308,8 @@ pub async fn find_similar_nodes(
     );
 
     let rows = sqlx::query(
-        "SELECT id, 1.0 - (embedding <=> $1::vector) AS similarity, \
-                COALESCE(content, '') AS content \
+        "SELECT id, (1.0 - (embedding <=> $1::vector))::real AS similarity, \
+                COALESCE(document, '') AS content \
          FROM memory_vectors \
          WHERE embedding IS NOT NULL \
            AND embedding <=> $1::vector < $2 \
@@ -375,8 +375,8 @@ pub async fn prune_nodes(pool: &PgPool, min_importance: f32, days_untouched: i32
 pub async fn save_self_model(pool: &PgPool, model: &crate::core::SelfModel) -> Result<(), sqlx::Error> {
     let json_str = serde_json::to_string(model).unwrap_or_default();
     sqlx::query(
-        "INSERT INTO runtime_settings (key, value, updated_at) \
-         VALUES ('rgw_self_model', $1, NOW()) \
+        "INSERT INTO runtime_settings (key, value, description, category, updated_at) \
+         VALUES ('rgw_self_model', $1, 'RGW self-model snapshot', 'rgw', NOW()) \
          ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()"
     )
     .bind(&json_str)

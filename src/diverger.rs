@@ -26,7 +26,8 @@ use crate::walker;
 #[derive(Debug)]
 struct NodeEnergy {
     energy: f32,
-    last_fired: f64,  // unix timestamp
+    last_fired: f64,   // unix timestamp of last spontaneous fire (refractory clock)
+    last_update: f64,  // unix timestamp of last energy update (decay clock)
 }
 
 /// The Diverger engine — a self-propagating reactive graph.
@@ -227,12 +228,18 @@ impl Diverger {
                         let node = nodes_lock.entry(nid).or_insert(NodeEnergy {
                             energy: 0.0,
                             last_fired: 0.0,
+                            last_update: now,
                         });
 
-                        // Apply energy decay
+                        // Apply energy decay since this node was last updated.
                         // (energy leaks over time — prevents unbounded accumulation)
-                        let dt = (now - node.last_fired).max(0.0) as f32;
+                        // Decay is clocked off last_update, NOT last_fired: a node
+                        // that has never fired has last_fired=0 (epoch), which would
+                        // make dt astronomical and wipe all injected energy before it
+                        // could ever accumulate to threshold.
+                        let dt = (now - node.last_update).max(0.0) as f32;
                         node.energy = (node.energy - config.energy_decay_rate * dt).max(0.0);
+                        node.last_update = now;
 
                         // Add new energy from the edge change
                         node.energy += energy_delta;
@@ -287,15 +294,25 @@ impl Diverger {
                     let sm_walk = self_model.clone();
                     let julian_url = julian_url_outer.clone();
                     tokio::spawn(async move {
-                        // Fire the walk on a rayon thread (true parallelism)
+                        // Preload the seed's neighborhood (radius 1) before walking.
+                        // walk_single is cache-only with NO DB fallback, so without a
+                        // preload it dead-ends at hop 1 and never reaches the motor's
+                        // hops>=3 gate — spontaneous walks fire but never act.
+                        let cache = std::sync::Arc::new(
+                            crate::edge_cache::EdgeCache::new(pool.clone())
+                        );
+                        let _ = cache.preload_radius(&[node_id]).await;
+
+                        // Fire the walk on a blocking thread (true parallelism)
+                        let cache_walk = cache.clone();
+                        let pool_walk = pool.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let mut sm = sm_walk.blocking_lock().clone();
                             let collective = std::sync::Arc::new(std::sync::Mutex::new(
                                 crate::graph::WalkerCollective::new()
                             ));
-                            let cache = crate::edge_cache::EdgeCache::new(pool.clone());
                             crate::walker::walk_single(
-                                &pool, &cache, node_id,
+                                &pool_walk, &*cache_walk, node_id,
                                 WalkerBias::all()[node_id as usize % WalkerBias::all().len()],
                                 &emo, steps, &mut sm, &collective, None,
                             )
@@ -303,6 +320,12 @@ impl Diverger {
                         .await;
 
                         if let Ok(result) = result {
+                            // Hebbian: reinforce the edges this walk traversed
+                            // (also bumps last_traversed / traversal_count).
+                            if !result.edges_traversed.is_empty() {
+                                cache.strengthen_edges(&result.edges_traversed, 0.02);
+                            }
+
                             let hops = result.path.len();
                             let surprises = result.surprises;
                             let domains = result.domains_visited.clone();
@@ -352,6 +375,9 @@ impl Diverger {
                             }
                         }
 
+                        // Persist edge strengthening accumulated during the walk.
+                        let _ = cache.flush().await;
+
                         drop(permit);  // Release semaphore
                     });
                 }
@@ -400,11 +426,16 @@ impl Diverger {
 
     /// Seed the Diverger with initial energy (kickstart on boot)
     pub async fn seed_energy(&self, node_ids: Vec<i32>, initial_energy: f32) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
         let mut nodes = self.nodes.write().await;
         for id in node_ids {
             nodes.entry(id).or_insert(NodeEnergy {
                 energy: initial_energy,
                 last_fired: 0.0,
+                last_update: now,
             });
         }
         tracing::info!("[diverger] Seeded {} nodes with {:.2} energy", nodes.len(), initial_energy);
