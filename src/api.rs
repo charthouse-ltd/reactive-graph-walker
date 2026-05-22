@@ -78,6 +78,9 @@ pub async fn serve(
     // Create the Diverger with shared self-model + Julian URL for motor commands
     let diverger = Diverger::new(pool.clone(), self_model.clone(), julian_url);
 
+    // ── Start concurrent dream loop (always-on, motor-disconnected) ──
+    crate::dream::start_dream_loop(pool.clone(), self_model.clone());
+
     // Seed initial energy from high-importance nodes
     let seeds = db::seed_nodes(&pool, 50).await.unwrap_or_default();
     diverger.seed_energy(seeds, 0.3).await;

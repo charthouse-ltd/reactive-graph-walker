@@ -343,3 +343,79 @@ fn dream_walk_single(
 
     result
 }
+
+// ── Concurrent Dream Loop ────────────────────────────────────────
+// Not a separate "sleep" phase — a continuous background process
+// that always runs alongside the reactive walker loop.
+//
+// Reactive (awake):   edge changes → energy → walks → strengthen → motor
+// Dream (always-on):  noise walks → new edges + prune → motor DISCONNECTED
+//
+// Energy is a modulator, not a switch:
+//   high energy → reactive dominates (less dreaming)
+//   low energy → dream dominates (more dreaming, more pruning)
+//
+// This replaces time-sharing with concurrency — the graph is
+// continuously explored AND continuously renormalized.
+
+/// Spawn a background dream loop that runs continuously.
+/// Modulated by energy: high energy → slower dream cycle,
+/// low energy → faster dream cycle, more pruning.
+pub fn start_dream_loop(
+    pool: PgPool,
+    self_model: Arc<tokio::sync::Mutex<SelfModel>>,
+) {
+    tokio::spawn(async move {
+        let config = DreamConfig {
+            n_walks: 20,              // Fewer walks per cycle (continuous, not batched)
+            steps: 6,
+            noise_magnitude: 0.10,    // Lower noise for continuous operation
+            coherence_threshold: 0.5,
+            max_new_edges: 5,
+        };
+
+        tracing::info!("[dream] Concurrent dream loop started (always-on, motor-disconnected)");
+
+        loop {
+            // ── Energy-modulated cycle time ──
+            // Higher energy → longer sleep between dream cycles
+            let (energy, mode) = {
+                let sm = self_model.lock().await;
+                (sm.energy, sm.mode.clone())
+            };
+
+            if mode == core::CognitiveMode::Compliant {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+
+            // Energy 0.0 → dream every 3s; energy 1.0 → dream every 30s
+            let cycle_secs = 3.0 + (1.0 - energy) as f64 * 27.0;
+            tokio::time::sleep(std::time::Duration::from_secs_f64(cycle_secs)).await;
+
+            // ── Run a dream cycle ──
+            let report = dream(&pool, &self_model, config.clone()).await;
+            if report.edges_created > 0 || report.connections_kept > 0 {
+                tracing::info!(
+                    "[dream] Cycle: {} edges created, {} connections kept, {} insights (energy={:.2})",
+                    report.edges_created, report.connections_kept, report.insights.len(), energy
+                );
+            }
+
+            // ── Homeostasis: prune weak edges ──
+            // Without this, continuous dreaming causes runaway potentiation.
+            // Pruning scales with dream intensity — low energy → more cleanup.
+            if energy < 0.3 {
+                match db::prune_nodes(&pool, 0.1, 7).await {
+                    Ok(prune_count) if prune_count > 0 => {
+                        tracing::debug!("[dream] Homeostasis: pruned {} weak nodes/edges", prune_count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("[dream] Pruning failed: {}", e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+}
