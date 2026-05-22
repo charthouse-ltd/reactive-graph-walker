@@ -467,14 +467,52 @@ pub async fn find_knowledge_by_domain(
     }).collect())
 }
 
-/// Get all distinct knowledge domains (skill_names) as a HashSet.
-/// Pre-fetched by walk_parallel / dream() so sync walk functions
-/// can do O(1) domain lookups without an async DB call.
+/// Memory domains that have a semantically-matching RAG skill in
+/// knowledge_vectors. Walkers/dream use this to anchor memory traversal to
+/// verified compendium knowledge.
+///
+/// NOTE: this returns *memory* domains (e.g. "market", "travel"), NOT skill
+/// names — the previous version returned skill_names ("market-brief", …),
+/// which never matched node.domain, so the interlink was inert. The bridge is
+/// semantic: embed each distinct memory domain and keep it if any knowledge
+/// vector is within cosine 0.75. Computed once and cached (the corpus is stable
+/// at runtime; restart picks up newly-ingested knowledge).
+static KNOWLEDGE_DOMAINS: tokio::sync::OnceCell<std::collections::HashSet<String>> =
+    tokio::sync::OnceCell::const_new();
+
 pub async fn all_knowledge_domains(pool: &PgPool) -> Result<std::collections::HashSet<String>, sqlx::Error> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT skill_name FROM knowledge_vectors WHERE skill_name != ''"
+    let set = KNOWLEDGE_DOMAINS
+        .get_or_init(|| async { compute_knowledge_domains(pool).await.unwrap_or_default() })
+        .await;
+    Ok(set.clone())
+}
+
+async fn compute_knowledge_domains(pool: &PgPool) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let domains: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT domain FROM memory_vectors WHERE domain IS NOT NULL AND domain != ''"
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|(s,)| s).collect())
+
+    let mut grounded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (domain,) in domains {
+        let emb = match crate::embed::embed_text(&domain) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let emb_str = format!("[{}]", emb.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+        let hit: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM knowledge_vectors \
+             WHERE embedding IS NOT NULL AND embedding <=> $1::vector < $2 LIMIT 1"
+        )
+        .bind(&emb_str)
+        .bind(0.75_f32)
+        .fetch_optional(pool)
+        .await?;
+        if hit.is_some() {
+            grounded.insert(domain);
+        }
+    }
+    tracing::info!("[knowledge] {} memory domains anchored to RAG: {:?}", grounded.len(), grounded);
+    Ok(grounded)
 }

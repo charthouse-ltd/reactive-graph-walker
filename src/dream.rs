@@ -136,6 +136,7 @@ pub async fn dream(
 
     // ── Pre-fetch knowledge domains for dream walk cross-reference ──
     let knowledge_domains = db::all_knowledge_domains(pool).await.unwrap_or_default();
+    let kd_for_walks = knowledge_domains.clone(); // moved into the walk closure; original kept for Phase 4
 
     let dream_results: Vec<DreamWalkResult> = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
@@ -143,7 +144,7 @@ pub async fn dream(
             .into_par_iter()
             .map(|i| {
                 let seed = seeds[i % seeds.len()];
-                dream_walk_single(&pool_clone, seed, noise, steps, &rt, &knowledge_domains)
+                dream_walk_single(&pool_clone, seed, noise, steps, &rt, &kd_for_walks)
             })
             .collect()
     })
@@ -184,8 +185,15 @@ pub async fn dream(
     }
 
     for ((src_domain, tgt_domain), (conns, votes)) in &connection_votes {
-        let coherence = *votes as f32 / config.n_walks as f32 * 10.0; // Normalize
-        let coherence = coherence.min(1.0);
+        let mut coherence = (*votes as f32 / config.n_walks as f32 * 10.0).min(1.0); // Normalize
+
+        // RAG anchoring: a connection grounded in verified compendium knowledge
+        // is more credible than pure noise — boost its coherence so dreams
+        // preferentially keep knowledge-anchored insights. (This is what the
+        // knowledge_anchors cross-reference is FOR; previously it was unused.)
+        if knowledge_domains.contains(src_domain) || knowledge_domains.contains(tgt_domain) {
+            coherence = (coherence + 0.25).min(1.0);
+        }
 
         if coherence >= config.coherence_threshold && kept_connections.len() < config.max_new_edges {
             if let Some(best) = conns.first() {
