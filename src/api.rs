@@ -25,7 +25,7 @@ use crate::walker;
 pub struct AppState {
     pub pool: PgPool,
     pub diverger: Diverger,
-    pub self_model: std::sync::Arc<std::sync::Mutex<SelfModel>>,
+    pub self_model: std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
     pub ollama_url: String,
     pub expression_model: String,
     pub julian_url: String,
@@ -72,7 +72,7 @@ pub async fn serve(
     julian_url: &str,
 ) -> anyhow::Result<()> {
     // Create the self-model FIRST — the continuous state of self-awareness
-    let self_model = std::sync::Arc::new(std::sync::Mutex::new(SelfModel::new()));
+    let self_model = std::sync::Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
     tracing::info!("[rgw] Self-model initialized. Consciousness online.");
 
     // Create the Diverger with shared self-model + Julian URL for motor commands
@@ -143,7 +143,7 @@ pub async fn serve(
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                let sm = save_state.self_model.lock().unwrap().clone();
+                let sm = save_state.self_model.lock().await.clone();
                 if sm.total_signals_processed > 0 {
                     match db::save_self_model(&save_state.pool, &sm).await {
                         Ok(_) => tracing::debug!("[rgw] Self-model saved ({} signals)", sm.total_signals_processed),
@@ -187,15 +187,17 @@ async fn walk(
     };
 
     // Per-request mode override: temporarily switch, walk, restore
-    let prev_mode = req.rgw_mode.as_ref().and_then(|m| {
-        let target = parse_mode(m)?;
-        let mut sm = state.self_model.lock().unwrap();
+    let mode_target = req.rgw_mode.as_ref().and_then(|m| parse_mode(m));
+    let prev_mode = if let Some(target) = mode_target {
+        let mut sm = state.self_model.lock().await;
         let prev = sm.mode.clone();
         sm.mode = target;
         Some(prev)
-    });
+    } else {
+        None
+    };
 
-    let output = walker::walk_parallel(
+    let (output, walker_results) = walker::walk_parallel(
         &state.pool,
         &req.emotional_state,
         n,
@@ -204,9 +206,27 @@ async fn walk(
     )
     .await;
 
+    // ── Metacognitive Critic: run after walk session ──
+    // Algorithmic diagnosis always runs. LLM escalates only when warranted.
+    {
+        let mut sm = state.self_model.lock().await;
+        let diagnosis = crate::metacog::run_critic(&output, &walker_results, &mut sm);
+
+        // Optionally escalate to LLM if diagnosis warrants it
+        if diagnosis.algorithmic_adjustments.escalate_to_llm || sm.critic_sessions_since_llm > 10 {
+            if let Some(ref provider) = state.provider {
+                let summary = crate::metacog::build_session_summary(&output, &walker_results, &sm);
+                let (system, user) = crate::metacog::build_critic_llm_prompt(&diagnosis, &summary);
+
+                let result = provider.generate(&system, &user, 0.5, Some(256), 0.3).await;
+                crate::metacog::run_llm_critic(&diagnosis, &summary, &mut sm, &result.text).await;
+            }
+        }
+    }
+
     // Restore previous mode if we overrode it
     if let Some(prev) = prev_mode {
-        let mut sm = state.self_model.lock().unwrap();
+        let mut sm = state.self_model.lock().await;
         sm.mode = prev;
     }
 
@@ -215,13 +235,13 @@ async fn walk(
 
 /// GET /self — current self-model state (consciousness introspection)
 async fn self_state(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let sm = state.self_model.lock().unwrap();
+    let sm = state.self_model.lock().await;
     Json(serde_json::to_value(&*sm).unwrap_or_default())
 }
 
 /// POST /self/save — persist self-model to database
 async fn save_self_model_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let sm = state.self_model.lock().unwrap().clone();
+    let sm = state.self_model.lock().await.clone();
     match db::save_self_model(&state.pool, &sm).await {
         Ok(_) => Json(serde_json::json!({"status": "saved"})),
         Err(e) => Json(serde_json::json!({"status": "error", "error": e.to_string()})),
@@ -248,7 +268,7 @@ async fn execute_tool_endpoint(
 
     // Feed tool result through self-model
     {
-        let mut sm = state.self_model.lock().unwrap();
+        let mut sm = state.self_model.lock().await;
         let signal = crate::core::Signal::new(
             if result.success { "tool_success" } else { "tool_failure" },
             &format!("{}: {}", result.tool, &result.content[..result.content.len().min(100)]),
@@ -282,7 +302,7 @@ async fn speak_endpoint(
 async fn music_endpoint(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::music::MusicParams> {
-    let sm = state.self_model.lock().unwrap();
+    let sm = state.self_model.lock().await;
     Json(crate::music::emotion_to_music(&sm))
 }
 
@@ -290,7 +310,7 @@ async fn music_endpoint(
 async fn music_midi_endpoint(
     State(state): State<Arc<AppState>>,
 ) -> (axum::http::StatusCode, [(axum::http::header::HeaderName, &'static str); 2], axum::body::Bytes) {
-    let sm = state.self_model.lock().unwrap();
+    let sm = state.self_model.lock().await;
     let params = crate::music::emotion_to_music(&sm);
     let midi = crate::music::generate_midi(&params);
 
@@ -308,7 +328,7 @@ async fn music_midi_endpoint(
 async fn music_prompt_endpoint(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let sm = state.self_model.lock().unwrap();
+    let sm = state.self_model.lock().await;
     let prompt = crate::music::emotion_to_prompt(&sm);
     let params = crate::music::emotion_to_music(&sm);
     Json(serde_json::json!({
@@ -333,7 +353,7 @@ async fn music_generate_endpoint(
     Json(req): Json<MusicGenRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let prompt = if req.prompt.is_empty() {
-        let sm = state.self_model.lock().unwrap();
+        let sm = state.self_model.lock().await;
         crate::music::emotion_to_prompt(&sm)
     } else {
         req.prompt
@@ -345,7 +365,7 @@ async fn music_generate_endpoint(
         Ok(path) => {
             // Notify self-model: Julian created music
             {
-                let mut sm = state.self_model.lock().unwrap();
+                let mut sm = state.self_model.lock().await;
                 let signal = crate::core::Signal::new("music_created", &format!(
                     "Composed: {}", &prompt[..prompt.len().min(60)]
                 )).with_intensity(0.5);
@@ -362,7 +382,7 @@ async fn music_generate_endpoint(
         Err(e) => {
             // Friction: music generation failed
             {
-                let mut sm = state.self_model.lock().unwrap();
+                let mut sm = state.self_model.lock().await;
                 crate::friction::motor_friction("music_generate", &e, &mut sm);
             }
             Ok(Json(serde_json::json!({
@@ -534,7 +554,7 @@ async fn ingest_signal_endpoint(
     State(state): State<Arc<AppState>>,
     Json(req): Json<IngestSignalRequest>,
 ) -> Json<serde_json::Value> {
-    let mut sm = state.self_model.lock().unwrap();
+    let mut sm = state.self_model.lock().await;
 
     let signal = crate::core::Signal::new(&req.kind, &req.content)
         .with_domain(if req.domain.is_empty() { &req.kind } else { &req.domain })
@@ -583,7 +603,7 @@ async fn set_mode_endpoint(
     match parse_mode(&req.mode) {
         Some(mode) => {
             let prev = {
-                let mut sm = state.self_model.lock().unwrap();
+                let mut sm = state.self_model.lock().await;
                 let prev = sm.mode.clone();
                 sm.mode = mode.clone();
                 prev
@@ -616,7 +636,7 @@ async fn benchmark(
 
         for _ in 0..3 {
             let start = Instant::now();
-            let output = walker::walk_parallel(
+            let (output, _) = walker::walk_parallel(
                 &state.pool,
                 &emotion,
                 n_walkers,

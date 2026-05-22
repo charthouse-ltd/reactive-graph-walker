@@ -288,6 +288,98 @@ impl WalkerBias {
     }
 }
 
+// ── Learned Bias ─────────────────────────────────────────────────
+// Emergent, self-modifying biases that adapt from walk outcomes.
+// Each walker starts from a neutral profile; outcomes adjust weights.
+// Over time, biases specialize — some become more curious, others
+// more analytical, based on what works. Pure algorithmic reinforcement.
+
+/// A learned bias profile with adjustable weights.
+/// Replaces the fixed WalkerBias enum with emergent, self-tuned behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedBias {
+    pub novelty_seeking: f32,
+    pub contradiction_seeking: f32,
+    pub experience_reliance: f32,
+    pub emotional_alignment: f32,
+    pub cross_domain_curiosity: f32,
+    pub sessions_learned: u32,
+}
+
+impl Default for LearnedBias {
+    fn default() -> Self {
+        Self {
+            novelty_seeking: 0.3,
+            contradiction_seeking: 0.3,
+            experience_reliance: 0.3,
+            emotional_alignment: 0.2,
+            cross_domain_curiosity: 0.3,
+            sessions_learned: 0,
+        }
+    }
+}
+
+impl LearnedBias {
+    /// Update weights from a walk session's outcomes.
+    /// Learning rate decays — early experiences shape more than later ones.
+    pub fn update_from_session(&mut self, surprises: u32, dead_ends: u32, novelty: f32, domain_count: usize) {
+        let lr = 0.08 / (1.0 + self.sessions_learned as f32 * 0.05);
+        self.sessions_learned += 1;
+
+        if surprises > 0 {
+            let boost = (surprises as f32 * 0.12).min(0.3);
+            self.contradiction_seeking = (self.contradiction_seeking + boost * lr).min(1.0);
+            self.cross_domain_curiosity = (self.cross_domain_curiosity + boost * lr * 0.5).min(1.0);
+            self.experience_reliance = (self.experience_reliance - 0.02 * lr).max(0.05);
+        }
+        if dead_ends > 0 {
+            self.novelty_seeking = (self.novelty_seeking + 0.05 * lr * dead_ends as f32).min(1.0);
+            self.experience_reliance = (self.experience_reliance - 0.03 * lr).max(0.05);
+        }
+        if novelty > 0.5 {
+            self.novelty_seeking = (self.novelty_seeking + 0.04 * lr).min(1.0);
+            self.cross_domain_curiosity = (self.cross_domain_curiosity + 0.03 * lr).min(1.0);
+        }
+        if domain_count > 2 {
+            self.cross_domain_curiosity = (self.cross_domain_curiosity + 0.04 * lr * domain_count as f32).min(1.0);
+        }
+
+        // Gentle regression toward neutral
+        for w in [&mut self.novelty_seeking, &mut self.contradiction_seeking,
+                   &mut self.experience_reliance, &mut self.emotional_alignment,
+                   &mut self.cross_domain_curiosity] {
+            *w = (*w * 0.995 + 0.3 * 0.005).clamp(0.05, 0.95);
+        }
+    }
+
+    /// Score an edge using learned weights.
+    pub fn score_edge(&self, edge_type: &str, edge_weight: f32, emotional_charge: f32,
+                       traversal_count: i32, emotion: &EmotionalState,
+                       next_domain: &str, current_domain: &str) -> f32 {
+        let mut w = edge_weight;
+
+        if (edge_type == "contradicts" || edge_type == "opposes") && self.contradiction_seeking > 0.3 {
+            w *= 1.0 + self.contradiction_seeking * 2.0;
+        }
+        if traversal_count < 2 && self.novelty_seeking > 0.3 {
+            w += self.novelty_seeking * 2.0;
+        }
+        if !next_domain.is_empty() && next_domain != current_domain && self.cross_domain_curiosity > 0.3 {
+            w *= 1.0 + self.cross_domain_curiosity;
+        }
+        if traversal_count > 10 && self.experience_reliance > 0.4 {
+            w *= 1.0 + self.experience_reliance * 0.5;
+        }
+        if emotional_charge * emotion.valence > 0.0 && self.emotional_alignment > 0.3 {
+            w *= 1.0 + self.emotional_alignment * emotional_charge.abs() * emotion.arousal;
+        }
+        if emotion.arousal > 0.5 {
+            w *= 1.0 + (emotion.arousal - 0.5);
+        }
+        w.max(0.01)
+    }
+}
+
 /// Result of a single walker's traversal
 #[derive(Debug, Clone, Serialize)]
 pub struct WalkerResult {

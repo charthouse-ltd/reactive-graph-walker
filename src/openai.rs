@@ -154,20 +154,22 @@ pub async fn chat_completions(
     let emotion = req.rgw_emotion.unwrap_or_default();
     let walk_start = Instant::now();
 
-    // Per-request mode override
-    let prev_mode = req.rgw_mode.as_ref().and_then(|m| {
-        let target = match m.to_lowercase().as_str() {
-            "autonomous" => Some(crate::core::CognitiveMode::Autonomous),
-            "compliant" => Some(crate::core::CognitiveMode::Compliant),
-            _ => None,
-        }?;
-        let mut sm = state.self_model.lock().unwrap();
+    // Per-request mode override (extract first, lock later)
+    let mode_target = req.rgw_mode.as_ref().and_then(|m| match m.to_lowercase().as_str() {
+        "autonomous" => Some(crate::core::CognitiveMode::Autonomous),
+        "compliant" => Some(crate::core::CognitiveMode::Compliant),
+        _ => None,
+    });
+    let prev_mode = if let Some(target) = mode_target {
+        let mut sm = state.self_model.lock().await;
         let prev = sm.mode.clone();
         sm.mode = target;
         Some(prev)
-    });
+    } else {
+        None
+    };
 
-    let walk_output = walker::walk_parallel(
+    let (walk_output, _walker_results) = walker::walk_parallel(
         &state.pool,
         &emotion,
         req.rgw_walkers,
@@ -178,7 +180,7 @@ pub async fn chat_completions(
 
     // Restore mode after walk
     if let Some(prev) = prev_mode {
-        let mut sm = state.self_model.lock().unwrap();
+        let mut sm = state.self_model.lock().await;
         sm.mode = prev;
     }
 

@@ -129,7 +129,7 @@ pub struct DivergerStats {
 
 impl Diverger {
     /// Create a new Diverger engine with shared self-model.
-    pub fn new(pool: PgPool, self_model: std::sync::Arc<std::sync::Mutex<crate::core::SelfModel>>, julian_url: &str) -> Self {
+    pub fn new(pool: PgPool, self_model: std::sync::Arc<tokio::sync::Mutex<crate::core::SelfModel>>, julian_url: &str) -> Self {
         let (edge_tx, edge_rx) = mpsc::unbounded_channel();
         let sm = self_model.clone();
 
@@ -157,7 +157,7 @@ impl Diverger {
         &self,
         mut edge_rx: mpsc::UnboundedReceiver<EdgeChange>,
         config: DivergerConfig,
-        self_model: std::sync::Arc<std::sync::Mutex<crate::core::SelfModel>>,
+        self_model: std::sync::Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
     ) {
         let pool = self.pool.clone();
         let nodes = self.nodes.clone();
@@ -254,7 +254,7 @@ impl Diverger {
                 // no spontaneous behavior fires. The system only acts
                 // when explicitly asked via API.
                 let is_autonomous = {
-                    let sm_lock = self_model.lock().unwrap();
+                    let sm_lock = self_model.lock().await;
                     sm_lock.mode == crate::core::CognitiveMode::Autonomous
                 };
                 if !is_autonomous {
@@ -287,18 +287,17 @@ impl Diverger {
                     let sm_walk = self_model.clone();
                     let julian_url = julian_url_outer.clone();
                     tokio::spawn(async move {
-                        let rt = tokio::runtime::Handle::current();
-
                         // Fire the walk on a rayon thread (true parallelism)
                         let result = tokio::task::spawn_blocking(move || {
-                            let mut sm = sm_walk.lock().unwrap().clone();
+                            let mut sm = sm_walk.blocking_lock().clone();
                             let collective = std::sync::Arc::new(std::sync::Mutex::new(
                                 crate::graph::WalkerCollective::new()
                             ));
+                            let cache = crate::edge_cache::EdgeCache::new(pool.clone());
                             crate::walker::walk_single(
-                                &pool, node_id,
+                                &pool, &cache, node_id,
                                 WalkerBias::all()[node_id as usize % WalkerBias::all().len()],
-                                &emo, steps, &rt, &mut sm, &collective,
+                                &emo, steps, &mut sm, &collective, None,
                             )
                         })
                         .await;
@@ -346,6 +345,7 @@ impl Diverger {
                                         novelty: surprises as f32 / hops.max(1) as f32,
                                         search_query,
                                         params: None,
+                                        audience_id: None,  // Spontaneous walks have no specific audience
                                     };
                                     crate::motor::execute(&julian_url, cmd).await;
                                 }

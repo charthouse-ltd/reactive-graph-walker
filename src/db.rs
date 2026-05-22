@@ -245,9 +245,6 @@ pub async fn create_memory_node(
     let row = sqlx::query(
         "INSERT INTO memory_vectors (content, domain, embedding, importance, valence, arousal, access_count, created_at) \
          VALUES ($1, $2, $3::vector, $4, $5, $6, 0, NOW()) \
-         ON CONFLICT (content, domain) DO UPDATE SET \
-             importance = GREATEST(memory_vectors.importance, $4), \
-             access_count = memory_vectors.access_count + 1 \
          RETURNING id"
     )
     .bind(content)
@@ -260,7 +257,8 @@ pub async fn create_memory_node(
     .await?;
 
     let id: i32 = row.get("id");
-    tracing::debug!("[db] Created/updated memory node {}: {} (domain={})", id, &content[..content.len().min(60)], domain);
+    let preview: String = content.chars().take(60).collect();
+    tracing::debug!("[db] Created/updated memory node {}: {} (domain={})", id, preview, domain);
     Ok(id)
 }
 

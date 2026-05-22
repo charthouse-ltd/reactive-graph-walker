@@ -17,7 +17,8 @@
 //!   RUST_LOG=info,rgw=debug \
 //!   ./target/release/examples/digester
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use sqlx::PgPool;
 
@@ -199,7 +200,7 @@ async fn run_walks(pool: &PgPool) -> anyhow::Result<()> {
     println!("║   SESSION 1 — Initial Exploration             ║");
     println!("╚══════════════════════════════════════════════╝\n");
 
-    let output = walker::walk_parallel(pool, &EmotionalState::default(), 4, 6, &self_model).await;
+    let (output, _) = walker::walk_parallel(pool, &EmotionalState::default(), 4, 6, &self_model).await;
     print_walk_summary(&output);
 
     // ── Session 2: Higher arousal (simulating engagement) ──
@@ -208,11 +209,11 @@ async fn run_walks(pool: &PgPool) -> anyhow::Result<()> {
     println!("╚══════════════════════════════════════════════╝\n");
 
     let excited = EmotionalState { valence: 0.3, arousal: 0.7, energy: 0.8 };
-    let output2 = walker::walk_parallel(pool, &excited, 6, 5, &self_model).await;
+    let (output2, _) = walker::walk_parallel(pool, &excited, 6, 5, &self_model).await;
     print_walk_summary(&output2);
 
     // ── Self-model state ──
-    let sm = self_model.lock().unwrap();
+    let sm = self_model.lock().await;
     println!("\n╔══════════════════════════════════════════════╗");
     println!("║   SELF-MODEL STATE                            ║");
     println!("╚══════════════════════════════════════════════╝\n");

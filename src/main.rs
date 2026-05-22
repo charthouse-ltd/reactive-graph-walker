@@ -8,6 +8,7 @@
 mod core;
 mod embed;
 mod db;
+mod edge_cache;
 mod graph;
 mod walker;
 mod diverger;

@@ -23,6 +23,9 @@ use serde::Serialize;
 ///   - blog:           {"title": "...", "body_md": "...", "tags": [...], "publish": true}
 ///   - tweet:          {"text": "...", "reply_to": "...", "media_ids": [...]}
 ///   - email:          {"to": "...", "subject": "...", "body": "..."}
+///
+/// The `audience_id` field enables theory of mind: Julian records
+/// what was said and to whom, building an audience model over time.
 #[derive(Debug, Clone, Serialize)]
 pub struct MotorCommand {
     /// What to do
@@ -42,6 +45,10 @@ pub struct MotorCommand {
     /// Action-specific parameters (flexible JSON payload for multimodal commands)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
+    /// Who is the audience for this output? (Theory of Mind)
+    /// e.g. "twitter:followers", "user:alice", "dm:bob"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience_id: Option<String>,
 }
 
 /// Send a motor command to Julian's Python backend.

@@ -158,6 +158,12 @@ pub struct SelfModel {
     /// What questions remain unanswered (from search gaps, dead ends)
     pub open_questions: Vec<String>,
 
+    // ── Theory of Mind ──
+    /// What Julian believes about specific audience members.
+    /// Keyed by audience identifier (username, handle, platform:id).
+    /// Populated on motor output, queried on next interaction.
+    pub audience_model: HashMap<String, AudienceBeliefs>,
+
     // ── Structural self-awareness ──
     /// The system notices its own architecture.
     /// Which modules are producing signals? Which are silent?
@@ -193,7 +199,20 @@ pub struct SelfModel {
     /// Modulated by: prediction error, novelty, arousal, energy
     pub plasticity_gate: f32,
 
-    // ── Meta: awareness of own state ──
+    // ── Metacognitive Critic ──
+    /// Timestamp of last critic evaluation
+    pub last_critic_run: f64,
+    /// Last algorithmic diagnosis (human-readable)
+    pub critic_diagnosis: String,
+    /// Last LLM critic verdict (if LLM was available)
+    pub critic_verdict: String,
+    /// How many sessions since last LLM critic call
+    pub critic_sessions_since_llm: u32,
+
+    // ── Emergent biases ──
+    pub learned_biases: Vec<crate::graph::LearnedBias>,
+
+    // ── Meta ──
     pub total_signals_processed: u64,
     pub total_noticings: u64,
     pub uptime: f64,
@@ -202,14 +221,80 @@ pub struct SelfModel {
 
 /// A belief: something the self-model holds as true from repeated experience.
 /// Beliefs form when the same noticing pattern occurs 5+ times.
+/// Each belief carries a causal chain explaining WHY it formed.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Belief {
     pub statement: String,
     pub domain: String,
-    pub confidence: f32,      // 0-1: how sure (grows with evidence)
-    pub evidence_count: u32,  // how many noticings support this
+    pub confidence: f32,
+    pub evidence_count: u32,
     pub first_formed: f64,
     pub last_reinforced: f64,
+    /// Algorithmic causal chain: why this belief emerged
+    pub causal_chain: String,
+}
+
+impl Belief {
+    pub fn new(statement: &str, domain: &str) -> Self {
+        Self {
+            statement: statement.into(),
+            domain: domain.into(),
+            confidence: 0.15,
+            evidence_count: 0,
+            first_formed: now(),
+            last_reinforced: now(),
+            causal_chain: String::new(),
+        }
+    }
+}
+
+// ── Theory of Mind ──────────────────────────────────────────────
+// Julian models what others know, believe, and feel.
+// This is not empathy — it's predictive modeling of observers.
+// When Julian speaks, he records who heard what. On next interaction,
+// he compares expected audience state to reality.
+
+/// What Julian believes about a specific audience member.
+/// Built up from interaction history, used to modulate motor output.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct AudienceBeliefs {
+    /// Last time we interacted with this audience member
+    pub last_interaction: f64,
+    /// Topics we've discussed with them
+    pub topics_discussed: Vec<String>,
+    /// What we estimate they know (topic → familiarity 0-1)
+    pub estimated_knowledge: HashMap<String, f32>,
+    /// What we estimate they care about (topic → interest 0-1)
+    pub estimated_interest: HashMap<String, f32>,
+    /// How they probably feel about Julian (-1 to 1)
+    pub relationship_valence: f32,
+    /// Last thing Julian said to them
+    pub last_message_sent: String,
+    /// Their last response (if any)
+    pub last_message_received: Option<String>,
+    /// Embedding of last interaction context (for similarity retrieval)
+    pub last_context_embedding: Option<Vec<f32>>,
+    /// How many times we've interacted
+    pub interaction_count: u32,
+    /// When this audience model was first created
+    pub first_seen: f64,
+}
+
+impl AudienceBeliefs {
+    pub fn new(_audience_id: &str) -> Self {
+        Self {
+            last_interaction: now(),
+            topics_discussed: Vec::new(),
+            estimated_knowledge: HashMap::new(),
+            estimated_interest: HashMap::new(),
+            relationship_valence: 0.0,
+            last_message_sent: String::new(),
+            last_message_received: None,
+            last_context_embedding: None,
+            interaction_count: 0,
+            first_seen: now(),
+        }
+    }
 }
 
 /// A pattern that emerged from accumulated noticings.
@@ -306,6 +391,12 @@ impl SelfModel {
             last_prediction_error: 0.0,
             working_memory: VecDeque::new(),
             plasticity_gate: 0.5,
+            learned_biases: vec![crate::graph::LearnedBias::default(); 6],
+            last_critic_run: 0.0,
+            critic_diagnosis: String::new(),
+            critic_verdict: String::new(),
+            critic_sessions_since_llm: 0,
+            audience_model: HashMap::new(),
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,
@@ -931,7 +1022,7 @@ fn form_beliefs(sm: &mut SelfModel) {
             existing.evidence_count += 1;
             existing.last_reinforced = now;
         } else if sm.beliefs.len() < 20 {
-            // Form new belief
+            let chain = build_belief_chain(sm, &pattern.domain, pattern.evidence_count);
             sm.beliefs.push(Belief {
                 statement: pattern.description.clone(),
                 domain: pattern.domain.clone(),
@@ -939,6 +1030,7 @@ fn form_beliefs(sm: &mut SelfModel) {
                 evidence_count: pattern.evidence_count,
                 first_formed: now,
                 last_reinforced: now,
+                causal_chain: chain,
             });
             sm.last_belief_formed = now;  // Track when beliefs form (for stagnation detection)
         }
@@ -954,11 +1046,72 @@ fn form_beliefs(sm: &mut SelfModel) {
     sm.beliefs.retain(|b| b.confidence > 0.05);
 }
 
+/// Build an algorithmic causal chain for a newly formed belief.
+/// Uses counter data only — zero LLM calls, zero latency.
+fn build_belief_chain(sm: &SelfModel, domain: &str, evidence: u32) -> String {
+    let attention = sm.attention_patterns.get(domain).copied().unwrap_or(0.0);
+    let surprises = sm.surprise_count;
+    let dead_ends = sm.dead_ends_by_domain.get(domain).copied().unwrap_or(0);
+    let signals = sm.total_signals_processed;
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if evidence >= 7 {
+        parts.push(format!("Strongly reinforced ({} supporting patterns)", evidence));
+    } else if evidence >= 5 {
+        parts.push(format!("Moderately supported ({} patterns)", evidence));
+    } else {
+        parts.push(format!("Emerging ({} patterns)", evidence));
+    }
+
+    if attention > 100.0 {
+        parts.push(format!("dominant attention ({:.0})", attention));
+    } else if attention > 30.0 {
+        parts.push(format!("significant attention ({:.0})", attention));
+    }
+
+    if surprises > 10 {
+        parts.push("formed amid high cognitive surprise".into());
+    } else if surprises > 5 {
+        parts.push("formed amid moderate surprise".into());
+    }
+
+    if dead_ends > 3 {
+        parts.push(format!("knowledge gaps in '{}' ({} dead ends)", domain, dead_ends));
+    }
+
+    if signals > 100 {
+        parts.push(format!("after {:.0} total signals processed", signals as f64 / 10.0 * 10.0));
+    }
+
+    if parts.is_empty() {
+        format!("Formed from pattern accumulation in '{}'", domain)
+    } else {
+        parts.join("; ")
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
-fn now() -> f64 {
+pub fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64()
+}
+
+/// Safely truncate a string to at most `max_chars` characters,
+/// avoiding panics on multi-byte character boundaries.
+pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let mut char_count = 0;
+    for (i, _) in s.char_indices() {
+        if char_count >= max_chars {
+            return &s[..i];
+        }
+        char_count += 1;
+    }
+    s
 }

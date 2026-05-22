@@ -7,11 +7,13 @@
 //!   - edge_create: connect two nodes
 //!   - code_exec: execute code in a sandbox (future)
 //!   - speech_say: speak text via TTS (future)
+//!   - llm_express: self-model expresses its state through an LLM
 //!
 //! Tools are invoked by the walker when it detects gaps or needs
 //! external information. Results flow back through the self-model.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// A tool that RGW can invoke
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +30,62 @@ pub struct ToolResult {
     pub success: bool,
     pub content: String,
     pub metadata: serde_json::Value,
+}
+
+/// Registry of tool executors that can be invoked.
+/// Each tool has a name and an async execution function.
+pub struct ToolRegistry {
+    executors: Vec<ToolExecutor>,
+}
+
+pub struct ToolExecutor {
+    pub name: String,
+    pub description: String,
+    pub execute: Arc<dyn Fn(serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<ToolResult>> + Send>> + Send + Sync>,
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self { executors: Vec::new() }
+    }
+
+    /// Register a tool executor.
+    pub fn register(&mut self, executor: ToolExecutor) {
+        self.executors.push(executor);
+    }
+
+    /// Get all available tool definitions (for LLM function calling, etc.)
+    pub fn available(&self) -> Vec<Tool> {
+        self.executors.iter().map(|e| Tool {
+            name: e.name.clone(),
+            description: e.description.clone(),
+            parameters: serde_json::json!({}),
+        }).collect()
+    }
+
+    /// Execute a tool by name.
+    pub async fn execute(&self, name: &str, params: serde_json::Value) -> Option<ToolResult> {
+        for executor in &self.executors {
+            if executor.name == name {
+                return match (executor.execute)(params).await {
+                    Ok(r) => Some(r),
+                    Err(e) => Some(ToolResult {
+                        tool: name.to_string(),
+                        success: false,
+                        content: format!("Error: {}", e),
+                        metadata: serde_json::json!({}),
+                    }),
+                };
+            }
+        }
+        None
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Available tools
@@ -208,6 +266,7 @@ async fn motor_tool(action: &str, params: serde_json::Value) -> ToolResult {
         novelty: 0.0,
         search_query: None,
         params: Some(clean_params),
+        audience_id: None,  // Tool invocations have no explicit audience
     };
 
     // Motor commands are fire-and-forget by design, but for tool

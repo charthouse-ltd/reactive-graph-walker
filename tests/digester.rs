@@ -12,7 +12,8 @@
 //! Usage:
 //!   DATABASE_URL=postgresql://user@localhost/rgw_test cargo test --test digester -- --nocapture
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::time::Instant;
 
 use sqlx::PgPool;
@@ -198,7 +199,7 @@ async fn run_walks(pool: &PgPool) -> anyhow::Result<()> {
 
     println!("=== WALKER SESSION 1: Curiosity-biased exploration ===\n");
 
-    let output = walker::walk_parallel(
+    let (output, _) = walker::walk_parallel(
         pool,
         &emotion,
         4,    // 4 walkers
@@ -216,7 +217,7 @@ async fn run_walks(pool: &PgPool) -> anyhow::Result<()> {
         output.total_hops, output.walk_ms, output.hops_per_sec);
 
     // ── Self-model state after walk ──
-    let sm = self_model.lock().unwrap();
+    let sm = self_model.lock().await;
     println!("\n=== SELF-MODEL STATE ===");
     println!("  mode: {:?}", sm.mode);
     println!("  valence={:.3}  arousal={:.3}  energy={:.3}  plasticity_gate={:.3}",

@@ -16,8 +16,9 @@ use rand::Rng;
 use rayon::prelude::*;
 use sqlx::PgPool;
 
-use crate::core::{self, Signal, SelfModel, Noticing};
+use crate::core::{self, Signal, SelfModel, Noticing, safe_truncate};
 use crate::db;
+use crate::edge_cache::EdgeCache;
 use crate::graph::*;
 
 /// Run a single walker through the graph.
@@ -26,13 +27,14 @@ use crate::graph::*;
 /// read each other's trails to diversify exploration.
 pub fn walk_single(
     pool: &PgPool,
+    cache: &EdgeCache,
     seed_id: i32,
     bias: WalkerBias,
     emotion: &EmotionalState,
     steps: usize,
-    rt: &tokio::runtime::Handle,
     self_model: &mut SelfModel,
     collective: &Arc<Mutex<WalkerCollective>>,
+    learned_bias: Option<&crate::graph::LearnedBias>,
 ) -> WalkerResult {
     let mut result = WalkerResult {
         bias,
@@ -55,15 +57,8 @@ pub fn walk_single(
     let mut prev_domain = String::new();
 
     for step in 0..steps {
-        // Get edges from current node
-        let edges = match rt.block_on(db::edges_from(pool, current_id)) {
-            Ok(e) => e,
-            Err(_) => {
-                result.dead_ends += 1;
-                break;
-            }
-        };
-
+        // Get edges from current node — sync cache read (lock-free)
+        let edges = cache.try_get(current_id);
         if edges.is_empty() {
             result.dead_ends += 1;
             // Write dead end to collective so other walkers avoid this node
@@ -92,9 +87,8 @@ pub fn walk_single(
             }).collect()
         } else {
             // Autonomous: full context scoring
-            // Read collective state (non-blocking try_lock)
-            let collective_lock = collective.try_lock().ok();
-            let collective_snapshot: Option<&WalkerCollective> = collective_lock.as_deref();
+            // ── Snapshot collective state (release lock BEFORE scoring loop) ──
+            let collective_snapshot: Option<WalkerCollective> = collective.try_lock().ok().map(|c| c.clone());
             let current_emotion = EmotionalState {
                 valence: self_model.valence,
                 arousal: self_model.arousal,
@@ -107,29 +101,51 @@ pub fn walk_single(
                 .map(|s| s.domain.clone())
                 .collect();
 
+            // ── Batch pre-fetch node domains for all edge targets ──
+            // Avoids N+1 blocking DB queries in the hot scoring loop
+            let target_ids: Vec<i32> = edges.iter()
+                .map(|e| if e.source_id == current_id { e.target_id } else { e.source_id })
+                .collect();
+            let domain_map: HashMap<i32, String> = {
+                let mut map = HashMap::new();
+                for &tid in &target_ids {
+                    if let Some(domain) = cache.get_domain(tid) {
+                        map.insert(tid, domain);
+                    }
+                }
+                map
+            };
+
+            let current_domain = prev_domain.clone();
+            let collective_ref = collective_snapshot.as_ref();
             edges.iter().map(|e| {
                 let next_id = if e.source_id == current_id { e.target_id } else { e.source_id };
-                // Fetch domain for the next node (fallback to empty if unavailable)
-                let next_domain = rt.block_on(db::get_node(pool, next_id))
-                    .ok()
-                    .flatten()
-                    .map(|n| n.domain)
-                    .unwrap_or_default();
+                let next_domain = domain_map.get(&next_id).map(|s| s.as_str()).unwrap_or("");
 
-                let score = bias.score_edge_with_context(
-                    &e.edge_type,
-                    e.weight,
-                    e.emotional_charge,
-                    e.traversal_count,
-                    &current_emotion,
-                    collective_snapshot,
-                    next_id,
-                    &next_domain,
-                    &self_model.beliefs,
-                    &self_model.wounds,
-                    &self_model.competencies,
-                    &wm_domains,
-                );
+                let score = if let Some(lb) = learned_bias {
+                    // Emergent learned bias — adapts from experience
+                    lb.score_edge(
+                        &e.edge_type, e.weight, e.emotional_charge,
+                        e.traversal_count, &current_emotion,
+                        next_domain, &current_domain,
+                    )
+                } else {
+                    // Fallback: hardcoded WalkerBias with full context
+                    bias.score_edge_with_context(
+                        &e.edge_type,
+                        e.weight,
+                        e.emotional_charge,
+                        e.traversal_count,
+                        &current_emotion,
+                        collective_ref,
+                        next_id,
+                        next_domain,
+                        &self_model.beliefs,
+                        &self_model.wounds,
+                        &self_model.competencies,
+                        &wm_domains,
+                    )
+                };
                 (e, score)
             }).collect()
         };
@@ -166,18 +182,16 @@ pub fn walk_single(
         result.edges_traversed.push(edge.id);
 
         // Track domain transitions + feed through self-model
-        if let Ok(Some(node)) = rt.block_on(db::get_node(pool, next_id)) {
-            if !node.domain.is_empty() {
-                let is_surprise = !prev_domain.is_empty() && prev_domain != node.domain;
+        let next_domain = cache.get_domain(next_id).unwrap_or_default();
+        if !next_domain.is_empty() {
+                let is_surprise = !prev_domain.is_empty() && prev_domain != next_domain;
 
                 // ── WRITE to collective: leave trails for other walkers ──
                 if let Ok(mut c) = collective.try_lock() {
                     *c.visited_nodes.entry(next_id).or_insert(0) += 1;
-                    if !node.domain.is_empty() {
-                        *c.active_domains.entry(node.domain.clone()).or_insert(0) += 1;
-                    }
+                    *c.active_domains.entry(next_domain.clone()).or_insert(0) += 1;
                     if is_surprise {
-                        c.surprise_domains.insert(node.domain.clone());
+                        c.surprise_domains.insert(next_domain.clone());
                     }
                     // Drift collective emotion toward this walker's state
                     let alpha = 0.1; // Slow drift — collective is stable
@@ -188,8 +202,8 @@ pub fn walk_single(
                 if is_surprise {
                     result.surprises += 1;
                 }
-                if !result.domains_visited.contains(&node.domain) {
-                    result.domains_visited.push(node.domain.clone());
+                if !result.domains_visited.contains(&next_domain) {
+                    result.domains_visited.push(next_domain.clone());
                 }
 
                 // ── EVERY STEP PASSES THROUGH THE SELF-MODEL ──
@@ -197,9 +211,9 @@ pub fn walk_single(
                 let signal = Signal::new(
                     signal_kind,
                     &format!("Step {}: {} → {} via {} edge (w={:.2})",
-                        step, prev_domain, node.domain, edge.edge_type, edge.weight),
+                        step, prev_domain, next_domain, edge.edge_type, edge.weight),
                 )
-                .with_domain(&node.domain)
+                .with_domain(&next_domain)
                 .with_intensity(if is_surprise { 0.6 } else { 0.2 });
 
                 core::process(signal, self_model);
@@ -208,8 +222,7 @@ pub fn walk_single(
                 // THIS IS COGNITION: the walk changes the thinker,
                 // the changed thinker changes the walk.
 
-                prev_domain = node.domain;
-            }
+                prev_domain = next_domain;
         }
 
         current_id = next_id;
@@ -227,18 +240,19 @@ pub fn walk_single(
 
 /// Run multiple walkers in parallel and aggregate results.
 /// The shared self-model is passed in — all walkers feed it.
+/// Returns (WalkOutput, per-walker results) for post-walk analysis.
 pub async fn walk_parallel(
     pool: &PgPool,
     emotion: &EmotionalState,
     n_walkers: usize,
     steps: usize,
-    self_model: &std::sync::Arc<std::sync::Mutex<SelfModel>>,
-) -> WalkOutput {
+    self_model: &std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
+) -> (WalkOutput, Vec<WalkerResult>) {
     let start = Instant::now();
 
     // Signal: walk session starting
     {
-        let mut sm = self_model.lock().unwrap();
+        let mut sm = self_model.lock().await;
         let signal = Signal::new("session_start", &format!("Launching {} walkers", n_walkers))
             .with_intensity(0.4);
         core::process(signal, &mut sm);
@@ -250,12 +264,12 @@ pub async fn walk_parallel(
         .unwrap_or_default();
 
     if seeds.is_empty() {
-        return empty_output();
+        return (empty_output(), Vec::new());
     }
 
     // Assign biases — mode-dependent
     let mode = {
-        let sm = self_model.lock().unwrap();
+        let sm = self_model.lock().await;
         sm.mode.clone()
     };
     let biases: &[WalkerBias] = match mode {
@@ -277,11 +291,21 @@ pub async fn walk_parallel(
         .collect();
 
     let pool_clone = pool.clone();
-    let rt = tokio::runtime::Handle::current();
+
+    // ── Edge cache: preload seed neighborhoods for fast walks ──
+    let cache = EdgeCache::new(pool.clone());
+    let _ = cache.preload_radius(&seeds).await;
 
     // Clone self-model per walker (parallel perspectives, integrate after)
     // Like the brain: process in parallel, integrate in global workspace
-    let base_sm = self_model.lock().unwrap().clone();
+    let base_sm = self_model.lock().await.clone();
+
+    // Save base counter values — merge deltas, not absolute values
+    // (each walker_sm starts from base, so absolute values would count base N times)
+    let base_surprise_count = base_sm.surprise_count;
+    let base_dead_ends: HashMap<String, u32> = base_sm.dead_ends_by_domain.clone();
+    let base_signals: HashMap<String, u32> = base_sm.signals_by_source.clone();
+    let base_total_signals = base_sm.total_signals_processed;
 
     // Create shared stigmergic collective — walkers leave trails for each other
     let collective = Arc::new(Mutex::new(WalkerCollective::new()));
@@ -289,23 +313,28 @@ pub async fn walk_parallel(
     let walk_start = Instant::now();
     let results: Vec<(WalkerResult, SelfModel)> = configs
         .par_iter()
-        .map(|(seed, bias)| {
+        .enumerate()
+        .map(|(i, (seed, bias))| {
             let mut sm = base_sm.clone();  // Each walker gets its own copy
             let collective = Arc::clone(&collective);
-            let result = walk_single(&pool_clone, *seed, *bias, &EmotionalState {
+            let learned = base_sm.learned_biases.get(i);
+            let result = walk_single(&pool_clone, &cache, *seed, *bias, &EmotionalState {
                 valence: sm.valence,
                 arousal: sm.arousal,
                 energy: sm.energy,
-            }, steps, &rt, &mut sm, &collective);
+            }, steps, &mut sm, &collective, learned);
             (result, sm)
         })
         .collect();
     let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
 
+    // ── Flush edge cache writes to DB ──
+    let _ = cache.flush().await;
+
     // Merge per-walker self-models back into the shared self-model
     // Each walker saw different things — integrate all perspectives
     {
-        let mut sm = self_model.lock().unwrap();
+        let mut sm = self_model.lock().await;
         // Proper weighted average that preserves emotional scale
         let n_walkers = results.len() as f32;
         let walker_avg_valence: f32 = results.iter().map(|(_, s)| s.valence).sum::<f32>() / n_walkers;
@@ -326,8 +355,38 @@ pub async fn walk_parallel(
             for (domain, &count) in &walker_sm.attention_patterns {
                 *sm.attention_patterns.entry(domain.clone()).or_insert(0.0) += count;
             }
+            // Merge structural tracking — add deltas, not absolutes
+            sm.surprise_count += walker_sm.surprise_count.saturating_sub(base_surprise_count);
+            for (domain, &count) in &walker_sm.dead_ends_by_domain {
+                let delta = count.saturating_sub(*base_dead_ends.get(domain).unwrap_or(&0));
+                if delta > 0 {
+                    *sm.dead_ends_by_domain.entry(domain.clone()).or_insert(0) += delta;
+                }
+            }
+            for (source, &count) in &walker_sm.signals_by_source {
+                let delta = count.saturating_sub(*base_signals.get(source).unwrap_or(&0));
+                if delta > 0 {
+                    *sm.signals_by_source.entry(source.clone()).or_insert(0) += delta;
+                }
+            }
+            // Merge predictions from walkers
+            for (domain, pred) in &walker_sm.predictions {
+                sm.predictions.entry(domain.clone()).or_insert_with(|| pred.clone());
+            }
+            // Merge working memory (deduplicate by content prefix)
+            for wm_slot in &walker_sm.working_memory {
+                let key = safe_truncate(&wm_slot.content, 30);
+                if !sm.working_memory.iter().any(|s| s.content.starts_with(key)) {
+                    sm.working_memory.push_back(wm_slot.clone());
+                }
+            }
+            while sm.working_memory.len() > 5 {
+                sm.working_memory.pop_front();
+            }
         }
-        sm.total_signals_processed += results.iter().map(|(_, s)| s.total_signals_processed).sum::<u64>();
+        sm.total_signals_processed += results.iter()
+            .map(|(_, s)| s.total_signals_processed.saturating_sub(base_total_signals))
+            .sum::<u64>();
 
         // Signal: integration complete
         let signal = crate::core::Signal::new("integration", &format!(
@@ -335,32 +394,42 @@ pub async fn walk_parallel(
             results.len()
         )).with_intensity(0.3);
         crate::core::process(signal, &mut sm);
+
+        // ── Update learned biases from session outcomes ──
+        // Each walker's bias adapts based on what it found.
+        // Walkers that found surprises → more contradiction-seeking.
+        // Walkers that hit dead ends → more novelty-seeking.
+        for (i, (result, _walker_sm)) in results.iter().enumerate() {
+            if let Some(bias) = sm.learned_biases.get_mut(i) {
+                let novelty = if result.path.len() > 1 {
+                    result.surprises as f32 / result.path.len() as f32
+                } else {
+                    0.0
+                };
+                bias.update_from_session(
+                    result.surprises as u32,
+                    result.dead_ends as u32,
+                    novelty,
+                    result.domains_visited.len(),
+                );
+            }
+        }
     }
 
     // Extract just the walker results for aggregation
     let walker_results: Vec<WalkerResult> = results.into_iter().map(|(r, _)| r).collect();
 
-    // Aggregate results
-    let output = aggregate(pool, walker_results, walk_ms, start).await;
+    // Aggregate results (borrows walker_results, doesn't consume)
+    let output = aggregate(pool, &walker_results, walk_ms, start).await;
 
-    // Batch strengthen traversed edges (the walk changes the graph)
-    let all_edge_ids: Vec<i32> = output
-        .consensus_nodes
-        .iter()
-        .copied()
-        .chain(output.divergent_nodes.iter().copied())
-        .collect();
-    // Note: we use consensus_nodes as a proxy — actual edge strengthening
-    // happens via the edge IDs collected during walks
-    // For now, just log that we would strengthen
-
-    output
+    // Return both output and walker results for post-walk analysis
+    (output, walker_results)
 }
 
 /// Aggregate parallel walker results into structured cognition.
 async fn aggregate(
     pool: &PgPool,
-    results: Vec<WalkerResult>,
+    results: &[WalkerResult],
     walk_ms: f64,
     start: Instant,
 ) -> WalkOutput {
@@ -372,7 +441,7 @@ async fn aggregate(
     // Vote counting: which nodes did walkers visit?
     let mut node_votes: HashMap<i32, usize> = HashMap::new();
     let mut total_hops = 0;
-    for r in &results {
+    for r in results {
         for &node_id in &r.path {
             *node_votes.entry(node_id).or_insert(0) += 1;
         }
@@ -398,7 +467,7 @@ async fn aggregate(
 
     // Domain distribution
     let mut domain_counts: HashMap<String, usize> = HashMap::new();
-    for r in &results {
+    for r in results {
         for d in &r.domains_visited {
             *domain_counts.entry(d.clone()).or_insert(0) += 1;
         }

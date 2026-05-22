@@ -122,6 +122,9 @@ impl LlmEngine {
 
         let url = format!("{}/v1/chat/completions", self.base_url);
 
+        tracing::info!("[llm] POST {} model={} max_tokens={:?} temp={:.2} ({} chars user)",
+            url, self.model, max_tokens, temperature, user.len());
+
         let resp = self
             .client
             .post(&url)
@@ -132,10 +135,14 @@ impl LlmEngine {
             .send()
             .await?;
 
+        tracing::info!("[llm] DeepSeek response: HTTP {} ({} bytes)",
+            resp.status().as_u16(), resp.content_length().unwrap_or(0));
+
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DeepSeek {} — {}", status, &text[..text.len().min(300)]);
+            let preview: String = text.chars().take(300).collect();
+            anyhow::bail!("DeepSeek {} — {}", status, preview);
         }
 
         let data: DeepSeekResponse = resp.json().await?;

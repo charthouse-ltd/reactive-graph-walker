@@ -80,14 +80,14 @@ pub struct DreamInsight {
 /// must remain stable and deterministic. No Monte Carlo mutations.
 pub async fn dream(
     pool: &PgPool,
-    self_model: &Arc<std::sync::Mutex<SelfModel>>,
+    self_model: &Arc<tokio::sync::Mutex<SelfModel>>,
     config: DreamConfig,
 ) -> DreamReport {
     let start = Instant::now();
 
     // Compliant mode: no dreaming. Graph stays frozen.
     {
-        let sm = self_model.lock().unwrap();
+        let sm = self_model.lock().await;
         if sm.mode == core::CognitiveMode::Compliant {
             tracing::info!("[dream] Compliant mode — dreaming disabled, graph frozen");
             return DreamReport {
@@ -103,7 +103,7 @@ pub async fn dream(
 
     // Signal: entering dream state
     {
-        let mut sm = self_model.lock().unwrap();
+        let mut sm = self_model.lock().await;
         let signal = Signal::new("dream_start", "Entering REM sleep — motor cortex disconnected")
             .with_intensity(0.5);
         core::process(signal, &mut sm);
@@ -214,7 +214,7 @@ pub async fn dream(
 
     // Signal: dream complete
     {
-        let mut sm = self_model.lock().unwrap();
+        let mut sm = self_model.lock().await;
         let signal = Signal::new(
             "dream_end",
             &format!(
