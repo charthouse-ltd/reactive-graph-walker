@@ -31,12 +31,18 @@ pub fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Embed a single text string. Returns a 384-dim vector.
+/// Embed a single text string. Returns a 768-dim vector.
+/// Prepends "search_document:" prefix for pgvector compatibility
+/// (matches Julian's Python-embedded memory_vectors format).
 pub fn embed_text(text: &str) -> anyhow::Result<Vec<f32>> {
     let mut lock = EMBEDDER.lock().unwrap();
     let model = lock.as_mut().ok_or_else(|| anyhow::anyhow!("Embedder not initialized"))?;
 
-    let embeddings = model.embed(vec![text], None)?;
+    // nomic-embed-text requires the "search_document:" prefix for
+    // document/passage embeddings to produce correct vectors.
+    // Without this, embeddings won't match Python-generated pgvector data.
+    let prefixed = format!("search_document: {}", text);
+    let embeddings = model.embed(vec![prefixed], None)?;
     embeddings
         .into_iter()
         .next()

@@ -557,10 +557,52 @@ async fn ingest_signal_endpoint(
     State(state): State<Arc<AppState>>,
     Json(req): Json<IngestSignalRequest>,
 ) -> Json<serde_json::Value> {
+    let domain = if req.domain.is_empty() { &req.kind } else { &req.domain };
+
+    // ── Awake driver: content → embedding → find similar nodes → inject energy ──
+    // This is the perception→walk→motor loop: external input activates
+    // matching graph nodes, which cascades to spontaneous walks.
+    let matched_nodes: Vec<(i32, f32)> = if !req.content.is_empty() && req.content.len() > 10 {
+        match crate::embed::embed_text(&req.content) {
+            Ok(embedding) => {
+                match crate::db::find_similar_nodes(&state.pool, &embedding, 5, 0.7).await {
+                    Ok(nodes) => {
+                        for (node_id, similarity, _content) in &nodes {
+                            state.diverger.notify_edge_change(EdgeChange {
+                                edge_id: 0,
+                                source_id: *node_id,
+                                target_id: *node_id, // self-loop: activate the node itself
+                                delta: *similarity as f32 * req.intensity,
+                                edge_type: "activated_by".into(),
+                            });
+                        }
+                        tracing::debug!(
+                            "[ingest] Content matched {} nodes (best sim={:.2}), injected energy",
+                            nodes.len(),
+                            nodes.first().map(|(_, s, _)| *s as f32).unwrap_or(0.0)
+                        );
+                        nodes.iter().map(|(id, sim, _)| (*id, *sim as f32)).collect()
+                    }
+                    Err(e) => {
+                        tracing::debug!("[ingest] find_similar_nodes failed: {}", e);
+                        Vec::new()
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("[ingest] embed_text failed: {}", e);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // ── Self-model update ──
     let mut sm = state.self_model.lock().await;
 
     let signal = crate::core::Signal::new(&req.kind, &req.content)
-        .with_domain(if req.domain.is_empty() { &req.kind } else { &req.domain })
+        .with_domain(domain)
         .with_intensity(req.intensity.clamp(0.0, 1.0));
 
     let (output, noticing) = crate::core::process(signal, &mut sm);
@@ -574,6 +616,7 @@ async fn ingest_signal_endpoint(
             "observation": n.observation,
             "significance": n.significance,
         })),
+        "matched_nodes": matched_nodes.len(),
         "self_model": {
             "valence": sm.valence,
             "arousal": sm.arousal,
