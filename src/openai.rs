@@ -186,14 +186,9 @@ pub async fn chat_completions(
 
     let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
 
-    // 3. Build enriched prompt for Qwen
+    // 3. Build walker context. The provider/Ollama paths below assemble their
+    //    own system+user messages from this, so no combined prompt is needed here.
     let walker_context = format_walk_context(&walk_output);
-    let enriched_prompt = format!(
-        "{}\n\n{}\n\nUser: {}",
-        walker_context,
-        if system_prompt.is_empty() { "" } else { &system_prompt },
-        stimulus,
-    );
 
     // 4. Generate text — route through provider or fall back to Ollama
     //
