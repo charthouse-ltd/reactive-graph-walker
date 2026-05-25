@@ -126,19 +126,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Start periodic self-model save (every 60s)
-    {
-        let save_pool = pool.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                // The save happens inside api.rs where self_model is accessible
-                // This is a placeholder — actual save is triggered by the API state
-                tracing::debug!("[rgw] Self-model save tick");
-            }
-        });
-    }
+    // Note: periodic self-model persistence runs inside api::serve (it owns the
+    // self_model). A no-op placeholder loop used to live here; removed as dead code.
 
     // Start HTTP server
     let addr = format!("{}:{}", args.host, args.port);
