@@ -445,6 +445,50 @@ pub async fn walk_parallel(
     (output, walker_results)
 }
 
+/// Classify visited nodes into (consensus, divergent, blind_spots) by how many
+/// walkers landed on each. The three buckets form a COMPLETE partition of every
+/// node with ≥1 vote — there is no uncategorized middle band:
+///   consensus   : votes > 0.6·n   (most walkers agree)
+///   divergent   : 1 < votes ≤ 0.6·n (a minority converged, short of consensus)
+///   blind_spots : votes == 1       (only one walker saw it)
+fn classify_votes(
+    node_votes: &HashMap<i32, usize>,
+    n: usize,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let consensus_threshold = n as f32 * 0.6;
+    let mut consensus = Vec::new();
+    let mut divergent = Vec::new();
+    let mut blind_spots = Vec::new();
+    for (&node, &votes) in node_votes {
+        if votes as f32 > consensus_threshold {
+            consensus.push(node);
+        } else if votes > 1 {
+            divergent.push(node);
+        } else {
+            blind_spots.push(node); // votes == 1
+        }
+    }
+    (consensus, divergent, blind_spots)
+}
+
+/// Emotional resonance: the mean edge weight the collective traversed per hop.
+/// High = walks moved through strong, well-worn connections; low = weak/random.
+/// Clamped to 0..1.
+fn compute_resonance(results: &[WalkerResult]) -> f32 {
+    let per_walker: Vec<f32> = results
+        .iter()
+        .filter_map(|r| {
+            let hops = r.path.len().saturating_sub(1);
+            (hops > 0).then(|| r.total_weight / hops as f32)
+        })
+        .collect();
+    if per_walker.is_empty() {
+        0.0
+    } else {
+        (per_walker.iter().sum::<f32>() / per_walker.len() as f32).clamp(0.0, 1.0)
+    }
+}
+
 /// Aggregate parallel walker results into structured cognition.
 async fn aggregate(
     pool: &PgPool,
@@ -467,22 +511,8 @@ async fn aggregate(
         total_hops += r.path.len();
     }
 
-    // Classify nodes by agreement level
-    let consensus: Vec<i32> = node_votes
-        .iter()
-        .filter(|(_, v)| **v as f32 > n as f32 * 0.6)
-        .map(|(k, _)| *k)
-        .collect();
-    let divergent: Vec<i32> = node_votes
-        .iter()
-        .filter(|(_, v)| **v > 1 && (**v as f32) <= n as f32 * 0.4)
-        .map(|(k, _)| *k)
-        .collect();
-    let blind_spots: Vec<i32> = node_votes
-        .iter()
-        .filter(|(_, v)| **v == 1)
-        .map(|(k, _)| *k)
-        .collect();
+    // Classify nodes by agreement level (pure, complete partition — see helper).
+    let (consensus, divergent, blind_spots) = classify_votes(&node_votes, n);
 
     // Domain distribution
     let mut domain_counts: HashMap<String, usize> = HashMap::new();
@@ -502,6 +532,11 @@ async fn aggregate(
     let agreement = consensus.len() as f32 / total_unique as f32;
     let total_surprises: usize = results.iter().map(|r| r.surprises).sum();
     let novelty = ((divergent.len() + total_surprises) as f32 / total_unique as f32).min(1.0);
+
+    // Emotional resonance: how strongly the collective moved through well-worn
+    // (high-weight) edges vs. weak/random ones (pure helper). Previously this
+    // field was hard-coded 0.0 yet consumed by metacog.
+    let resonance = compute_resonance(results);
 
     // Novel connections count
     let novel_connections = total_surprises;
@@ -548,7 +583,7 @@ async fn aggregate(
         domain_distribution: domain_counts,
         agreement_score: agreement,
         novelty_score: novelty,
-        emotional_resonance: 0.0,
+        emotional_resonance: resonance,
         search_query: None,
         expression_seeds,
         novel_connections,
@@ -708,5 +743,54 @@ fn empty_output() -> WalkOutput {
         walk_ms: 0.0,
         total_ms: 0.0,
         hops_per_sec: 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wr(path: Vec<i32>, total_weight: f32) -> WalkerResult {
+        WalkerResult {
+            bias: WalkerBias::Curiosity,
+            path,
+            domains_visited: Vec::new(),
+            edge_types_used: Vec::new(),
+            total_weight,
+            surprises: 0,
+            dead_ends: 0,
+            edges_traversed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn classify_votes_is_a_complete_partition() {
+        let mut votes = HashMap::new();
+        votes.insert(1, 4); // consensus
+        votes.insert(2, 3); // consensus
+        votes.insert(3, 2); // divergent (previously fell into the uncategorized gap)
+        votes.insert(4, 1); // blind spot
+        let (consensus, divergent, blind) = classify_votes(&votes, 4);
+
+        assert!(consensus.contains(&1) && consensus.contains(&2));
+        assert_eq!(divergent, vec![3], "2-of-4 votes must be divergent, not lost");
+        assert_eq!(blind, vec![4]);
+        // Every node is categorized exactly once — no gaps, no overlaps.
+        assert_eq!(consensus.len() + divergent.len() + blind.len(), votes.len());
+    }
+
+    #[test]
+    fn resonance_is_mean_edge_weight_per_hop() {
+        // A: 2 hops, weight 1.0 → 0.5 ; B: 1 hop, weight 0.8 → 0.8 ; mean = 0.65
+        let results = vec![wr(vec![1, 2, 3], 1.0), wr(vec![1, 2], 0.8)];
+        let r = compute_resonance(&results);
+        assert!((r - 0.65).abs() < 1e-6, "expected 0.65, got {r}");
+    }
+
+    #[test]
+    fn resonance_ignores_zero_hop_walks_and_clamps() {
+        assert_eq!(compute_resonance(&[]), 0.0);
+        assert_eq!(compute_resonance(&[wr(vec![1], 5.0)]), 0.0); // 0 hops → skipped → empty
+        assert_eq!(compute_resonance(&[wr(vec![1, 2], 9.0)]), 1.0); // clamped
     }
 }
