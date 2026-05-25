@@ -211,10 +211,13 @@ pub async fn chat_completions(
         } else {
             format!("{}\n\n{}", system_prompt, walker_context)
         };
+        // No external difficulty signal here; let the complexity score (derived
+        // from walker novelty/disagreement) decide chat vs reasoner via its threshold.
         let result = provider.generate(
             &system_with_context,
             &stimulus,
             complexity,
+            false,
             req.max_tokens,
             req.temperature,
         ).await;

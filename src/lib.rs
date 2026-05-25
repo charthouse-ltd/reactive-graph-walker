@@ -8,6 +8,8 @@ pub mod graph;
 pub mod walker;
 pub mod diverger;
 pub mod llm;
+pub mod metrics;
+pub mod budget;
 pub mod provider;
 pub mod openai;
 pub mod motor;

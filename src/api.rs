@@ -115,6 +115,7 @@ pub async fn serve(
         .route("/health", get(health))
         .route("/walk", post(walk))
         .route("/stats", get(stats))
+        .route("/metrics", get(metrics_endpoint))
         .route("/benchmark", get(benchmark))
         .route("/diverger", get(diverger_stats))
         .route("/prune", post(prune))
@@ -215,13 +216,24 @@ async fn walk(
         let mut sm = state.self_model.lock().await;
         let diagnosis = crate::metacog::run_critic(&output, &walker_results, &mut sm);
 
-        // Optionally escalate to LLM if diagnosis warrants it
-        if diagnosis.algorithmic_adjustments.escalate_to_llm || sm.critic_sessions_since_llm > 10 {
+        // Escalate to the LLM critic only when it earns its cost:
+        //   * the diagnosis flags genuine difficulty (stuck / explore / refine), or
+        //   * a periodic calibration is due — but not while resting, and at a far
+        //     larger interval than the old every-11-sessions default (cadence waste).
+        let escalate = diagnosis.algorithmic_adjustments.escalate_to_llm;
+        let interval: u32 = std::env::var("RGW_CRITIC_LLM_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let periodic = sm.critic_sessions_since_llm > interval
+            && diagnosis.primary_diagnosis != crate::metacog::DiagnosisLabel::Rest;
+        if escalate || periodic {
             if let Some(ref provider) = state.provider {
                 let summary = crate::metacog::build_session_summary(&output, &walker_results, &sm);
                 let (system, user) = crate::metacog::build_critic_llm_prompt(&diagnosis, &summary);
 
-                let result = provider.generate(&system, &user, 0.5, Some(256), 0.3).await;
+                // Genuine difficulty routes to the reasoner; periodic calibration stays on chat.
+                let result = provider.generate(&system, &user, 0.5, escalate, Some(256), 0.3).await;
                 crate::metacog::run_llm_critic(&diagnosis, &summary, &mut sm, &result.text).await;
             }
         }
@@ -404,6 +416,12 @@ async fn dream_endpoint(
     let config = crate::dream::DreamConfig::default();
     let report = crate::dream::dream(&state.pool, &state.self_model, config).await;
     Json(report)
+}
+
+/// GET /metrics — live DeepSeek cost scorecard.
+/// tokens/call, calls/min, est. cost, % reasoner, and dedup (duplicate-call) rate.
+async fn metrics_endpoint() -> Json<crate::metrics::MetricsSnapshot> {
+    Json(crate::metrics::snapshot())
 }
 
 /// GET /stats — graph topology

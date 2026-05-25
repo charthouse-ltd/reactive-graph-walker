@@ -10,12 +10,18 @@
 //! Model: nomic-ai/nomic-embed-text-v1.5 (768-dim) — matches
 //! Julian's pgvector embeddings (nomic-embed-text via Ollama).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
+use dashmap::DashMap;
 use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
 
 lazy_static::lazy_static! {
     static ref EMBEDDER: Mutex<Option<TextEmbedding>> = Mutex::new(None);
+    /// Cache identical text → embedding so repeated ingest content (RSS
+    /// re-polls, retried webhooks) isn't re-embedded. ~3KB per entry; capped.
+    static ref EMBED_CACHE: DashMap<u64, Vec<f32>> = DashMap::new();
 }
 
 /// Initialize the embedding model (call once on startup)
@@ -35,6 +41,14 @@ pub fn init() -> anyhow::Result<()> {
 /// Prepends "search_document:" prefix for pgvector compatibility
 /// (matches Julian's Python-embedded memory_vectors format).
 pub fn embed_text(text: &str) -> anyhow::Result<Vec<f32>> {
+    // Reuse a cached embedding for identical text instead of recomputing.
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    let key = hasher.finish();
+    if let Some(cached) = EMBED_CACHE.get(&key) {
+        return Ok(cached.clone());
+    }
+
     let mut lock = EMBEDDER.lock().unwrap();
     let model = lock.as_mut().ok_or_else(|| anyhow::anyhow!("Embedder not initialized"))?;
 
@@ -43,10 +57,16 @@ pub fn embed_text(text: &str) -> anyhow::Result<Vec<f32>> {
     // Python `model.embed()`. Prepending here double-prefixes and collapses
     // cosine similarity against Julian's stored vectors → 0 matches.
     let embeddings = model.embed(vec![text], None)?;
-    embeddings
+    let embedding = embeddings
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("No embedding produced"))
+        .ok_or_else(|| anyhow::anyhow!("No embedding produced"))?;
+
+    if EMBED_CACHE.len() > 1024 {
+        EMBED_CACHE.clear(); // simple bounded reset; embeddings are cheap to rebuild
+    }
+    EMBED_CACHE.insert(key, embedding.clone());
+    Ok(embedding)
 }
 
 /// Embed multiple texts at once (batch processing)

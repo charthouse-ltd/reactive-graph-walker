@@ -13,6 +13,8 @@ mod graph;
 mod walker;
 mod diverger;
 mod llm;
+mod metrics;
+mod budget;
 mod provider;
 mod openai;
 mod motor;

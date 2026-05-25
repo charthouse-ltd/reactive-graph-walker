@@ -558,7 +558,19 @@ pub fn diagnose_session(summary: &WalkSessionSummary, sm: &SelfModel) -> CriticD
 
 /// Format the session summary + diagnosis as an LLM prompt.
 fn format_critic_prompt(summary: &WalkSessionSummary, diagnosis: &CriticDiagnosis) -> String {
-    let domains_str = summary.domains_visited.join(", ");
+    // Top-k the domain list: it grows with the graph and would otherwise
+    // dump an unbounded subgraph into the prompt. The unique count is kept
+    // separately, so the signal survives the cap.
+    const MAX_DOMAINS_IN_PROMPT: usize = 12;
+    let domains_str = if summary.domains_visited.len() > MAX_DOMAINS_IN_PROMPT {
+        format!(
+            "{}, …(+{} more)",
+            summary.domains_visited[..MAX_DOMAINS_IN_PROMPT].join(", "),
+            summary.domains_visited.len() - MAX_DOMAINS_IN_PROMPT
+        )
+    } else {
+        summary.domains_visited.join(", ")
+    };
     let noticings_str = summary.recent_noticings.join("; ");
     let wm_str = summary.working_memory.join("; ");
     let biases_str: Vec<String> = summary.bias_weights.iter()
@@ -1445,5 +1457,60 @@ mod tests {
 
         // Stuck takes priority over ExploreMore
         assert_eq!(diagnosis.primary_diagnosis, DiagnosisLabel::BreakLoop);
+    }
+
+    // ── Efficiency cognition-quality guards ──────────────────────
+    // These assert that the cost-bounding levers (top-k context, token
+    // budget, difficulty routing) do NOT strip the essential cognitive
+    // signal from the critic prompt. Run on a fixed scenario set.
+
+    #[test]
+    fn efficiency_budget_preserves_critic_signal() {
+        let mut sm = test_sm();
+        // Pathological growth: a huge domain list that would otherwise dump
+        // an unbounded subgraph into the prompt.
+        let output = test_walk_output();
+        let mut results = test_walker_results();
+        results[0].domains_visited =
+            (0..100).map(|i| format!("domain_{}", i)).collect();
+        sm.consecutive_repetitions = 4; // force BreakLoop (a difficult session)
+
+        let summary = build_session_summary(&output, &results, &sm);
+        let diagnosis = diagnose_session(&summary, &sm);
+        let (system, user) = build_critic_llm_prompt(&diagnosis, &summary);
+
+        // Top-k cap engaged, but the unique-domain count still conveys breadth.
+        assert!(user.contains("more)"), "domain list should be capped, not dumped");
+        // Essential instructions survive both the cap and the wire-level budget.
+        let budgeted = crate::budget::budget_prompt(&user);
+        assert!(system.contains("metacognitive critic"));
+        assert!(budgeted.contains("Output ONLY JSON"), "JSON contract must survive budgeting");
+        assert!(budgeted.contains("Diagnosis:"), "diagnosis must survive budgeting");
+        // And the prompt is actually bounded.
+        assert!(crate::budget::approx_tokens(&budgeted) <= crate::budget::max_prompt_tokens());
+    }
+
+    #[test]
+    fn efficiency_routing_escalates_only_hard_sessions() {
+        // Easy/normal session → algorithmic only → cheap chat tier.
+        let sm = test_sm();
+        let output = test_walk_output();
+        let results = test_walker_results();
+        let summary = build_session_summary(&output, &results, &sm);
+        let normal = diagnose_session(&summary, &sm);
+        assert!(
+            !crate::budget::wants_reasoner(0.5, normal.algorithmic_adjustments.escalate_to_llm),
+            "a normal session must NOT pay for the reasoner"
+        );
+
+        // Stuck session → genuine difficulty → reasoner tier.
+        let mut stuck_sm = test_sm();
+        stuck_sm.consecutive_repetitions = 4;
+        let stuck_summary = build_session_summary(&output, &results, &stuck_sm);
+        let stuck = diagnose_session(&stuck_summary, &stuck_sm);
+        assert!(
+            crate::budget::wants_reasoner(0.5, stuck.algorithmic_adjustments.escalate_to_llm),
+            "a genuinely stuck session SHOULD escalate to the reasoner"
+        );
     }
 }
