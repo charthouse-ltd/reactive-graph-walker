@@ -2,3 +2,5 @@ target/
 .claude/
 .env
 .fastembed_cache/
+
+.codegraph/

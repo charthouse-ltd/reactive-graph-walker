@@ -62,6 +62,13 @@ impl Default for ProviderConfig {
 /// Unified LLM provider
 pub struct Provider {
     local: Option<LlmEngine>,
+    /// DeepSeek engine, wired from DEEPSEEK_API_KEY when present. This is the
+    /// primary path: one engine that routes between chat and reasoner tiers.
+    deepseek: Option<LlmEngine>,
+    /// Model name for the cheap/fast tier (default "deepseek-chat").
+    chat_model: String,
+    /// Model name for the expensive reasoning tier (default "deepseek-reasoner").
+    reasoner_model: String,
     config: ProviderConfig,
 }
 
@@ -101,22 +108,101 @@ impl Provider {
             None
         };
 
-        Ok(Self { local, config })
+        // Wire DeepSeek on by default from the environment. This is the
+        // primary generation path; chat vs reasoner is chosen per call.
+        let chat_model =
+            std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
+        let reasoner_model = std::env::var("DEEPSEEK_REASONER_MODEL")
+            .unwrap_or_else(|_| "deepseek-reasoner".into());
+        let deepseek = match std::env::var("DEEPSEEK_API_KEY") {
+            Ok(key) if !key.is_empty() => match LlmEngine::new(&key, &chat_model) {
+                Ok(engine) => {
+                    tracing::info!(
+                        "[provider] DeepSeek wired: chat={} reasoner={} (routed by difficulty)",
+                        chat_model, reasoner_model
+                    );
+                    Some(engine)
+                }
+                Err(e) => {
+                    tracing::warn!("[provider] DeepSeek init failed: {}. Falling back.", e);
+                    None
+                }
+            },
+            _ => {
+                tracing::info!("[provider] DEEPSEEK_API_KEY not set — DeepSeek path disabled.");
+                None
+            }
+        };
+
+        Ok(Self { local, deepseek, chat_model, reasoner_model, config })
     }
 
     /// Generate text — routes between local and cloud based on complexity.
     ///
     /// complexity: 0.0 = trivial (journal entry, short response)
     ///             1.0 = hard (blog post, analysis, multi-step reasoning)
+    /// difficult:  hard signal from metacog (stuck / break-loop) that forces
+    ///             reasoner escalation regardless of the complexity score.
     pub async fn generate(
         &self,
         system: &str,
         user: &str,
         complexity: f32,
+        difficult: bool,
         max_tokens: Option<u32>,
         temperature: f32,
     ) -> GenerateResult {
         let start = std::time::Instant::now();
+
+        // ── Token budget: graph context (carried in `system`) and the user
+        // stimulus can both grow unbounded. Cap each before they hit the wire.
+        let system = crate::budget::budget_prompt(system);
+        let user = crate::budget::budget_prompt(user);
+
+        // ── DeepSeek primary path: route, dedup, call, account ──
+        if let Some(ref ds) = self.deepseek {
+            let model = if crate::budget::wants_reasoner(complexity, difficult) {
+                self.reasoner_model.as_str()
+            } else {
+                self.chat_model.as_str()
+            };
+
+            // Idempotency: identical cognition states hash equal — reuse the
+            // cached completion instead of paying for the same call again.
+            let hash = crate::budget::prompt_hash(model, &system, &user, max_tokens, temperature);
+            if let Some(cached) = crate::budget::dedup_lookup(hash) {
+                crate::metrics::record_dedup_hit();
+                tracing::info!("[provider] DeepSeek dedup hit (model={}) — call skipped", model);
+                return GenerateResult {
+                    tokens_generated: crate::budget::approx_tokens(&cached) as u32,
+                    text: cached,
+                    model_used: ModelUsed::Cloud(format!("deepseek:{} (dedup)", model)),
+                    elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+                };
+            }
+
+            match ds.chat_with_model(model, &system, &user, max_tokens, temperature).await {
+                Ok((text, usage)) => {
+                    crate::budget::dedup_store(hash, &text);
+                    tracing::info!(
+                        "[provider] DeepSeek {} (complexity={:.2} difficult={})",
+                        model, complexity, difficult
+                    );
+                    return GenerateResult {
+                        tokens_generated: usage.completion_tokens,
+                        text,
+                        model_used: ModelUsed::Cloud(format!("deepseek:{}", model)),
+                        elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!("[provider] DeepSeek failed: {}. Trying fallbacks.", e);
+                }
+            }
+        }
+
+        let system = system.as_str();
+        let user = user.as_str();
 
         // Route: simple → local, complex → cloud
         if complexity < self.config.cloud_threshold {
@@ -295,16 +381,29 @@ async fn generate_anthropic(
         .map_err(|e| format!("Anthropic request failed: {}", e))?;
 
     if !resp.status().is_success() {
+        crate::metrics::record_failure();
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Anthropic {} — {}", status, &body[..200.min(body.len())]));
     }
 
-    let data: serde_json::Value = resp.json().await.map_err(|e| format!("Parse failed: {}", e))?;
-    data["content"][0]["text"]
+    let data: serde_json::Value = resp.json().await.map_err(|e| {
+        crate::metrics::record_failure();
+        format!("Parse failed: {}", e)
+    })?;
+    let text = data["content"][0]["text"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| "No text in Anthropic response".into())
+        .ok_or_else(|| {
+            crate::metrics::record_failure();
+            "No text in Anthropic response".to_string()
+        })?;
+    let pt = data["usage"]["input_tokens"].as_u64()
+        .unwrap_or_else(|| (crate::budget::approx_tokens(system) + crate::budget::approx_tokens(user)) as u64);
+    let ct = data["usage"]["output_tokens"].as_u64()
+        .unwrap_or_else(|| crate::budget::approx_tokens(&text) as u64);
+    crate::metrics::record_call(model, pt, ct);
+    Ok(text)
 }
 
 /// Call any OpenAI-compatible API (OpenAI, Groq, Together, etc.)
@@ -342,16 +441,29 @@ async fn generate_openai_compat(
         .map_err(|e| format!("OpenAI-compat request failed: {}", e))?;
 
     if !resp.status().is_success() {
+        crate::metrics::record_failure();
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("OpenAI-compat {} — {}", status, &body[..200.min(body.len())]));
     }
 
-    let data: serde_json::Value = resp.json().await.map_err(|e| format!("Parse failed: {}", e))?;
-    data["choices"][0]["message"]["content"]
+    let data: serde_json::Value = resp.json().await.map_err(|e| {
+        crate::metrics::record_failure();
+        format!("Parse failed: {}", e)
+    })?;
+    let text = data["choices"][0]["message"]["content"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| "No content in response".into())
+        .ok_or_else(|| {
+            crate::metrics::record_failure();
+            "No content in response".to_string()
+        })?;
+    let pt = data["usage"]["prompt_tokens"].as_u64()
+        .unwrap_or_else(|| (crate::budget::approx_tokens(system) + crate::budget::approx_tokens(user)) as u64);
+    let ct = data["usage"]["completion_tokens"].as_u64()
+        .unwrap_or_else(|| crate::budget::approx_tokens(&text) as u64);
+    crate::metrics::record_call(model, pt, ct);
+    Ok(text)
 }
 
 /// Call Gemini API directly
@@ -395,6 +507,7 @@ async fn generate_gemini(
         .map_err(|e| format!("Gemini request failed: {}", e))?;
 
     if !resp.status().is_success() {
+        crate::metrics::record_failure();
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Gemini {} — {}", status, &body[..200.min(body.len())]));
@@ -403,10 +516,22 @@ async fn generate_gemini(
     let data: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("Gemini parse failed: {}", e))?;
+        .map_err(|e| {
+            crate::metrics::record_failure();
+            format!("Gemini parse failed: {}", e)
+        })?;
 
-    data["candidates"][0]["content"]["parts"][0]["text"]
+    let text = data["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| "No text in Gemini response".into())
+        .ok_or_else(|| {
+            crate::metrics::record_failure();
+            "No text in Gemini response".to_string()
+        })?;
+    let pt = data["usageMetadata"]["promptTokenCount"].as_u64()
+        .unwrap_or_else(|| (crate::budget::approx_tokens(system) + crate::budget::approx_tokens(user)) as u64);
+    let ct = data["usageMetadata"]["candidatesTokenCount"].as_u64()
+        .unwrap_or_else(|| crate::budget::approx_tokens(&text) as u64);
+    crate::metrics::record_call(model, pt, ct);
+    Ok(text)
 }

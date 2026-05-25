@@ -1,0 +1,213 @@
+//! LLM cost accounting — the measurement spine for DeepSeek efficiency.
+//!
+//! Every generation call (DeepSeek or any cloud provider) flows through
+//! `record_call`, which captures the REAL `usage` object returned by the
+//! API (prompt/completion tokens) rather than a `split_whitespace()` guess.
+//! Dedup hits (calls we avoided) flow through `record_dedup_hit`, so the
+//! duplicate-call rate is observable. `snapshot()` renders the scorecard
+//! numbers — calls/min, tokens/call, % reasoner, estimated cost — live.
+//!
+//! This module never logs API keys. It only counts tokens.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use serde::Serialize;
+
+/// DeepSeek published pricing, USD per 1M tokens (cache-miss rates).
+/// Used for cost ESTIMATION only; override with env if rates change.
+const CHAT_INPUT_USD_PER_M: f64 = 0.27;
+const CHAT_OUTPUT_USD_PER_M: f64 = 1.10;
+const REASONER_INPUT_USD_PER_M: f64 = 0.55;
+const REASONER_OUTPUT_USD_PER_M: f64 = 2.19;
+
+/// One global metrics sink. Atomics for the hot counters; a small Mutex
+/// only for the rolling timestamp window used to compute calls/min.
+pub struct LlmMetrics {
+    pub calls: AtomicU64,
+    pub failed_calls: AtomicU64,
+    /// Calls served from the dedup cache (i.e. API calls avoided).
+    pub dedup_hits: AtomicU64,
+    pub chat_calls: AtomicU64,
+    pub reasoner_calls: AtomicU64,
+    pub prompt_tokens: AtomicU64,
+    pub completion_tokens: AtomicU64,
+    /// Cost in micro-USD (USD * 1e6) to keep it an integer atomic.
+    pub cost_micros: AtomicU64,
+    /// Unix-seconds timestamps of recent successful calls (rolling 60s window).
+    recent: Mutex<Vec<f64>>,
+    started_at: f64,
+}
+
+impl LlmMetrics {
+    fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            failed_calls: AtomicU64::new(0),
+            dedup_hits: AtomicU64::new(0),
+            chat_calls: AtomicU64::new(0),
+            reasoner_calls: AtomicU64::new(0),
+            prompt_tokens: AtomicU64::new(0),
+            completion_tokens: AtomicU64::new(0),
+            cost_micros: AtomicU64::new(0),
+            recent: Mutex::new(Vec::new()),
+            started_at: now_secs(),
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref METRICS: LlmMetrics = LlmMetrics::new();
+}
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// A model name is the reasoner path if it mentions "reasoner".
+fn is_reasoner(model: &str) -> bool {
+    model.contains("reasoner")
+}
+
+/// Estimate USD cost for one call given the model and token usage.
+pub fn estimate_cost_usd(model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+    let (in_rate, out_rate) = if is_reasoner(model) {
+        (REASONER_INPUT_USD_PER_M, REASONER_OUTPUT_USD_PER_M)
+    } else {
+        (CHAT_INPUT_USD_PER_M, CHAT_OUTPUT_USD_PER_M)
+    };
+    (prompt_tokens as f64 / 1_000_000.0) * in_rate
+        + (completion_tokens as f64 / 1_000_000.0) * out_rate
+}
+
+/// Record a successful generation call with REAL usage from the API.
+pub fn record_call(model: &str, prompt_tokens: u64, completion_tokens: u64) {
+    METRICS.calls.fetch_add(1, Ordering::Relaxed);
+    if is_reasoner(model) {
+        METRICS.reasoner_calls.fetch_add(1, Ordering::Relaxed);
+    } else {
+        METRICS.chat_calls.fetch_add(1, Ordering::Relaxed);
+    }
+    METRICS.prompt_tokens.fetch_add(prompt_tokens, Ordering::Relaxed);
+    METRICS.completion_tokens.fetch_add(completion_tokens, Ordering::Relaxed);
+
+    let cost = estimate_cost_usd(model, prompt_tokens, completion_tokens);
+    METRICS
+        .cost_micros
+        .fetch_add((cost * 1_000_000.0) as u64, Ordering::Relaxed);
+
+    if let Ok(mut recent) = METRICS.recent.lock() {
+        let now = now_secs();
+        recent.retain(|&t| now - t < 60.0);
+        recent.push(now);
+    }
+
+    tracing::info!(
+        "[metrics] call model={} prompt_tok={} completion_tok={} est_cost=${:.6}",
+        model, prompt_tokens, completion_tokens, cost
+    );
+}
+
+/// Record a call that was avoided because the prompt hash was already seen.
+pub fn record_dedup_hit() {
+    METRICS.dedup_hits.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a failed generation attempt (no usage available).
+pub fn record_failure() {
+    METRICS.failed_calls.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Serializable scorecard snapshot — the numbers PHASE 0/DELIVERABLE want.
+#[derive(Debug, Serialize)]
+pub struct MetricsSnapshot {
+    pub calls: u64,
+    pub failed_calls: u64,
+    pub dedup_hits: u64,
+    pub chat_calls: u64,
+    pub reasoner_calls: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub est_cost_usd: f64,
+    pub uptime_secs: f64,
+    pub calls_per_min: f64,
+    pub calls_per_min_lifetime: f64,
+    pub reasoner_pct: f64,
+    pub dup_rate: f64,
+    pub avg_prompt_tokens: f64,
+    pub avg_completion_tokens: f64,
+    pub tokens_per_call: f64,
+}
+
+/// Read the current metrics. Cheap; safe to call from a handler.
+pub fn snapshot() -> MetricsSnapshot {
+    let calls = METRICS.calls.load(Ordering::Relaxed);
+    let dedup = METRICS.dedup_hits.load(Ordering::Relaxed);
+    let chat = METRICS.chat_calls.load(Ordering::Relaxed);
+    let reasoner = METRICS.reasoner_calls.load(Ordering::Relaxed);
+    let prompt_t = METRICS.prompt_tokens.load(Ordering::Relaxed);
+    let completion_t = METRICS.completion_tokens.load(Ordering::Relaxed);
+    let cost = METRICS.cost_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+
+    let uptime = (now_secs() - METRICS.started_at).max(1e-6);
+    let calls_per_min_recent = METRICS
+        .recent
+        .lock()
+        .map(|mut r| {
+            let now = now_secs();
+            r.retain(|&t| now - t < 60.0);
+            r.len() as f64
+        })
+        .unwrap_or(0.0);
+
+    let attempts = calls + dedup; // calls we would have made without dedup
+    MetricsSnapshot {
+        calls,
+        failed_calls: METRICS.failed_calls.load(Ordering::Relaxed),
+        dedup_hits: dedup,
+        chat_calls: chat,
+        reasoner_calls: reasoner,
+        prompt_tokens: prompt_t,
+        completion_tokens: completion_t,
+        total_tokens: prompt_t + completion_t,
+        est_cost_usd: cost,
+        uptime_secs: uptime,
+        calls_per_min: calls_per_min_recent,
+        calls_per_min_lifetime: calls as f64 / (uptime / 60.0),
+        reasoner_pct: if calls > 0 { reasoner as f64 / calls as f64 * 100.0 } else { 0.0 },
+        dup_rate: if attempts > 0 { dedup as f64 / attempts as f64 * 100.0 } else { 0.0 },
+        avg_prompt_tokens: if calls > 0 { prompt_t as f64 / calls as f64 } else { 0.0 },
+        avg_completion_tokens: if calls > 0 { completion_t as f64 / calls as f64 } else { 0.0 },
+        tokens_per_call: if calls > 0 { (prompt_t + completion_t) as f64 / calls as f64 } else { 0.0 },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoner_is_detected_and_priced_higher() {
+        assert!(is_reasoner("deepseek-reasoner"));
+        assert!(!is_reasoner("deepseek-chat"));
+        let chat = estimate_cost_usd("deepseek-chat", 1_000_000, 1_000_000);
+        let reasoner = estimate_cost_usd("deepseek-reasoner", 1_000_000, 1_000_000);
+        assert!(reasoner > chat, "reasoner must cost more than chat");
+        // chat: 0.27 + 1.10 = 1.37 per 1M+1M
+        assert!((chat - 1.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn snapshot_reports_token_averages() {
+        // Note: global state — only assert on monotonic/relative behaviour.
+        let before = snapshot().calls;
+        record_call("deepseek-chat", 100, 50);
+        let after = snapshot();
+        assert_eq!(after.calls, before + 1);
+        assert!(after.total_tokens >= 150);
+    }
+}
