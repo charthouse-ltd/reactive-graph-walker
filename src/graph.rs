@@ -84,13 +84,17 @@ pub enum WalkerBias {
 }
 
 impl WalkerBias {
-    /// All available biases
+    /// All available biases. Previously this omitted Analytical and Contrarian,
+    /// leaving Contrarian permanently unreachable (it appears in no other set)
+    /// and its "contradicts"-seeking scoring dead. Now genuinely all six.
     pub fn all() -> &'static [WalkerBias] {
         &[
             WalkerBias::Fear,
             WalkerBias::Curiosity,
             WalkerBias::Experience,
             WalkerBias::Random,
+            WalkerBias::Analytical,
+            WalkerBias::Contrarian,
         ]
     }
 
@@ -413,4 +417,18 @@ pub struct WalkOutput {
     pub walk_ms: f64,
     pub total_ms: f64,
     pub hops_per_sec: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_biases_exposes_every_variant() {
+        let all = WalkerBias::all();
+        // Regression: all() used to omit these two, leaving Contrarian unreachable.
+        assert!(all.contains(&WalkerBias::Contrarian), "Contrarian must be reachable");
+        assert!(all.contains(&WalkerBias::Analytical), "Analytical must be reachable");
+        assert_eq!(all.len(), 6, "all() should expose every bias variant");
+    }
 }

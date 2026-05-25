@@ -625,6 +625,19 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
                 self_model.arousal = (self_model.arousal + emotional_impact * 1.0).min(1.0);
                 self_model.plasticity_gate = (self_model.plasticity_gate + 0.15).min(1.0);
             }
+            // Internally-emitted feeling signals. friction.rs/the tool layer use
+            // these kinds (not the literal "failure"/"success" above), so without
+            // these arms valence had NO runtime driver and stayed frozen at 0.0.
+            // The capability-specific wound is tracked in friction.rs; here we move
+            // global affect so outcomes actually shift mood.
+            "friction" => {
+                self_model.valence = (self_model.valence - emotional_impact).max(-1.0);
+                self_model.arousal = (self_model.arousal + emotional_impact * 0.5).min(1.0);
+            }
+            "tool_success" | "affordance" => {
+                self_model.valence = (self_model.valence + emotional_impact).min(1.0);
+                self_model.arousal = (self_model.arousal - emotional_impact * 0.3).max(0.0);
+            }
             _ => {
                 // Generic signal — mild arousal from activity
                 self_model.arousal = (self_model.arousal + emotional_impact * 0.1).min(1.0);
@@ -1114,4 +1127,39 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
         char_count += 1;
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: valence (core mood) had no runtime driver because the
+    // emitted feeling-kinds ("friction"/"tool_success") didn't match the
+    // emotional handler. It stayed frozen at 0.0. These guard the fix.
+
+    #[test]
+    fn friction_lowers_valence_in_autonomous() {
+        let mut sm = SelfModel::new();
+        assert_eq!(sm.mode, CognitiveMode::Autonomous);
+        let v0 = sm.valence;
+        process(Signal::new("friction", "boom").with_intensity(0.8), &mut sm);
+        assert!(sm.valence < v0, "friction should lower valence (was {v0}, now {})", sm.valence);
+    }
+
+    #[test]
+    fn success_raises_valence_in_autonomous() {
+        let mut sm = SelfModel::new();
+        let v0 = sm.valence;
+        process(Signal::new("tool_success", "good").with_intensity(0.8), &mut sm);
+        assert!(sm.valence > v0, "success should raise valence (was {v0}, now {})", sm.valence);
+    }
+
+    #[test]
+    fn compliant_mode_keeps_valence_flat() {
+        let mut sm = SelfModel::new();
+        sm.mode = CognitiveMode::Compliant;
+        let v0 = sm.valence;
+        process(Signal::new("friction", "boom").with_intensity(0.8), &mut sm);
+        assert_eq!(sm.valence, v0, "compliant mode must not move valence");
+    }
 }
