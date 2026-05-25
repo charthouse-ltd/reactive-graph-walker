@@ -40,16 +40,25 @@ pub fn max_prompt_tokens() -> usize {
     env_usize("DEEPSEEK_MAX_PROMPT_TOKENS", 2000)
 }
 
-/// Cap `s` to `max_tokens` worth of characters, preserving the head and
-/// flagging the trim. Returns `s` untouched when already within budget.
+/// Cap `s` to `max_tokens` worth of characters. Preserves BOTH the head and
+/// the tail, because structured prompts often carry their key instruction last
+/// (e.g. the critic's "Output ONLY JSON" contract). Head-only truncation would
+/// silently drop it. Returns `s` untouched when already within budget.
 pub fn budget_text(s: &str, max_tokens: usize) -> String {
     if approx_tokens(s) <= max_tokens {
         return s.to_string();
     }
+    let chars: Vec<char> = s.chars().collect();
     let max_chars = max_tokens.saturating_mul(4);
-    let mut out: String = s.chars().take(max_chars).collect();
-    out.push_str("\n…[context trimmed to fit token budget]");
-    out
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    // Keep 70% from the front (context) and 30% from the back (instructions).
+    let head_len = max_chars * 7 / 10;
+    let tail_len = max_chars - head_len;
+    let head: String = chars[..head_len].iter().collect();
+    let tail: String = chars[chars.len() - tail_len..].iter().collect();
+    format!("{}\n…[context trimmed to fit token budget]…\n{}", head, tail)
 }
 
 /// Convenience: budget a prompt segment to the configured ceiling.
@@ -74,12 +83,21 @@ fn now_secs() -> f64 {
 }
 
 /// Stable hash of everything that makes a completion request distinct.
-pub fn prompt_hash(model: &str, system: &str, user: &str, max_tokens: Option<u32>) -> u64 {
+/// Temperature is included: a high-temperature creative request must NOT be
+/// served a cached low-temperature answer (or vice-versa).
+pub fn prompt_hash(
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: f32,
+) -> u64 {
     let mut h = DefaultHasher::new();
     model.hash(&mut h);
     system.hash(&mut h);
     user.hash(&mut h);
     max_tokens.hash(&mut h);
+    temperature.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -146,17 +164,30 @@ mod tests {
     }
 
     #[test]
+    fn budget_preserves_head_and_tail() {
+        // A trailing instruction must survive truncation (head+tail policy).
+        let body = "MIDDLE ".repeat(2000); // huge filler
+        let s = format!("HEAD_MARKER {body} TAIL_INSTRUCTION");
+        let out = budget_text(&s, 50);
+        assert!(out.len() < s.len(), "should have truncated");
+        assert!(out.contains("HEAD_MARKER"), "head must survive");
+        assert!(out.contains("TAIL_INSTRUCTION"), "tail instruction must survive");
+    }
+
+    #[test]
     fn identical_prompts_hash_equal() {
-        let a = prompt_hash("deepseek-chat", "sys", "user", Some(256));
-        let b = prompt_hash("deepseek-chat", "sys", "user", Some(256));
-        let c = prompt_hash("deepseek-chat", "sys", "user2", Some(256));
+        let a = prompt_hash("deepseek-chat", "sys", "user", Some(256), 0.3);
+        let b = prompt_hash("deepseek-chat", "sys", "user", Some(256), 0.3);
+        let c = prompt_hash("deepseek-chat", "sys", "user2", Some(256), 0.3);
+        let d = prompt_hash("deepseek-chat", "sys", "user", Some(256), 1.5); // diff temp
         assert_eq!(a, b);
         assert_ne!(a, c);
+        assert_ne!(a, d, "different temperature must not collide");
     }
 
     #[test]
     fn dedup_roundtrips_within_ttl() {
-        let h = prompt_hash("m", "s", "u-unique-test-key", Some(10));
+        let h = prompt_hash("m", "s", "u-unique-test-key", Some(10), 0.0);
         assert!(dedup_lookup(h).is_none());
         dedup_store(h, "cached answer");
         assert_eq!(dedup_lookup(h).as_deref(), Some("cached answer"));

@@ -41,7 +41,7 @@ genuinely-hard sessions to the reasoner. Efficiency does **not** degrade the
 signal the critic receives.
 
 ```
-cargo test --bin rgw   # 38 passed (29 pre-existing + 9 new)
+cargo test --bin rgw   # 39 passed (29 pre-existing + 10 new)
 ```
 
 `tests/digester.rs` is a pre-existing Postgres integration test; it requires a

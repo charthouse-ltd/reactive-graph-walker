@@ -169,7 +169,7 @@ impl Provider {
 
             // Idempotency: identical cognition states hash equal — reuse the
             // cached completion instead of paying for the same call again.
-            let hash = crate::budget::prompt_hash(model, &system, &user, max_tokens);
+            let hash = crate::budget::prompt_hash(model, &system, &user, max_tokens, temperature);
             if let Some(cached) = crate::budget::dedup_lookup(hash) {
                 crate::metrics::record_dedup_hit();
                 tracing::info!("[provider] DeepSeek dedup hit (model={}) — call skipped", model);

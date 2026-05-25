@@ -1488,6 +1488,16 @@ mod tests {
         assert!(budgeted.contains("Diagnosis:"), "diagnosis must survive budgeting");
         // And the prompt is actually bounded.
         assert!(crate::budget::approx_tokens(&budgeted) <= crate::budget::max_prompt_tokens());
+
+        // Even under FORCED truncation, the trailing JSON contract survives
+        // (head+tail policy) — head-only truncation would have dropped it.
+        let forced = crate::budget::budget_text(&user, 60);
+        assert!(forced.len() < user.len(), "should have truncated");
+        assert!(forced.contains("Session:"), "head must survive forced truncation");
+        assert!(
+            forced.contains("attention_deltas"),
+            "trailing JSON contract must survive forced truncation"
+        );
     }
 
     #[test]
