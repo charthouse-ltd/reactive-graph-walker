@@ -4,3 +4,7 @@ target/
 .fastembed_cache/
 
 .codegraph/
+
+# A/B harness: real scenarios + results stay local
+ab_scenarios.json
+ab_results.json
