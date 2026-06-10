@@ -112,10 +112,11 @@ pub async fn serve(
         provider,
     });
 
-    if std::env::var("RGW_API_TOKEN").ok().filter(|s| !s.is_empty()).is_none() {
+    if std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
         tracing::warn!(
-            "[rgw] RGW_API_TOKEN not set — all mutating/LLM endpoints are DISABLED (401). \
-             Set RGW_API_TOKEN to enable /walk, /v1/chat/completions, /ingest/signal, etc."
+            "[rgw] RGW_API_KEY not set — protected endpoints are UNAUTHENTICATED (fail-open). \
+             Set RGW_API_KEY (and send X-RGW-Key on callers) to require auth on \
+             /walk, /v1/chat/completions, /ingest/signal, etc."
         );
     }
 
@@ -134,7 +135,7 @@ pub async fn serve(
         .route("/music/prompt", get(music_prompt_endpoint))
         .route("/v1/models", get(openai::list_models));
 
-    // ── Protected endpoints (require RGW_API_TOKEN bearer) ──
+    // ── Protected endpoints (require X-RGW-Key when RGW_API_KEY is set) ──
     // Everything that mutates the graph/self-model, emits actions, spawns a
     // subprocess, or spends LLM tokens. See the security audit (C1/S3).
     let protected = Router::new()
@@ -183,24 +184,25 @@ pub async fn serve(
     Ok(())
 }
 
-/// Bearer-token auth middleware for mutating / cost endpoints.
-/// Requires `Authorization: Bearer <RGW_API_TOKEN>`. If the env var is unset or
-/// empty, protected endpoints are denied outright (secure default) — set
-/// RGW_API_TOKEN to enable them. Read-only endpoints bypass this entirely.
+/// Auth middleware for mutating / cost endpoints.
+/// Convention shared with the deployed backends: the secret travels as the
+/// `X-RGW-Key` header and matches the `RGW_API_KEY` env var. Fail-open when
+/// `RGW_API_KEY` is unset on this side (preserves behaviour during graceful
+/// rollout — the callers send nothing until the key is set on both sides);
+/// fail-closed once it is configured. Read-only endpoints bypass this entirely.
 async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {
-    let Some(expected) = std::env::var("RGW_API_TOKEN").ok().filter(|s| !s.is_empty()) else {
-        tracing::warn!("[auth] RGW_API_TOKEN not set — denying {}", req.uri().path());
-        return Err(StatusCode::UNAUTHORIZED);
+    let Some(expected) = std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()) else {
+        // Fail-open: no key configured → allow (a startup WARN already fired).
+        return Ok(next.run(req).await);
     };
 
     let presented = req
         .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .get("X-RGW-Key")
+        .and_then(|v| v.to_str().ok());
 
     match presented {
-        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => Ok(next.run(req).await),
+        Some(key) if constant_time_eq(key.as_bytes(), expected.as_bytes()) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
