@@ -44,6 +44,11 @@ pub struct ChatRequest {
     /// Per-request cognitive mode override ("autonomous" or "compliant")
     #[serde(default)]
     pub rgw_mode: Option<String>,
+    /// Audience identifier for Theory of Mind (e.g. "user:alice", "twitter:bob").
+    /// When set, Julian conditions his expression on his model of this audience
+    /// and updates that model from the exchange.
+    #[serde(default)]
+    pub rgw_audience: Option<String>,
 }
 
 fn default_temp() -> f32 { 0.7 }
@@ -190,6 +195,14 @@ pub async fn chat_completions(
     //    own system+user messages from this, so no combined prompt is needed here.
     let walker_context = format_walk_context(&walk_output);
 
+    // Theory of Mind: condition expression on what we know about this audience.
+    let audience_context = if let Some(ref aid) = req.rgw_audience {
+        let sm = state.self_model.lock().await;
+        crate::metacog::format_audience_context(&sm, aid)
+    } else {
+        String::new()
+    };
+
     // 4. Generate text — route through provider or fall back to Ollama
     //
     // Complexity is derived from walker output:
@@ -200,12 +213,18 @@ pub async fn chat_completions(
 
     let expr_start = Instant::now();
     let text = if let Some(ref provider) = state.provider {
-        // Intelligent routing: complexity determines local vs cloud
-        let system_with_context = if system_prompt.is_empty() {
-            walker_context.clone()
-        } else {
-            format!("{}\n\n{}", system_prompt, walker_context)
-        };
+        // Intelligent routing: complexity determines local vs cloud.
+        // System context = caller's system prompt + audience model (ToM) + walk.
+        let mut system_with_context = String::new();
+        if !system_prompt.is_empty() {
+            system_with_context.push_str(&system_prompt);
+            system_with_context.push_str("\n\n");
+        }
+        if !audience_context.is_empty() {
+            system_with_context.push_str(&audience_context);
+            system_with_context.push_str("\n\n");
+        }
+        system_with_context.push_str(&walker_context);
         // No external difficulty signal here; let the complexity score (derived
         // from walker novelty/disagreement) decide chat vs reasoner via its threshold.
         let result = provider.generate(
@@ -256,6 +275,20 @@ pub async fn chat_completions(
         walk_output.primary_domain,
         walk_output.recommended_action,
     );
+
+    // Theory of Mind: update our model of this audience from the exchange.
+    if let Some(ref aid) = req.rgw_audience {
+        let mut sm = state.self_model.lock().await;
+        // Their incoming message is a response to our previous output — compare
+        // it against what we expected (ToM prediction error feeds noticings).
+        if !stimulus.is_empty()
+            && let Some(noticing) = crate::metacog::record_audience_response(&mut sm, aid, &stimulus)
+        {
+            sm.noticings.push(noticing);
+        }
+        // Record what we just said to them (updates the last-context embedding).
+        crate::metacog::record_audience_output(&mut sm, aid, &text, &walk_output.primary_domain);
+    }
 
     // 5. Return OpenAI-formatted response
     let response = ChatResponse {

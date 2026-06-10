@@ -445,6 +445,59 @@ pub async fn walk_parallel(
     (output, walker_results)
 }
 
+/// Fold a single background (Diverger) walk's self-model changes back into the
+/// shared self-model. Unlike [`walk_parallel`]'s N-walker integration, this folds
+/// in ONE walk gently: emotion is blended (not replaced) so the high-frequency
+/// spontaneous loop can't yank the waking mood around, and counters/attention are
+/// merged as deltas (walked − base) so the walk's own starting snapshot isn't
+/// double-counted.
+///
+/// Previously the Diverger walked a throwaway clone and discarded it, so the
+/// always-on loop was cognitively inert — "the walk changes the thinker" only
+/// held for synchronous /walk requests (audit A1). This makes it true for the
+/// autonomous loop too.
+pub fn integrate_background_walk(shared: &mut SelfModel, base: &SelfModel, walked: &SelfModel) {
+    // Gentle emotional drift toward what the walk felt (80/20 blend).
+    shared.valence = shared.valence * 0.8 + walked.valence * 0.2;
+    shared.arousal = shared.arousal * 0.8 + walked.arousal * 0.2;
+    shared.energy = shared.energy * 0.8 + walked.energy * 0.2;
+
+    // New noticings the walk produced (dedup by observation text).
+    for n in &walked.noticings {
+        if !shared.noticings.iter().any(|e| e.observation == n.observation) {
+            shared.noticings.push(n.clone());
+        }
+    }
+    // Bound the buffer the same way core::process does (keep most significant).
+    if shared.noticings.len() > 100 {
+        shared.noticings.sort_by(|a, b| {
+            b.significance.partial_cmp(&a.significance).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        shared.noticings.truncate(50);
+    }
+
+    // Attention deltas (what the walk paid attention to).
+    for (domain, &count) in &walked.attention_patterns {
+        let prev = base.attention_patterns.get(domain).copied().unwrap_or(0.0);
+        let delta = count - prev;
+        if delta > 0.0 {
+            *shared.attention_patterns.entry(domain.clone()).or_insert(0.0) += delta;
+        }
+    }
+
+    // Structural counters: add only the deltas this walk produced.
+    shared.surprise_count += walked.surprise_count.saturating_sub(base.surprise_count);
+    for (domain, &count) in &walked.dead_ends_by_domain {
+        let delta = count.saturating_sub(base.dead_ends_by_domain.get(domain).copied().unwrap_or(0));
+        if delta > 0 {
+            *shared.dead_ends_by_domain.entry(domain.clone()).or_insert(0) += delta;
+        }
+    }
+    shared.total_signals_processed += walked
+        .total_signals_processed
+        .saturating_sub(base.total_signals_processed);
+}
+
 /// Classify visited nodes into (consensus, divergent, blind_spots) by how many
 /// walkers landed on each. The three buckets form a COMPLETE partition of every
 /// node with ≥1 vote — there is no uncategorized middle band:
@@ -792,5 +845,34 @@ mod tests {
         assert_eq!(compute_resonance(&[]), 0.0);
         assert_eq!(compute_resonance(&[wr(vec![1], 5.0)]), 0.0); // 0 hops → skipped → empty
         assert_eq!(compute_resonance(&[wr(vec![1, 2], 9.0)]), 1.0); // clamped
+    }
+
+    #[test]
+    fn background_walk_folds_deltas_not_absolutes() {
+        // Regression for audit A1: the Diverger used to discard its walk's
+        // self-model. Now it folds deltas back; verify counters add the delta
+        // (not the absolute) and emotion blends rather than overwrites.
+        let mut shared = SelfModel::new();
+        shared.surprise_count = 5;
+        let base = shared.clone(); // walk starts from a snapshot of shared
+        let mut walked = base.clone();
+        walked.surprise_count = 8; // walk found 3 new surprises
+        walked.valence = 1.0; // walk "felt" strongly positive
+        *walked.attention_patterns.entry("markets".into()).or_insert(0.0) += 2.0;
+        walked.noticings.push(Noticing {
+            kind: "surprise".into(),
+            observation: "unexpected link".into(),
+            domain: "markets".into(),
+            significance: 0.5,
+            valence: 0.1,
+            timestamp: 0.0,
+        });
+
+        integrate_background_walk(&mut shared, &base, &walked);
+
+        assert_eq!(shared.surprise_count, 8, "delta of 3 folded onto base 5");
+        assert!(shared.valence > 0.0 && shared.valence < 1.0, "emotion blended, not replaced");
+        assert_eq!(shared.attention_patterns.get("markets"), Some(&2.0), "attention delta merged");
+        assert!(shared.noticings.iter().any(|n| n.observation == "unexpected link"));
     }
 }
