@@ -120,11 +120,18 @@ pub async fn serve(
         );
     }
 
-    // ── Public, read-only endpoints (no auth) ──
-    // Introspection/health only — they neither mutate state, emit actions,
-    // nor spend money. Safe to leave open.
+    // ── Public endpoint (no auth) — health only ──
+    // Strict posture: ONLY /health is open (liveness probes work without a key).
+    // Everything else — including read-only introspection — requires X-RGW-Key
+    // when RGW_API_KEY is set.
     let public = Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health));
+
+    // ── Protected endpoints (require X-RGW-Key when RGW_API_KEY is set) ──
+    // Everything except /health: read-only introspection AND mutations / actions
+    // / LLM-spend. Fail-open until the key is set on both sides. See audit C1/S3.
+    let protected = Router::new()
+        // read-only introspection
         .route("/stats", get(stats))
         .route("/metrics", get(metrics_endpoint))
         .route("/diverger", get(diverger_stats))
@@ -133,14 +140,10 @@ pub async fn serve(
         .route("/music", get(music_endpoint))
         .route("/music/midi", get(music_midi_endpoint))
         .route("/music/prompt", get(music_prompt_endpoint))
-        .route("/v1/models", get(openai::list_models));
-
-    // ── Protected endpoints (require X-RGW-Key when RGW_API_KEY is set) ──
-    // Everything that mutates the graph/self-model, emits actions, spawns a
-    // subprocess, or spends LLM tokens. See the security audit (C1/S3).
-    let protected = Router::new()
-        .route("/walk", post(walk))
+        .route("/v1/models", get(openai::list_models))
         .route("/benchmark", get(benchmark))
+        // mutations / actions / cost
+        .route("/walk", post(walk))
         .route("/prune", post(prune))
         .route("/edge", post(create_edge_endpoint))
         .route("/diverger/notify", post(diverger_notify))
@@ -190,7 +193,7 @@ pub async fn serve(
 /// `X-RGW-Key` header and matches the `RGW_API_KEY` env var. Fail-open when
 /// `RGW_API_KEY` is unset on this side (preserves behaviour during graceful
 /// rollout — the callers send nothing until the key is set on both sides);
-/// fail-closed once it is configured. Read-only endpoints bypass this entirely.
+/// fail-closed once it is configured. Only /health bypasses this (liveness).
 async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {
     let Some(expected) = std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()) else {
         // Fail-open: no key configured → allow (a startup WARN already fired).
