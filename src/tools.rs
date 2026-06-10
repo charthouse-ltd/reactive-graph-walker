@@ -91,18 +91,11 @@ impl Default for ToolRegistry {
 /// Available tools
 pub fn available_tools() -> Vec<Tool> {
     vec![
-        Tool {
-            name: "code_exec".into(),
-            description: "Execute Python code in a sandbox. Returns stdout/stderr.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Python code to execute"},
-                    "timeout_secs": {"type": "integer", "description": "Max execution time (default 10)"}
-                },
-                "required": ["code"]
-            }),
-        },
+        // NOTE: `code_exec` (arbitrary `python3 -c`) was removed. It was an
+        // unauthenticated remote-code-execution path behind a trivially
+        // bypassable string blacklist. Reinstating it requires a real sandbox
+        // (network-isolated container, read-only FS, resource limits) — not a
+        // denylist. See the security audit (C1).
         Tool {
             name: "web_search".into(),
             description: "Search the internet. Results become nodes in the graph.".into(),
@@ -209,7 +202,6 @@ pub async fn execute_tool(
     pool: &sqlx::PgPool,
 ) -> ToolResult {
     match name {
-        "code_exec" => code_exec(params).await,
         "web_search" => web_search(params).await,
         "web_fetch" => web_fetch(params).await,
         "memory_store" => memory_store(params, pool).await,
@@ -232,26 +224,27 @@ pub async fn execute_tool(
 /// backend is responsible for routing to the correct API (ComfyUI,
 /// Twitter, WordPress, etc).
 ///
-/// Expects `motor_url` in params or uses RGW_MOTOR_URL env var.
+/// The backend is taken ONLY from the server-side `RGW_MOTOR_URL` env var.
+/// A caller-supplied `motor_url` is deliberately ignored (and stripped before
+/// forwarding) — trusting it would let LLM/tool input point our outbound POST
+/// at arbitrary internal services (SSRF). See the security audit (C2).
 async fn motor_tool(action: &str, params: serde_json::Value) -> ToolResult {
-    let motor_url = params["motor_url"]
-        .as_str()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("RGW_MOTOR_URL").unwrap_or_default());
+    let motor_url = std::env::var("RGW_MOTOR_URL").unwrap_or_default();
 
     if motor_url.is_empty() {
         return ToolResult {
             tool: action.into(),
             success: false,
             content: format!(
-                "No motor cortex backend configured for '{}'. Set RGW_MOTOR_URL or pass motor_url in params.",
+                "No motor cortex backend configured for '{}'. Set the RGW_MOTOR_URL env var.",
                 action
             ),
             metadata: serde_json::json!({"action": action, "needs_backend": true}),
         };
     }
 
-    // Strip motor_url from params before forwarding
+    // Strip any caller-supplied motor_url before forwarding (it is ignored above,
+    // but never let it reach the backend payload either).
     let mut clean_params = params.clone();
     if let Some(obj) = clean_params.as_object_mut() {
         obj.remove("motor_url");
@@ -287,9 +280,9 @@ async fn motor_tool(action: &str, params: serde_json::Value) -> ToolResult {
                 content: if body.is_empty() {
                     format!("{} command accepted by motor cortex", action)
                 } else {
-                    body[..body.len().min(2000)].to_string()
+                    crate::core::safe_truncate(&body, 2000).to_string()
                 },
-                metadata: serde_json::json!({"action": action, "motor_url": motor_url}),
+                metadata: serde_json::json!({"action": action}),
             }
         }
         Ok(resp) => {
@@ -298,7 +291,7 @@ async fn motor_tool(action: &str, params: serde_json::Value) -> ToolResult {
             ToolResult {
                 tool: action.into(),
                 success: false,
-                content: format!("Motor cortex rejected {} (HTTP {}): {}", action, status, &body[..body.len().min(200)]),
+                content: format!("Motor cortex rejected {} (HTTP {}): {}", action, status, crate::core::safe_truncate(&body, 200)),
                 metadata: serde_json::json!({"action": action, "status": status}),
             }
         }
@@ -307,81 +300,6 @@ async fn motor_tool(action: &str, params: serde_json::Value) -> ToolResult {
             success: false,
             content: format!("Motor cortex unreachable for {}: {}", action, e),
             metadata: serde_json::json!({"action": action, "error": e.to_string()}),
-        },
-    }
-}
-
-/// Execute Python code in a sandbox (subprocess with timeout)
-async fn code_exec(params: serde_json::Value) -> ToolResult {
-    let code = params["code"].as_str().unwrap_or("");
-    let timeout = params["timeout_secs"].as_u64().unwrap_or(10);
-
-    if code.is_empty() {
-        return ToolResult {
-            tool: "code_exec".into(),
-            success: false,
-            content: "Empty code".into(),
-            metadata: serde_json::json!({}),
-        };
-    }
-
-    // Security: reject dangerous patterns
-    let forbidden = ["os.system", "subprocess", "shutil.rmtree", "__import__", "eval(", "exec(", "open("];
-    for pattern in &forbidden {
-        if code.contains(pattern) {
-            return ToolResult {
-                tool: "code_exec".into(),
-                success: false,
-                content: format!("Forbidden: code contains '{}'", pattern),
-                metadata: serde_json::json!({"blocked": true}),
-            };
-        }
-    }
-
-    use tokio::process::Command;
-
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout),
-        Command::new("python3")
-            .arg("-c")
-            .arg(code)
-            .output()
-    ).await;
-
-    match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let success = output.status.success();
-
-            let content = if success {
-                if stdout.is_empty() { "(no output)".to_string() } else { stdout.clone() }
-            } else {
-                format!("Error:\n{}", stderr)
-            };
-
-            ToolResult {
-                tool: "code_exec".into(),
-                success,
-                content: content[..content.len().min(2000)].to_string(),
-                metadata: serde_json::json!({
-                    "exit_code": output.status.code(),
-                    "stdout_len": stdout.len(),
-                    "stderr_len": stderr.len(),
-                }),
-            }
-        }
-        Ok(Err(e)) => ToolResult {
-            tool: "code_exec".into(),
-            success: false,
-            content: format!("Failed to spawn: {}", e),
-            metadata: serde_json::json!({}),
-        },
-        Err(_) => ToolResult {
-            tool: "code_exec".into(),
-            success: false,
-            content: format!("Timeout after {}s", timeout),
-            metadata: serde_json::json!({"timeout": true}),
         },
     }
 }
@@ -474,10 +392,14 @@ async fn web_fetch(params: serde_json::Value) -> ToolResult {
         };
     }
 
-    match reqwest::Client::builder()
+    // Build the client without unwrap(): a builder failure must not panic the
+    // request handler. Fall back to a default client if the builder errors.
+    let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; RGW/1.0)")
         .build()
-        .unwrap()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    match client
         .get(url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -489,8 +411,8 @@ async fn web_fetch(params: serde_json::Value) -> ToolResult {
                 Ok(body) => {
                     // Extract readable text from HTML
                     let content = extract_readable_text(&body);
-                    let content = if content.len() > 3000 {
-                        format!("{}...", &content[..3000])
+                    let content = if content.chars().count() > 3000 {
+                        format!("{}...", crate::core::safe_truncate(&content, 3000))
                     } else {
                         content
                     };

@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -110,33 +112,51 @@ pub async fn serve(
         provider,
     });
 
-    let app = Router::new()
-        // RGW native endpoints
+    if std::env::var("RGW_API_TOKEN").ok().filter(|s| !s.is_empty()).is_none() {
+        tracing::warn!(
+            "[rgw] RGW_API_TOKEN not set — all mutating/LLM endpoints are DISABLED (401). \
+             Set RGW_API_TOKEN to enable /walk, /v1/chat/completions, /ingest/signal, etc."
+        );
+    }
+
+    // ── Public, read-only endpoints (no auth) ──
+    // Introspection/health only — they neither mutate state, emit actions,
+    // nor spend money. Safe to leave open.
+    let public = Router::new()
         .route("/health", get(health))
-        .route("/walk", post(walk))
         .route("/stats", get(stats))
         .route("/metrics", get(metrics_endpoint))
-        .route("/benchmark", get(benchmark))
         .route("/diverger", get(diverger_stats))
+        .route("/self", get(self_state))
+        .route("/tools", get(list_tools))
+        .route("/music", get(music_endpoint))
+        .route("/music/midi", get(music_midi_endpoint))
+        .route("/music/prompt", get(music_prompt_endpoint))
+        .route("/v1/models", get(openai::list_models));
+
+    // ── Protected endpoints (require RGW_API_TOKEN bearer) ──
+    // Everything that mutates the graph/self-model, emits actions, spawns a
+    // subprocess, or spends LLM tokens. See the security audit (C1/S3).
+    let protected = Router::new()
+        .route("/walk", post(walk))
+        .route("/benchmark", get(benchmark))
         .route("/prune", post(prune))
         .route("/edge", post(create_edge_endpoint))
         .route("/diverger/notify", post(diverger_notify))
-        .route("/self", get(self_state))
         .route("/self/mode", post(set_mode_endpoint))
         .route("/self/save", post(save_self_model_endpoint))
-        .route("/tools", get(list_tools))
         .route("/tools/execute", post(execute_tool_endpoint))
         .route("/speak", post(speak_endpoint))
         .route("/dream", post(dream_endpoint))
-        .route("/music", get(music_endpoint))
-        .route("/music/midi", get(music_midi_endpoint))
         .route("/music/generate", post(music_generate_endpoint))
-        .route("/music/prompt", get(music_prompt_endpoint))
         // Signal ingest — external events feed into the cognitive loop
         .route("/ingest/signal", post(ingest_signal_endpoint))
-        // OpenAI-compatible endpoints (drop-in replacement for Ollama)
+        // OpenAI-compatible chat (triggers a walk + paid LLM expression)
         .route("/v1/chat/completions", post(openai::chat_completions))
-        .route("/v1/models", get(openai::list_models))
+        .route_layer(middleware::from_fn(require_auth));
+
+    let app = public
+        .merge(protected)
         .with_state(state.clone())
         .layer(CorsLayer::permissive());
 
@@ -161,6 +181,40 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Bearer-token auth middleware for mutating / cost endpoints.
+/// Requires `Authorization: Bearer <RGW_API_TOKEN>`. If the env var is unset or
+/// empty, protected endpoints are denied outright (secure default) — set
+/// RGW_API_TOKEN to enable them. Read-only endpoints bypass this entirely.
+async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {
+    let Some(expected) = std::env::var("RGW_API_TOKEN").ok().filter(|s| !s.is_empty()) else {
+        tracing::warn!("[auth] RGW_API_TOKEN not set — denying {}", req.uri().path());
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match presented {
+        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => Ok(next.run(req).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Length-checked constant-time byte comparison (avoids token-timing leaks).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// GET /health
@@ -286,7 +340,7 @@ async fn execute_tool_endpoint(
         let mut sm = state.self_model.lock().await;
         let signal = crate::core::Signal::new(
             if result.success { "tool_success" } else { "tool_failure" },
-            &format!("{}: {}", result.tool, &result.content[..result.content.len().min(100)]),
+            &format!("{}: {}", result.tool, crate::core::safe_truncate(&result.content, 100)),
         ).with_intensity(if result.success { 0.3 } else { 0.2 });
         crate::core::process(signal, &mut sm);
     }
@@ -374,7 +428,7 @@ async fn music_generate_endpoint(
         req.prompt
     };
 
-    tracing::info!("[music] Generating via MusicGen: '{}'", &prompt[..prompt.len().min(80)]);
+    tracing::info!("[music] Generating via MusicGen: '{}'", crate::core::safe_truncate(&prompt, 80));
 
     match crate::music::generate_musicgen(&prompt, req.duration_secs).await {
         Ok(path) => {
@@ -382,7 +436,7 @@ async fn music_generate_endpoint(
             {
                 let mut sm = state.self_model.lock().await;
                 let signal = crate::core::Signal::new("music_created", &format!(
-                    "Composed: {}", &prompt[..prompt.len().min(60)]
+                    "Composed: {}", crate::core::safe_truncate(&prompt, 60)
                 )).with_intensity(0.5);
                 crate::core::process(signal, &mut sm);
             }

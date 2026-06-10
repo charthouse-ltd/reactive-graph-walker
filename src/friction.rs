@@ -17,7 +17,7 @@ pub fn tool_friction(result: &ToolResult, self_model: &mut SelfModel) {
         // Success = mild satisfaction, not pain
         let signal = Signal::new("tool_success", &format!(
             "Tool '{}' worked: {}",
-            result.tool, &result.content[..result.content.len().min(80)]
+            result.tool, core::safe_truncate(&result.content, 80)
         )).with_intensity(0.2);
         core::process(signal, self_model);
         return;
@@ -27,7 +27,7 @@ pub fn tool_friction(result: &ToolResult, self_model: &mut SelfModel) {
     let intensity = 0.4; // Base pain for tool failure
     let signal = Signal::new("friction", &format!(
         "Tool '{}' failed: {}",
-        result.tool, &result.content[..result.content.len().min(120)]
+        result.tool, core::safe_truncate(&result.content, 120)
     )).with_intensity(intensity);
     core::process(signal, self_model);
 
@@ -41,7 +41,7 @@ pub fn tool_friction(result: &ToolResult, self_model: &mut SelfModel) {
     *wound = (*wound + 0.1).min(1.0);
 
     // Add to open questions (what went wrong?)
-    let question = format!("Why did {} fail? Error: {}", capability, &result.content[..result.content.len().min(60)]);
+    let question = format!("Why did {} fail? Error: {}", capability, core::safe_truncate(&result.content, 60));
     if !self_model.open_questions.contains(&question) {
         self_model.open_questions.push(question);
         if self_model.open_questions.len() > 10 {
@@ -54,7 +54,7 @@ pub fn tool_friction(result: &ToolResult, self_model: &mut SelfModel) {
 pub fn motor_friction(action: &str, error: &str, self_model: &mut SelfModel) {
     let signal = Signal::new("friction", &format!(
         "Motor command '{}' rejected: {}",
-        action, &error[..error.len().min(120)]
+        action, core::safe_truncate(error, 120)
     )).with_intensity(0.5);
     core::process(signal, self_model);
 
@@ -66,7 +66,7 @@ pub fn motor_friction(action: &str, error: &str, self_model: &mut SelfModel) {
 pub fn network_friction(url: &str, error: &str, self_model: &mut SelfModel) {
     let signal = Signal::new("friction", &format!(
         "Network error reaching {}: {}",
-        &url[..url.len().min(40)], &error[..error.len().min(80)]
+        core::safe_truncate(url, 40), core::safe_truncate(error, 80)
     )).with_intensity(0.3);
     core::process(signal, self_model);
 }

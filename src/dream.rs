@@ -431,13 +431,22 @@ pub fn start_dream_loop(
                 );
             }
 
-            // ── Homeostasis: prune weak edges ──
-            // Without this, continuous dreaming causes runaway potentiation.
-            // Pruning scales with dream intensity — low energy → more cleanup.
-            if energy < 0.3 {
+            // ── Homeostasis: prune weak nodes (DESTRUCTIVE, opt-in) ──
+            // prune_nodes hard-DELETEs rows from memory_vectors. Running that
+            // unattended in an always-on loop is data loss by default, so it is
+            // gated behind RGW_ENABLE_AUTO_PRUNE (off unless explicitly set) and
+            // audit-logged at WARN. Operator-triggered edge pruning via
+            // POST /prune is unaffected.
+            let auto_prune = std::env::var("RGW_ENABLE_AUTO_PRUNE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if auto_prune && energy < 0.3 {
                 match db::prune_nodes(&pool, 0.1, 7).await {
                     Ok(prune_count) if prune_count > 0 => {
-                        tracing::debug!("[dream] Homeostasis: pruned {} weak nodes/edges", prune_count);
+                        tracing::warn!(
+                            "[dream] AUTO-PRUNE deleted {} low-importance/stale nodes (RGW_ENABLE_AUTO_PRUNE=on)",
+                            prune_count
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("[dream] Pruning failed: {}", e);
