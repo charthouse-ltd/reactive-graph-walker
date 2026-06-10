@@ -12,7 +12,7 @@
 //!
 //! Run:
 //!   export RGW_BASE_URL=http://localhost:11435      # or your prod URL
-//!   export RGW_API_TOKEN=...                          # bearer for protected routes
+//!   export RGW_API_KEY=...                            # X-RGW-Key for protected routes
 //!   export DEEPSEEK_API_KEY=sk-...                    # the blind judge
 //!   export RGW_JUDGE_MODEL=deepseek-chat              # optional (default shown)
 //!   cargo run --release --example ab_eval -- ab_scenarios.json
@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .or_else(|| spec["base_url"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "http://localhost:11435".into());
-    let token = std::env::var("RGW_API_TOKEN").unwrap_or_default();
+    let token = std::env::var("RGW_API_KEY").unwrap_or_default();
     let judge_key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
     let judge_model = std::env::var("RGW_JUDGE_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
     let rubric = spec["brand_rubric"]
@@ -165,7 +165,7 @@ async fn complete(
     });
     let mut req = client.post(format!("{base_url}/v1/chat/completions")).json(&body);
     if !token.is_empty() {
-        req = req.header("Authorization", format!("Bearer {token}"));
+        req = req.header("X-RGW-Key", token);
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
