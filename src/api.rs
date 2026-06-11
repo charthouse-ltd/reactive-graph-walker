@@ -155,6 +155,7 @@ pub async fn serve(
         .route("/music/generate", post(music_generate_endpoint))
         // Signal ingest — external events feed into the cognitive loop
         .route("/ingest/signal", post(ingest_signal_endpoint))
+        .route("/tom/record", post(tom_record_endpoint))
         // OpenAI-compatible chat (triggers a walk + paid LLM expression)
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route_layer(middleware::from_fn(require_auth));
@@ -320,6 +321,53 @@ async fn save_self_model_endpoint(State(state): State<Arc<AppState>>) -> Json<se
         Ok(_) => Json(serde_json::json!({"status": "saved"})),
         Err(e) => Json(serde_json::json!({"status": "error", "error": e.to_string()})),
     }
+}
+
+/// POST /tom/record — record a Theory-of-Mind interaction with an audience.
+///
+/// Lets the audience model populate even though the backends express through
+/// their OWN LLM and never hit `/v1/chat/completions` (where ToM is wired
+/// inline). They call this AFTER posting: `message` is what Julian said, and
+/// optional `response` is the audience's prior reply (drives ToM prediction
+/// error). Without this, A3 would be inert for those consumers.
+#[derive(Deserialize)]
+struct TomRecordRequest {
+    audience_id: String,
+    /// What Julian just said to this audience.
+    message: String,
+    #[serde(default)]
+    domain: String,
+    /// The audience's prior message, if any — compared against expectation.
+    #[serde(default)]
+    response: Option<String>,
+}
+
+async fn tom_record_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TomRecordRequest>,
+) -> Json<serde_json::Value> {
+    if req.audience_id.is_empty() {
+        return Json(serde_json::json!({"status": "error", "error": "audience_id required"}));
+    }
+    let mut sm = state.self_model.lock().await;
+    // Their prior message is a response to our previous output (ToM prediction error).
+    if let Some(resp) = req.response.as_deref().filter(|r| !r.is_empty())
+        && let Some(n) = crate::metacog::record_audience_response(&mut sm, &req.audience_id, resp)
+    {
+        sm.noticings.push(n);
+    }
+    crate::metacog::record_audience_output(&mut sm, &req.audience_id, &req.message, &req.domain);
+    let interactions = sm
+        .audience_model
+        .get(&req.audience_id)
+        .map(|a| a.interaction_count)
+        .unwrap_or(0);
+    Json(serde_json::json!({
+        "status": "recorded",
+        "audience_id": req.audience_id,
+        "interactions": interactions,
+        "audiences_tracked": sm.audience_model.len(),
+    }))
 }
 
 /// GET /tools — list available tools

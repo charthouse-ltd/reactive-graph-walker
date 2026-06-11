@@ -770,6 +770,25 @@ pub fn record_audience_output(sm: &mut SelfModel, audience_id: &str, message: &s
         let knowledge = audience.estimated_knowledge.entry(domain.to_string()).or_insert(0.0);
         *knowledge = (*knowledge + 0.1).min(1.0);
     }
+
+    // Bound the audience model so an always-on social process can't leak memory:
+    // beyond the cap, evict the least-recently-seen audience. The entry we just
+    // touched has last_interaction = now, so it is never the one evicted.
+    const MAX_AUDIENCES: usize = 500;
+    if sm.audience_model.len() > MAX_AUDIENCES {
+        if let Some(oldest) = sm
+            .audience_model
+            .iter()
+            .min_by(|a, b| {
+                a.1.last_interaction
+                    .partial_cmp(&b.1.last_interaction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(k, _)| k.clone())
+        {
+            sm.audience_model.remove(&oldest);
+        }
+    }
 }
 
 /// Record a response from an audience member. Compares expected vs actual — ToM prediction error.
@@ -841,6 +860,22 @@ mod tests {
     use std::collections::HashMap;
 
     // ── Helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn audience_model_stays_bounded() {
+        // Now that ToM is wired into the chat path, an unbounded audience map
+        // would leak in an always-on social process. Verify the cap holds.
+        let mut sm = SelfModel::new();
+        // Short message (<=10 chars) skips embedding so the test needs no model.
+        for i in 0..620 {
+            record_audience_output(&mut sm, &format!("user:{i}"), "hi", "chat");
+        }
+        assert!(
+            sm.audience_model.len() <= 500,
+            "audience model must stay bounded, got {}",
+            sm.audience_model.len()
+        );
+    }
 
     fn test_sm() -> SelfModel {
         let mut sm = SelfModel::new();

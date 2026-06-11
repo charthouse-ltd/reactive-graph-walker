@@ -44,6 +44,16 @@ pub struct ChatRequest {
     /// Per-request cognitive mode override ("autonomous" or "compliant")
     #[serde(default)]
     pub rgw_mode: Option<String>,
+    /// Audience identifier for Theory of Mind (e.g. "user:alice", "twitter:bob").
+    /// When set, Julian conditions his expression on his model of this audience
+    /// and updates that model from the exchange.
+    #[serde(default)]
+    pub rgw_audience: Option<String>,
+    /// A/B control arm. When true, bypass the RGW substrate entirely (no walk,
+    /// no self-model, no ToM, no drift) and answer via plain top-k memory
+    /// retrieval + the LLM. This is the baseline the full substrate must beat.
+    #[serde(default)]
+    pub rgw_bypass: bool,
 }
 
 fn default_temp() -> f32 { 0.7 }
@@ -150,6 +160,15 @@ pub async fn chat_completions(
         .map(|m| m.content.clone())
         .unwrap_or_default();
 
+    // ── A/B control arm ──
+    // `rgw_bypass: true` answers WITHOUT the substrate (no walk, self-model,
+    // ToM, or drift) — just top-k memory retrieval + the LLM. Same model, same
+    // memory store; the honest baseline the full path must beat on identical
+    // inputs. Lets a harness flip arms per request.
+    if req.rgw_bypass {
+        return bypass_completion(&state, &req, &stimulus, &system_prompt, start).await;
+    }
+
     // 2. Graph walk — RGW thinks
     let emotion = req.rgw_emotion.unwrap_or_default();
     let walk_start = Instant::now();
@@ -190,6 +209,14 @@ pub async fn chat_completions(
     //    own system+user messages from this, so no combined prompt is needed here.
     let walker_context = format_walk_context(&walk_output);
 
+    // Theory of Mind: condition expression on what we know about this audience.
+    let audience_context = if let Some(ref aid) = req.rgw_audience {
+        let sm = state.self_model.lock().await;
+        crate::metacog::format_audience_context(&sm, aid)
+    } else {
+        String::new()
+    };
+
     // 4. Generate text — route through provider or fall back to Ollama
     //
     // Complexity is derived from walker output:
@@ -200,12 +227,18 @@ pub async fn chat_completions(
 
     let expr_start = Instant::now();
     let text = if let Some(ref provider) = state.provider {
-        // Intelligent routing: complexity determines local vs cloud
-        let system_with_context = if system_prompt.is_empty() {
-            walker_context.clone()
-        } else {
-            format!("{}\n\n{}", system_prompt, walker_context)
-        };
+        // Intelligent routing: complexity determines local vs cloud.
+        // System context = caller's system prompt + audience model (ToM) + walk.
+        let mut system_with_context = String::new();
+        if !system_prompt.is_empty() {
+            system_with_context.push_str(&system_prompt);
+            system_with_context.push_str("\n\n");
+        }
+        if !audience_context.is_empty() {
+            system_with_context.push_str(&audience_context);
+            system_with_context.push_str("\n\n");
+        }
+        system_with_context.push_str(&walker_context);
         // No external difficulty signal here; let the complexity score (derived
         // from walker novelty/disagreement) decide chat vs reasoner via its threshold.
         let result = provider.generate(
@@ -257,6 +290,20 @@ pub async fn chat_completions(
         walk_output.recommended_action,
     );
 
+    // Theory of Mind: update our model of this audience from the exchange.
+    if let Some(ref aid) = req.rgw_audience {
+        let mut sm = state.self_model.lock().await;
+        // Their incoming message is a response to our previous output — compare
+        // it against what we expected (ToM prediction error feeds noticings).
+        if !stimulus.is_empty()
+            && let Some(noticing) = crate::metacog::record_audience_response(&mut sm, aid, &stimulus)
+        {
+            sm.noticings.push(noticing);
+        }
+        // Record what we just said to them (updates the last-context embedding).
+        crate::metacog::record_audience_output(&mut sm, aid, &text, &walk_output.primary_domain);
+    }
+
     // 5. Return OpenAI-formatted response
     let response = ChatResponse {
         id: format!("rgw-{}", uuid_simple()),
@@ -291,6 +338,104 @@ pub async fn chat_completions(
     };
 
     Ok(Json(response))
+}
+
+// ── A/B control arm: answer WITHOUT the RGW substrate ───────────
+
+/// The experiment's baseline: same LLM, same memory store, but reached via plain
+/// top-k vector retrieval instead of a walk + self-model + Theory of Mind + drift.
+/// Comparing this against the full path isolates what the substrate actually adds.
+async fn bypass_completion(
+    state: &Arc<AppState>,
+    req: &ChatRequest,
+    stimulus: &str,
+    system_prompt: &str,
+    start: Instant,
+) -> Result<Json<ChatResponse>, StatusCode> {
+    // Top-k memory retrieval — the "vector store + LLM" baseline.
+    let retr_start = Instant::now();
+    let memory_context = match crate::embed::embed_text(stimulus) {
+        Ok(emb) => match crate::db::find_similar_nodes(&state.pool, &emb, 5, 0.8).await {
+            Ok(nodes) if !nodes.is_empty() => {
+                let lines: Vec<String> = nodes
+                    .iter()
+                    .map(|(_, sim, content)| {
+                        format!("- ({:.2}) {}", sim, crate::core::safe_truncate(content, 200))
+                    })
+                    .collect();
+                format!("Relevant memory:\n{}", lines.join("\n"))
+            }
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    };
+    let retr_ms = retr_start.elapsed().as_secs_f64() * 1000.0;
+
+    let expr_start = Instant::now();
+    let text = if let Some(ref provider) = state.provider {
+        let mut system = String::new();
+        if !system_prompt.is_empty() {
+            system.push_str(system_prompt);
+            system.push_str("\n\n");
+        }
+        system.push_str(&memory_context);
+        let result = provider
+            .generate(&system, stimulus, 0.5, false, req.max_tokens, req.temperature)
+            .await;
+        if !result.text.is_empty() {
+            result.text
+        } else {
+            forward_to_ollama(
+                &state.ollama_url, &state.expression_model,
+                &req.messages, &memory_context, req.temperature, req.max_tokens,
+            )
+            .await
+            .unwrap_or_else(|_| memory_context.clone())
+        }
+    } else {
+        forward_to_ollama(
+            &state.ollama_url, &state.expression_model,
+            &req.messages, &memory_context, req.temperature, req.max_tokens,
+        )
+        .await
+        .unwrap_or_else(|_| memory_context.clone())
+    };
+    let expr_ms = expr_start.elapsed().as_secs_f64() * 1000.0;
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    tracing::info!(
+        "[rgw] Chat (BYPASS arm): retr={:.0}ms expr={:.0}ms total={:.0}ms",
+        retr_ms, expr_ms, total_ms
+    );
+
+    Ok(Json(ChatResponse {
+        id: format!("rgw-{}", uuid_simple()),
+        object: "chat.completion".into(),
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        model: "rgw".into(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message { role: "assistant".into(), content: text },
+            finish_reason: "stop".into(),
+        }],
+        usage: Usage {
+            prompt_tokens: stimulus.len() as u32 / 4,
+            completion_tokens: 0,
+            total_tokens: 0,
+        },
+        rgw_metadata: Some(RgwMetadata {
+            walker_action: "bypass".into(),
+            walker_domain: String::new(),
+            walker_agreement: 0.0,
+            walker_novelty: 0.0,
+            walk_ms: 0.0,
+            expression_ms: expr_ms,
+            total_ms,
+        }),
+    }))
 }
 
 // ── Ollama forwarding ───────────────────────────────────────────

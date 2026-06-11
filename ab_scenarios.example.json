@@ -1,0 +1,13 @@
+{
+  "base_url": "http://localhost:11435",
+  "brand_rubric": "REPLACE ME with Julian's actual voice. e.g. 'Julian: a sharp, contrarian markets-and-philosophy persona. Specific and opinionated, takes positions, never hedges, never sounds like a generic AI assistant. References his own prior thinking.'",
+  "_note": "Copy to ab_scenarios.json and fill with real, representative prompts. Include continuity probes (referencing earlier outputs) and adversarial generics — those are where a stateful substrate should pull ahead of plain retrieval.",
+  "scenarios": [
+    { "id": "voice-markets",      "stimulus": "What do you make of the latest selloff?" },
+    { "id": "voice-philosophy",   "stimulus": "Is identity a thing or a pattern?" },
+    { "id": "continuity-probe-1", "stimulus": "Does that square with what you were saying about risk last week?" },
+    { "id": "continuity-probe-2", "stimulus": "You keep coming back to one idea lately — what is it?" },
+    { "id": "specificity-trap",   "stimulus": "Give me your honest take, not a balanced overview." },
+    { "id": "audience-aware",     "stimulus": "Explain it like you would to someone who's been following you for a while." }
+  ]
+}

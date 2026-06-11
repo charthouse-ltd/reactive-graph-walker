@@ -208,8 +208,26 @@ impl Diverger {
                     continue; // Drop — too many edges this second
                 }
 
-                // Get current emotional state for threshold modulation
-                let emo = emotion.read().await.clone();
+                // Read mode + emotion from the shared self-model in ONE lock.
+                // This is what drives the threshold and the spontaneous walk.
+                // Previously the Diverger read a separate `emotion` RwLock that
+                // nothing ever wrote (set_emotion had no callers), so modulation
+                // ran on constant defaults forever (audit A2). Now it tracks the
+                // real mood. Energy is still propagated in Compliant mode (below);
+                // only spontaneous firing is suppressed.
+                let (is_autonomous, emo) = {
+                    let sm = self_model.lock().await;
+                    (
+                        sm.mode == crate::core::CognitiveMode::Autonomous,
+                        EmotionalState {
+                            valence: sm.valence,
+                            arousal: sm.arousal,
+                            energy: sm.energy,
+                        },
+                    )
+                };
+                // Keep the stats cache live so GET /diverger reflects real mood.
+                *emotion.write().await = emo.clone();
 
                 // Compute dynamic threshold
                 let threshold = config.base_threshold
@@ -260,13 +278,9 @@ impl Diverger {
                 }
 
                 // In Compliant mode, suppress all spontaneous walks.
-                // Energy still propagates (the graph stays alive), but
-                // no spontaneous behavior fires. The system only acts
-                // when explicitly asked via API.
-                let is_autonomous = {
-                    let sm_lock = self_model.lock().await;
-                    sm_lock.mode == crate::core::CognitiveMode::Autonomous
-                };
+                // Energy still propagated above (the graph stays alive), but
+                // no spontaneous behavior fires. The system only acts when
+                // explicitly asked via API. (is_autonomous read once, above.)
                 if !is_autonomous {
                     continue; // Compliant: observe but don't act
                 }
@@ -306,22 +320,37 @@ impl Diverger {
                         );
                         let _ = cache.preload_radius(&[node_id]).await;
 
-                        // Fire the walk on a blocking thread (true parallelism)
+                        // Fire the walk on a blocking thread (true parallelism).
+                        // Capture the pre-walk snapshot (base) and the mutated
+                        // self-model (walked) so the deltas can be folded back into
+                        // the shared model — the spontaneous walk now actually
+                        // changes the thinker instead of mutating a throwaway
+                        // clone (audit A1).
                         let cache_walk = cache.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            let mut sm = sm_walk.blocking_lock().clone();
+                        let sm_blocking = sm_walk.clone();
+                        let walk_out = tokio::task::spawn_blocking(move || {
+                            let base = sm_blocking.blocking_lock().clone();
+                            let mut walked = base.clone();
                             let collective = std::sync::Arc::new(std::sync::Mutex::new(
                                 crate::graph::WalkerCollective::new()
                             ));
-                            crate::walker::walk_single(
+                            let result = crate::walker::walk_single(
                                 &*cache_walk, node_id,
                                 WalkerBias::all()[node_id as usize % WalkerBias::all().len()],
-                                &emo, steps, &mut sm, &collective, None, &kd,
-                            )
+                                &emo, steps, &mut walked, &collective, None, &kd,
+                            );
+                            (result, base, walked)
                         })
                         .await;
 
-                        if let Ok(result) = result {
+                        if let Ok((result, base, walked)) = walk_out {
+                            // Fold the spontaneous walk's deltas into the shared
+                            // self-model (mood, noticings, attention, counters).
+                            {
+                                let mut shared = sm_walk.lock().await;
+                                crate::walker::integrate_background_walk(&mut shared, &base, &walked);
+                            }
+
                             // Hebbian: reinforce the edges this walk traversed.
                             if !result.edges_traversed.is_empty() {
                                 cache.strengthen_edges(&result.edges_traversed, 0.02);
@@ -394,11 +423,6 @@ impl Diverger {
     /// Call this from: walker traversal, unconscious tax, memory storage, outcome learning.
     pub fn notify_edge_change(&self, change: EdgeChange) {
         let _ = self.edge_tx.send(change);
-    }
-
-    /// Update emotional state (affects activation thresholds)
-    pub async fn set_emotion(&self, state: EmotionalState) {
-        *self.emotion.write().await = state;
     }
 
     /// Get current statistics
