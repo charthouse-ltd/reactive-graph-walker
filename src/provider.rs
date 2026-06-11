@@ -159,6 +159,21 @@ impl Provider {
         let system = crate::budget::budget_prompt(system);
         let user = crate::budget::budget_prompt(user);
 
+        // ── Cost circuit breaker: hard stop when a spend ceiling is hit ──
+        // Dedup/cadence reduce calls but don't cap absolute spend. This does:
+        // above RGW_MAX_CALLS_PER_MIN or RGW_MAX_DAILY_USD, skip the paid call
+        // entirely and return empty (callers fall back to Ollama / walker text).
+        if let Err(reason) = crate::metrics::spend_allows() {
+            crate::metrics::record_throttle();
+            tracing::warn!("[provider] LLM call throttled ({}); returning empty.", reason);
+            return GenerateResult {
+                text: String::new(),
+                model_used: ModelUsed::Fallback,
+                tokens_generated: 0,
+                elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+            };
+        }
+
         // ── DeepSeek primary path: route, dedup, call, account ──
         if let Some(ref ds) = self.deepseek {
             let model = if crate::budget::wants_reasoner(complexity, difficult) {

@@ -34,6 +34,12 @@ pub struct LlmMetrics {
     pub completion_tokens: AtomicU64,
     /// Cost in micro-USD (USD * 1e6) to keep it an integer atomic.
     pub cost_micros: AtomicU64,
+    /// Calls skipped by the spend circuit breaker (cost ceiling hit).
+    pub throttled: AtomicU64,
+    /// Cost accrued in the current accounting day (micro-USD), reset on day roll.
+    day_cost_micros: AtomicU64,
+    /// Current accounting day (unix_secs / 86400). Detects the day boundary.
+    day_epoch: AtomicU64,
     /// Unix-seconds timestamps of recent successful calls (rolling 60s window).
     recent: Mutex<Vec<f64>>,
     started_at: f64,
@@ -50,10 +56,26 @@ impl LlmMetrics {
             prompt_tokens: AtomicU64::new(0),
             completion_tokens: AtomicU64::new(0),
             cost_micros: AtomicU64::new(0),
+            throttled: AtomicU64::new(0),
+            day_cost_micros: AtomicU64::new(0),
+            day_epoch: AtomicU64::new(current_day()),
             recent: Mutex::new(Vec::new()),
             started_at: now_secs(),
         }
     }
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// The current accounting day as a unix-day number.
+fn current_day() -> u64 {
+    (now_secs() as u64) / 86_400
 }
 
 lazy_static::lazy_static! {
@@ -95,9 +117,10 @@ pub fn record_call(model: &str, prompt_tokens: u64, completion_tokens: u64) {
     METRICS.completion_tokens.fetch_add(completion_tokens, Ordering::Relaxed);
 
     let cost = estimate_cost_usd(model, prompt_tokens, completion_tokens);
-    METRICS
-        .cost_micros
-        .fetch_add((cost * 1_000_000.0) as u64, Ordering::Relaxed);
+    let cost_micros = (cost * 1_000_000.0) as u64;
+    roll_day_if_needed();
+    METRICS.cost_micros.fetch_add(cost_micros, Ordering::Relaxed);
+    METRICS.day_cost_micros.fetch_add(cost_micros, Ordering::Relaxed);
 
     if let Ok(mut recent) = METRICS.recent.lock() {
         let now = now_secs();
@@ -114,6 +137,64 @@ pub fn record_call(model: &str, prompt_tokens: u64, completion_tokens: u64) {
 /// Record a call that was avoided because the prompt hash was already seen.
 pub fn record_dedup_hit() {
     METRICS.dedup_hits.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record an LLM call the spend circuit breaker refused to make.
+pub fn record_throttle() {
+    METRICS.throttled.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reset the per-day cost accumulator when the accounting day rolls over.
+fn roll_day_if_needed() {
+    let today = current_day();
+    let stored = METRICS.day_epoch.load(Ordering::Relaxed);
+    if stored != today
+        && METRICS
+            .day_epoch
+            .compare_exchange(stored, today, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        METRICS.day_cost_micros.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Cost circuit breaker. Returns `Err(reason)` when a configured ceiling is hit
+/// so the caller can skip the paid call. Both ceilings are env-tunable; set
+/// either to `0` to disable that check.
+///   `RGW_MAX_CALLS_PER_MIN` (default 60) — rolling 60s successful-call rate
+///   `RGW_MAX_DAILY_USD`     (default 10.0) — estimated spend since midnight UTC
+pub fn spend_allows() -> Result<(), &'static str> {
+    spend_allows_with(
+        env_u32("RGW_MAX_CALLS_PER_MIN", 60),
+        env_f64("RGW_MAX_DAILY_USD", 10.0),
+    )
+}
+
+/// Pure core of [`spend_allows`] — caps passed explicitly so it is testable
+/// without mutating process env.
+fn spend_allows_with(max_calls_per_min: u32, max_daily_usd: f64) -> Result<(), &'static str> {
+    if max_calls_per_min > 0 {
+        let cpm = METRICS
+            .recent
+            .lock()
+            .map(|mut r| {
+                let now = now_secs();
+                r.retain(|&t| now - t < 60.0);
+                r.len() as u32
+            })
+            .unwrap_or(0);
+        if cpm >= max_calls_per_min {
+            return Err("calls/min ceiling");
+        }
+    }
+    if max_daily_usd > 0.0 {
+        roll_day_if_needed();
+        let spent = METRICS.day_cost_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        if spent >= max_daily_usd {
+            return Err("daily USD ceiling");
+        }
+    }
+    Ok(())
 }
 
 /// Record a failed generation attempt (no usage available).
@@ -133,6 +214,8 @@ pub struct MetricsSnapshot {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub est_cost_usd: f64,
+    pub day_cost_usd: f64,
+    pub throttled: u64,
     pub uptime_secs: f64,
     pub calls_per_min: f64,
     pub calls_per_min_lifetime: f64,
@@ -152,6 +235,8 @@ pub fn snapshot() -> MetricsSnapshot {
     let prompt_t = METRICS.prompt_tokens.load(Ordering::Relaxed);
     let completion_t = METRICS.completion_tokens.load(Ordering::Relaxed);
     let cost = METRICS.cost_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    roll_day_if_needed();
+    let day_cost = METRICS.day_cost_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
 
     let uptime = (now_secs() - METRICS.started_at).max(1e-6);
     let calls_per_min_recent = METRICS
@@ -175,6 +260,8 @@ pub fn snapshot() -> MetricsSnapshot {
         completion_tokens: completion_t,
         total_tokens: prompt_t + completion_t,
         est_cost_usd: cost,
+        day_cost_usd: day_cost,
+        throttled: METRICS.throttled.load(Ordering::Relaxed),
         uptime_secs: uptime,
         calls_per_min: calls_per_min_recent,
         calls_per_min_lifetime: calls as f64 / (uptime / 60.0),
@@ -202,12 +289,26 @@ mod tests {
     }
 
     #[test]
+    fn spend_guard_trips_on_daily_cap() {
+        // A reasoner call of 1k+1k tokens costs ~$0.00274, well over a $0.0001 cap.
+        record_call("deepseek-reasoner", 1000, 1000);
+        // cpm check disabled (0) so the assertion is deterministic under parallel tests.
+        assert!(
+            spend_allows_with(0, 0.0001).is_err(),
+            "daily-cost ceiling should trip once spend exceeds it"
+        );
+        // A ceiling of 0 disables the check entirely.
+        assert!(spend_allows_with(0, 0.0).is_ok(), "a 0 ceiling disables the cap");
+    }
+
+    #[test]
     fn snapshot_reports_token_averages() {
-        // Note: global state — only assert on monotonic/relative behaviour.
+        // Note: global state shared across parallel tests — assert only on
+        // monotonic/relative behaviour, never exact counts.
         let before = snapshot().calls;
         record_call("deepseek-chat", 100, 50);
         let after = snapshot();
-        assert_eq!(after.calls, before + 1);
+        assert!(after.calls >= before + 1, "a recorded call must increment the counter");
         assert!(after.total_tokens >= 150);
     }
 }

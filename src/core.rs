@@ -441,7 +441,7 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
 
     // ── 1. The self-model OBSERVES the incoming signal ──
     self_model.total_signals_processed += 1;
-    self_model.last_signal = format!("{}:{}", signal.kind, &signal.content[..signal.content.len().min(60)]);
+    self_model.last_signal = format!("{}:{}", signal.kind, safe_truncate(&signal.content, 60));
     self_model.uptime = now() - self_model.started_at;
 
     // Track attention patterns (what do I keep thinking about?)
@@ -480,7 +480,7 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
                 if sim < 0.3 && signal.intensity > 0.3 {
                     self_model.latest_insight = Some(format!(
                         "Unexpected: '{}' diverges from current mind-state (sim={:.2})",
-                        &signal.content[..signal.content.len().min(80)], sim
+                        safe_truncate(&signal.content, 80), sim
                     ));
                 }
             }
@@ -500,7 +500,7 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
 
     // Track interactions
     if signal.kind == "chat_message" || signal.kind.starts_with("social") {
-        let who = signal.content[..signal.content.len().min(40)].to_string();
+        let who = safe_truncate(&signal.content, 40).to_string();
         if !self_model.recent_interactions.contains(&who) {
             self_model.recent_interactions.push(who);
             if self_model.recent_interactions.len() > 20 {
@@ -674,7 +674,7 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
     // ── Working Memory: high-intensity signals enter conscious awareness ──
     if output.intensity > 0.3 && !output.content.is_empty() && self_model.mode == CognitiveMode::Autonomous {
         let slot = WorkingMemorySlot {
-            content: output.content[..output.content.len().min(80)].to_string(),
+            content: safe_truncate(&output.content, 80).to_string(),
             domain: output.domain.clone(),
             activation: output.intensity,
             since: now,

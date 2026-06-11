@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -110,33 +112,55 @@ pub async fn serve(
         provider,
     });
 
-    let app = Router::new()
-        // RGW native endpoints
-        .route("/health", get(health))
-        .route("/walk", post(walk))
+    if std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
+        tracing::warn!(
+            "[rgw] RGW_API_KEY not set — protected endpoints are UNAUTHENTICATED (fail-open). \
+             Set RGW_API_KEY (and send X-RGW-Key on callers) to require auth on \
+             /walk, /v1/chat/completions, /ingest/signal, etc."
+        );
+    }
+
+    // ── Public endpoint (no auth) — health only ──
+    // Strict posture: ONLY /health is open (liveness probes work without a key).
+    // Everything else — including read-only introspection — requires X-RGW-Key
+    // when RGW_API_KEY is set.
+    let public = Router::new()
+        .route("/health", get(health));
+
+    // ── Protected endpoints (require X-RGW-Key when RGW_API_KEY is set) ──
+    // Everything except /health: read-only introspection AND mutations / actions
+    // / LLM-spend. Fail-open until the key is set on both sides. See audit C1/S3.
+    let protected = Router::new()
+        // read-only introspection
         .route("/stats", get(stats))
         .route("/metrics", get(metrics_endpoint))
-        .route("/benchmark", get(benchmark))
         .route("/diverger", get(diverger_stats))
+        .route("/self", get(self_state))
+        .route("/tools", get(list_tools))
+        .route("/music", get(music_endpoint))
+        .route("/music/midi", get(music_midi_endpoint))
+        .route("/music/prompt", get(music_prompt_endpoint))
+        .route("/v1/models", get(openai::list_models))
+        .route("/benchmark", get(benchmark))
+        // mutations / actions / cost
+        .route("/walk", post(walk))
         .route("/prune", post(prune))
         .route("/edge", post(create_edge_endpoint))
         .route("/diverger/notify", post(diverger_notify))
-        .route("/self", get(self_state))
         .route("/self/mode", post(set_mode_endpoint))
         .route("/self/save", post(save_self_model_endpoint))
-        .route("/tools", get(list_tools))
         .route("/tools/execute", post(execute_tool_endpoint))
         .route("/speak", post(speak_endpoint))
         .route("/dream", post(dream_endpoint))
-        .route("/music", get(music_endpoint))
-        .route("/music/midi", get(music_midi_endpoint))
         .route("/music/generate", post(music_generate_endpoint))
-        .route("/music/prompt", get(music_prompt_endpoint))
         // Signal ingest — external events feed into the cognitive loop
         .route("/ingest/signal", post(ingest_signal_endpoint))
-        // OpenAI-compatible endpoints (drop-in replacement for Ollama)
+        // OpenAI-compatible chat (triggers a walk + paid LLM expression)
         .route("/v1/chat/completions", post(openai::chat_completions))
-        .route("/v1/models", get(openai::list_models))
+        .route_layer(middleware::from_fn(require_auth));
+
+    let app = public
+        .merge(protected)
         .with_state(state.clone())
         .layer(CorsLayer::permissive());
 
@@ -161,6 +185,41 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Auth middleware for mutating / cost endpoints.
+/// Convention shared with the deployed backends: the secret travels as the
+/// `X-RGW-Key` header and matches the `RGW_API_KEY` env var. Fail-open when
+/// `RGW_API_KEY` is unset on this side (preserves behaviour during graceful
+/// rollout — the callers send nothing until the key is set on both sides);
+/// fail-closed once it is configured. Only /health bypasses this (liveness).
+async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {
+    let Some(expected) = std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()) else {
+        // Fail-open: no key configured → allow (a startup WARN already fired).
+        return Ok(next.run(req).await);
+    };
+
+    let presented = req
+        .headers()
+        .get("X-RGW-Key")
+        .and_then(|v| v.to_str().ok());
+
+    match presented {
+        Some(key) if constant_time_eq(key.as_bytes(), expected.as_bytes()) => Ok(next.run(req).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Length-checked constant-time byte comparison (avoids token-timing leaks).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// GET /health
@@ -286,7 +345,7 @@ async fn execute_tool_endpoint(
         let mut sm = state.self_model.lock().await;
         let signal = crate::core::Signal::new(
             if result.success { "tool_success" } else { "tool_failure" },
-            &format!("{}: {}", result.tool, &result.content[..result.content.len().min(100)]),
+            &format!("{}: {}", result.tool, crate::core::safe_truncate(&result.content, 100)),
         ).with_intensity(if result.success { 0.3 } else { 0.2 });
         crate::core::process(signal, &mut sm);
     }
@@ -374,7 +433,7 @@ async fn music_generate_endpoint(
         req.prompt
     };
 
-    tracing::info!("[music] Generating via MusicGen: '{}'", &prompt[..prompt.len().min(80)]);
+    tracing::info!("[music] Generating via MusicGen: '{}'", crate::core::safe_truncate(&prompt, 80));
 
     match crate::music::generate_musicgen(&prompt, req.duration_secs).await {
         Ok(path) => {
@@ -382,7 +441,7 @@ async fn music_generate_endpoint(
             {
                 let mut sm = state.self_model.lock().await;
                 let signal = crate::core::Signal::new("music_created", &format!(
-                    "Composed: {}", &prompt[..prompt.len().min(60)]
+                    "Composed: {}", crate::core::safe_truncate(&prompt, 60)
                 )).with_intensity(0.5);
                 crate::core::process(signal, &mut sm);
             }

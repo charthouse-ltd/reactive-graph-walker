@@ -55,7 +55,7 @@ pub fn emotion_to_prompt(sm: &SelfModel) -> String {
     // Style hints
     // Musical texture from self-model depth
     if let Some(ref insight) = sm.latest_insight {
-        parts.push(format!("unexpected twist — {}", &insight[..insight.len().min(50)]));
+        parts.push(format!("unexpected twist — {}", crate::core::safe_truncate(insight, 50)));
     }
 
     // Tensions create dissonance
@@ -148,7 +148,7 @@ print('OK:' + '{output}.wav')
         Ok(actual_path)
     } else {
         let stderr = String::from_utf8_lossy(&result.stderr);
-        Err(format!("MusicGen failed: {}", &stderr[..stderr.len().min(200)]))
+        Err(format!("MusicGen failed: {}", crate::core::safe_truncate(&stderr, 200)))
     }
 }
 
