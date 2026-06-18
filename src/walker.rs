@@ -144,6 +144,10 @@ pub fn walk_single(
                         &self_model.wounds,
                         &self_model.competencies,
                         &wm_domains,
+                        self_model.active_goal_domain.as_deref(),
+                        self_model.active_goal_strength,
+                        Some(&self_model.audience_model),
+                        self_model.active_audience_id.as_deref(),
                     )
                 };
                 (e, score)
@@ -321,6 +325,8 @@ pub async fn walk_parallel(
     let base_dead_ends: HashMap<String, u32> = base_sm.dead_ends_by_domain.clone();
     let base_signals: HashMap<String, u32> = base_sm.signals_by_source.clone();
     let base_total_signals = base_sm.total_signals_processed;
+    let learned_len = base_sm.learned_biases.len();
+    let learned_rotation = base_sm.learned_bias_rotation as usize;
 
     // Create shared stigmergic collective — walkers leave trails for each other
     let collective = Arc::new(Mutex::new(WalkerCollective::new()));
@@ -336,7 +342,11 @@ pub async fn walk_parallel(
         .map(|(i, (seed, bias))| {
             let mut sm = base_sm.clone();  // Each walker gets its own copy
             let collective = Arc::clone(&collective);
-            let learned = base_sm.learned_biases.get(i);
+            let learned = if learned_len > 0 {
+                base_sm.learned_biases.get((learned_rotation + i) % learned_len)
+            } else {
+                None
+            };
             let result = walk_single(&cache, *seed, *bias, &EmotionalState {
                 valence: sm.valence,
                 arousal: sm.arousal,
@@ -419,7 +429,12 @@ pub async fn walk_parallel(
         // Walkers that found surprises → more contradiction-seeking.
         // Walkers that hit dead ends → more novelty-seeking.
         for (i, (result, _walker_sm)) in results.iter().enumerate() {
-            if let Some(bias) = sm.learned_biases.get_mut(i) {
+            let bias_idx = if sm.learned_biases.is_empty() {
+                None
+            } else {
+                Some((learned_rotation + i) % sm.learned_biases.len())
+            };
+            if let Some(bias) = bias_idx.and_then(|idx| sm.learned_biases.get_mut(idx)) {
                 let novelty = if result.path.len() > 1 {
                     result.surprises as f32 / result.path.len() as f32
                 } else {
@@ -433,6 +448,7 @@ pub async fn walk_parallel(
                 );
             }
         }
+        sm.learned_bias_rotation = sm.learned_bias_rotation.wrapping_add(1);
     }
 
     // Extract just the walker results for aggregation
@@ -440,6 +456,13 @@ pub async fn walk_parallel(
 
     // Aggregate results (borrows walker_results, doesn't consume)
     let output = aggregate(pool, &walker_results, walk_ms, start).await;
+
+    // Behavioral integration metric: track novelty and repetition tendency.
+    let repeated = {
+        let sm = self_model.lock().await;
+        sm.consecutive_repetitions > 1
+    };
+    crate::metrics::record_walk_session(output.novelty_score, repeated);
 
     // Return both output and walker results for post-walk analysis
     (output, walker_results)

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{CognitiveMode, SelfModel, Signal, Noticing, AudienceBeliefs};
+use crate::core::{AudienceBeliefs, CognitiveMode, MetacogPhase, Noticing, SelfModel, Signal};
 use crate::graph::{WalkOutput, WalkerResult};
 
 /// The agent's cognitive state. Cannot skip steps.
@@ -151,8 +151,22 @@ pub struct CriticAdjustment {
     pub plasticity_delta: f32,
     pub bias_deltas: HashMap<usize, f32>,
     pub attention_deltas: HashMap<String, f32>,
+    pub critic_rule_delta: CriticRuleDelta,
+    pub spawn_bias_variants: u8,
     pub escalate_to_llm: bool,
     pub verdict: String,
+}
+
+/// Runtime updates for Tier-1 critique thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CriticRuleDelta {
+    pub min_energy: Option<f32>,
+    pub agreement_threshold_autonomous: Option<f32>,
+    pub agreement_threshold_compliant: Option<f32>,
+    pub max_attention_saturation: Option<f32>,
+    pub wound_guard_threshold: Option<f32>,
+    pub wound_confidence_floor: Option<f32>,
+    pub phase_order: Option<Vec<MetacogPhase>>,
 }
 
 // ── Tier 1: Action-Level Metacognitive Loop ─────────────────────
@@ -195,8 +209,25 @@ pub fn metacognitive_loop(
             prior_critiques: prior_critiques.clone(),
         };
 
-        // Phase 2: Critique the plan (the metacognitive pause)
-        let evaluation = critique(&proposed, self_model);
+        let mut proposed = proposed;
+        let phases = self_model.metacog_phase_order.clone();
+        let mut evaluation: Option<SelfEvaluation> = None;
+
+        for phase in phases {
+            match phase {
+                MetacogPhase::Draft => {}
+                MetacogPhase::ReflectivePause => {
+                    proposed.confidence = (proposed.confidence * 0.95).clamp(0.0, 1.0);
+                    proposed.reasoning = format!("{}; pause: rechecked assumptions", proposed.reasoning);
+                }
+                MetacogPhase::Critique => {
+                    evaluation = Some(critique(&proposed, self_model));
+                }
+            }
+        }
+
+        // Safety fallback: critique can never be skipped, even if phase order is misconfigured.
+        let evaluation = evaluation.unwrap_or_else(|| critique(&proposed, self_model));
 
         // Feed through self-model (Julian notices his own deliberation)
         let signal = Signal::new(
@@ -210,6 +241,7 @@ pub fn metacognitive_loop(
         ).with_domain(&proposed.domain)
          .with_intensity(if evaluation.approved { 0.3 } else { 0.5 });
         crate::core::process(signal, self_model);
+        crate::metrics::record_metacog_decision(evaluation.approved);
 
         if evaluation.approved {
             return Some(ValidatedAction {
@@ -233,15 +265,19 @@ fn critique(proposed: &ProposedAction, sm: &SelfModel) -> SelfEvaluation {
     let mut approved = true;
     let mut critiques: Vec<String> = Vec::new();
 
-    let safety = sm.energy > 0.15;
+    let safety = sm.energy > sm.critic_rules.min_energy;
     if !safety {
         approved = false;
-        critiques.push("Energy too low — rest instead".into());
+        critiques.push(format!(
+            "Energy too low ({:.0}%) — rest instead (min {:.0}%)",
+            sm.energy * 100.0,
+            sm.critic_rules.min_energy * 100.0
+        ));
     }
 
     let agreement_threshold = match sm.mode {
-        CognitiveMode::Autonomous => 0.2,
-        CognitiveMode::Compliant => 0.3,
+        CognitiveMode::Autonomous => sm.critic_rules.agreement_threshold_autonomous,
+        CognitiveMode::Compliant => sm.critic_rules.agreement_threshold_compliant,
     };
     let hallucination = proposed.walker_agreement > agreement_threshold;
     if !hallucination {
@@ -261,7 +297,7 @@ fn critique(proposed: &ProposedAction, sm: &SelfModel) -> SelfEvaluation {
             .unwrap_or(0.0);
         let total_attention: f32 = sm.attention_patterns.values().sum();
         efficiency = if total_attention > 0.0 {
-            domain_saturation / total_attention < 0.7
+            domain_saturation / total_attention < sm.critic_rules.max_attention_saturation
         } else {
             true
         };
@@ -274,7 +310,9 @@ fn critique(proposed: &ProposedAction, sm: &SelfModel) -> SelfEvaluation {
         }
 
         if let Some(&wound) = sm.wounds.get(&proposed.domain) {
-            if wound > 0.5 && proposed.confidence < 0.6 {
+            if wound > sm.critic_rules.wound_guard_threshold
+                && proposed.confidence < sm.critic_rules.wound_confidence_floor
+            {
                 approved = false;
                 critiques.push(format!(
                     "Wound in {} ({:.0}%) + low confidence — proceed cautiously",
@@ -441,6 +479,11 @@ pub fn diagnose_session(summary: &WalkSessionSummary, sm: &SelfModel) -> CriticD
             format!("Energy at {:.0}% — system needs recovery", summary.energy * 100.0),
             CriticAdjustment {
                 plasticity_delta: -0.15,
+                critic_rule_delta: CriticRuleDelta {
+                    min_energy: Some((sm.critic_rules.min_energy + 0.02).min(0.4)),
+                    ..Default::default()
+                },
+                spawn_bias_variants: 0,
                 escalate_to_llm: false,
                 verdict: "Rest: energy critically low. Reduce activity, increase recovery.".into(),
                 ..Default::default()
@@ -459,6 +502,13 @@ pub fn diagnose_session(summary: &WalkSessionSummary, sm: &SelfModel) -> CriticD
                 plasticity_delta: 0.1,
                 bias_deltas,
                 attention_deltas,
+                critic_rule_delta: CriticRuleDelta {
+                    agreement_threshold_autonomous: Some((sm.critic_rules.agreement_threshold_autonomous - 0.02).max(0.05)),
+                    max_attention_saturation: Some((sm.critic_rules.max_attention_saturation - 0.05).max(0.45)),
+                    phase_order: Some(vec![MetacogPhase::Draft, MetacogPhase::ReflectivePause, MetacogPhase::Critique]),
+                    ..Default::default()
+                },
+                spawn_bias_variants: 1,
                 escalate_to_llm: true,
                 verdict: "BreakLoop: stuck in repetition. Randomize biases, reduce saturated attention.".into(),
             },
@@ -475,6 +525,12 @@ pub fn diagnose_session(summary: &WalkSessionSummary, sm: &SelfModel) -> CriticD
             CriticAdjustment {
                 plasticity_delta: 0.1,
                 bias_deltas,
+                critic_rule_delta: CriticRuleDelta {
+                    agreement_threshold_autonomous: Some((sm.critic_rules.agreement_threshold_autonomous - 0.01).max(0.05)),
+                    phase_order: Some(vec![MetacogPhase::Draft, MetacogPhase::ReflectivePause, MetacogPhase::Critique]),
+                    ..Default::default()
+                },
+                spawn_bias_variants: 1,
                 escalate_to_llm: true,
                 verdict: "ExploreMore: increase novelty-seeking and cross-domain curiosity.".into(),
                 ..Default::default()
@@ -523,6 +579,12 @@ pub fn diagnose_session(summary: &WalkSessionSummary, sm: &SelfModel) -> CriticD
             CriticAdjustment {
                 plasticity_delta: -0.05,
                 bias_deltas,
+                critic_rule_delta: CriticRuleDelta {
+                    wound_guard_threshold: Some((sm.critic_rules.wound_guard_threshold - 0.05).max(0.2)),
+                    phase_order: Some(vec![MetacogPhase::Draft, MetacogPhase::Critique]),
+                    ..Default::default()
+                },
+                spawn_bias_variants: 0,
                 escalate_to_llm: false,
                 verdict: "Caution: wound activated. Reduce exploration in wounded domains.".into(),
                 ..Default::default()
@@ -635,8 +697,17 @@ fn parse_critic_response(response: &str, fallback: &CriticAdjustment) -> CriticA
                 }).collect())
                 .unwrap_or_else(|| fallback.attention_deltas.clone());
 
+            let critic_rule_delta = v.get("critic_rule_delta")
+                .and_then(|x| serde_json::from_value::<CriticRuleDelta>(x.clone()).ok())
+                .unwrap_or_else(|| fallback.critic_rule_delta.clone());
+
+            let spawn_bias_variants = v.get("spawn_bias_variants")
+                .and_then(|n| n.as_u64())
+                .map(|n| n.min(u8::MAX as u64) as u8)
+                .unwrap_or(fallback.spawn_bias_variants);
+
             CriticAdjustment { plasticity_delta, bias_deltas, attention_deltas,
-                escalate_to_llm: false, verdict }
+                critic_rule_delta, spawn_bias_variants, escalate_to_llm: false, verdict }
         }
         Err(_) => fallback.clone(),
     }
@@ -704,6 +775,9 @@ pub async fn run_llm_critic(
         *entry = (*entry + delta).max(0.0);
     }
 
+    apply_rule_delta(sm, &adjustment.critic_rule_delta);
+    spawn_bias_variants(sm, adjustment.spawn_bias_variants);
+
     let signal = Signal::new("critic_llm_adjustment", &format!(
         "LLM Critic: {} (plasticity {:.2})",
         adjustment.verdict, sm.plasticity_gate,
@@ -715,7 +789,7 @@ pub async fn run_llm_critic(
 
 /// Build the LLM prompt for the critic from a diagnosis and summary.
 pub fn build_critic_llm_prompt(diagnosis: &CriticDiagnosis, summary: &WalkSessionSummary) -> (String, String) {
-    let system = "You are Julian's metacognitive critic. Evaluate this walk session. Output ONLY a JSON object with: verdict (string), plasticity_delta (float -0.3 to 0.3), bias_deltas (object mapping index string to float), attention_deltas (object mapping domain to float). Be concise.".to_string();
+    let system = "You are Julian's metacognitive critic. Evaluate this walk session. Output ONLY a JSON object with: verdict (string), plasticity_delta (float -0.3 to 0.3), bias_deltas (object mapping index string to float), attention_deltas (object mapping domain to float), spawn_bias_variants (int 0..2), critic_rule_delta (object with optional keys: min_energy, agreement_threshold_autonomous, agreement_threshold_compliant, max_attention_saturation, wound_guard_threshold, wound_confidence_floor, phase_order where phase_order is an array of [draft, reflective_pause, critique]). Be concise.".to_string();
     let user = format_critic_prompt(summary, diagnosis);
     (system, user)
 }
@@ -737,6 +811,9 @@ pub fn apply_critic_adjustments(sm: &mut SelfModel, adj: &CriticAdjustment) {
         *entry = (*entry + delta).max(0.0);
     }
 
+    apply_rule_delta(sm, &adj.critic_rule_delta);
+    spawn_bias_variants(sm, adj.spawn_bias_variants);
+
     let signal = Signal::new("critic_adjustment", &format!(
         "Critic: {} (plasticity {:.2}, {} bias changes, {} attn changes)",
         adj.verdict, sm.plasticity_gate, adj.bias_deltas.len(), adj.attention_deltas.len(),
@@ -744,10 +821,61 @@ pub fn apply_critic_adjustments(sm: &mut SelfModel, adj: &CriticAdjustment) {
     crate::core::process(signal, sm);
 }
 
+fn apply_rule_delta(sm: &mut SelfModel, delta: &CriticRuleDelta) {
+    if let Some(v) = delta.min_energy {
+        sm.critic_rules.min_energy = v.clamp(0.05, 0.6);
+    }
+    if let Some(v) = delta.agreement_threshold_autonomous {
+        sm.critic_rules.agreement_threshold_autonomous = v.clamp(0.05, 0.9);
+    }
+    if let Some(v) = delta.agreement_threshold_compliant {
+        sm.critic_rules.agreement_threshold_compliant = v.clamp(0.05, 0.95);
+    }
+    if let Some(v) = delta.max_attention_saturation {
+        sm.critic_rules.max_attention_saturation = v.clamp(0.3, 0.95);
+    }
+    if let Some(v) = delta.wound_guard_threshold {
+        sm.critic_rules.wound_guard_threshold = v.clamp(0.1, 0.95);
+    }
+    if let Some(v) = delta.wound_confidence_floor {
+        sm.critic_rules.wound_confidence_floor = v.clamp(0.1, 0.99);
+    }
+    if let Some(phases) = &delta.phase_order {
+        // Keep a safe floor: Draft + Critique must be present.
+        let has_draft = phases.iter().any(|p| p == &MetacogPhase::Draft);
+        let has_critique = phases.iter().any(|p| p == &MetacogPhase::Critique);
+        if has_draft && has_critique {
+            sm.metacog_phase_order = phases.clone();
+        }
+    }
+}
+
+fn spawn_bias_variants(sm: &mut SelfModel, count: u8) {
+    const MAX_LEARNED_BIASES: usize = 16;
+    for _ in 0..count {
+        if sm.learned_biases.len() >= MAX_LEARNED_BIASES {
+            break;
+        }
+
+        if sm.learned_biases.is_empty() {
+            sm.learned_biases.push(crate::graph::LearnedBias::default());
+        }
+
+        let parent_idx = (sm.learned_bias_rotation as usize) % sm.learned_biases.len();
+        let mut child = sm.learned_biases[parent_idx].clone();
+        child.sessions_learned = 0;
+        child.novelty_seeking = (child.novelty_seeking + 0.08).clamp(0.05, 0.95);
+        child.cross_domain_curiosity = (child.cross_domain_curiosity + 0.06).clamp(0.05, 0.95);
+        child.experience_reliance = (child.experience_reliance - 0.05).clamp(0.05, 0.95);
+        sm.learned_biases.push(child);
+    }
+}
+
 // ── Theory of Mind Helpers ──────────────────────────────────────
 
 /// Record a motor output to an audience member. Updates audience model.
 pub fn record_audience_output(sm: &mut SelfModel, audience_id: &str, message: &str, domain: &str) {
+    sm.active_audience_id = Some(audience_id.to_string());
     let audience = sm.audience_model.entry(audience_id.to_string())
         .or_insert_with(|| AudienceBeliefs::new(audience_id));
 
@@ -805,6 +933,7 @@ pub fn record_audience_response(sm: &mut SelfModel, audience_id: &str, response:
         crate::embed::embed_text(response),
     ) {
         let sim = crate::embed::cosine_similarity(&resp_emb, last_ctx);
+        crate::metrics::record_tom_prediction(sim >= 0.4);
         if sim < 0.4 {
             audience.relationship_valence = (audience.relationship_valence - 0.05).max(-1.0);
             return Some(Noticing {
@@ -1243,6 +1372,46 @@ mod tests {
 
         assert!(sm.attention_patterns.get("markets").unwrap() < &3.0);
         assert!((sm.attention_patterns.get("new_domain").unwrap() - 0.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_apply_critic_adjustments_phase_order() {
+        let mut sm = test_sm();
+        let adj = CriticAdjustment {
+            critic_rule_delta: CriticRuleDelta {
+                phase_order: Some(vec![
+                    MetacogPhase::Draft,
+                    MetacogPhase::ReflectivePause,
+                    MetacogPhase::Critique,
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        apply_critic_adjustments(&mut sm, &adj);
+        assert_eq!(
+            sm.metacog_phase_order,
+            vec![
+                MetacogPhase::Draft,
+                MetacogPhase::ReflectivePause,
+                MetacogPhase::Critique,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_apply_critic_adjustments_spawns_bias_variants() {
+        let mut sm = test_sm();
+        let before = sm.learned_biases.len();
+
+        let adj = CriticAdjustment {
+            spawn_bias_variants: 2,
+            ..Default::default()
+        };
+
+        apply_critic_adjustments(&mut sm, &adj);
+        assert!(sm.learned_biases.len() >= before + 2);
     }
 
     // ── parse_critic_response ────────────────────────────────────
