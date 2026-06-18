@@ -36,6 +36,24 @@ pub struct LlmMetrics {
     pub cost_micros: AtomicU64,
     /// Calls skipped by the spend circuit breaker (cost ceiling hit).
     pub throttled: AtomicU64,
+    /// Number of completed walker sessions recorded.
+    pub walk_sessions: AtomicU64,
+    /// Sum of walk novelty scores scaled by 1e6.
+    pub walk_novelty_micros: AtomicU64,
+    /// Sessions flagged as repetitive.
+    pub repeated_walks: AtomicU64,
+    /// Sum of observed cascade depths.
+    pub cascade_depth_total: AtomicU64,
+    /// Number of cascade depth events.
+    pub cascade_events: AtomicU64,
+    /// Metacognitive approvals/rejections.
+    pub metacog_approved: AtomicU64,
+    pub metacog_rejected: AtomicU64,
+    /// New emergent goals formed.
+    pub goals_formed: AtomicU64,
+    /// Theory-of-mind prediction outcomes.
+    pub tom_predictions: AtomicU64,
+    pub tom_correct: AtomicU64,
     /// Cost accrued in the current accounting day (micro-USD), reset on day roll.
     day_cost_micros: AtomicU64,
     /// Current accounting day (unix_secs / 86400). Detects the day boundary.
@@ -57,6 +75,16 @@ impl LlmMetrics {
             completion_tokens: AtomicU64::new(0),
             cost_micros: AtomicU64::new(0),
             throttled: AtomicU64::new(0),
+            walk_sessions: AtomicU64::new(0),
+            walk_novelty_micros: AtomicU64::new(0),
+            repeated_walks: AtomicU64::new(0),
+            cascade_depth_total: AtomicU64::new(0),
+            cascade_events: AtomicU64::new(0),
+            metacog_approved: AtomicU64::new(0),
+            metacog_rejected: AtomicU64::new(0),
+            goals_formed: AtomicU64::new(0),
+            tom_predictions: AtomicU64::new(0),
+            tom_correct: AtomicU64::new(0),
             day_cost_micros: AtomicU64::new(0),
             day_epoch: AtomicU64::new(current_day()),
             recent: Mutex::new(Vec::new()),
@@ -144,6 +172,48 @@ pub fn record_throttle() {
     METRICS.throttled.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record a completed walker session's novelty and whether it looked repetitive.
+pub fn record_walk_session(novelty_score: f32, repeated: bool) {
+    METRICS.walk_sessions.fetch_add(1, Ordering::Relaxed);
+    let novelty = novelty_score.clamp(0.0, 1.0);
+    METRICS
+        .walk_novelty_micros
+        .fetch_add((novelty * 1_000_000.0) as u64, Ordering::Relaxed);
+    if repeated {
+        METRICS.repeated_walks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record one cascade depth sample from a spontaneous diverger walk.
+pub fn record_cascade_depth(depth: u32) {
+    METRICS
+        .cascade_depth_total
+        .fetch_add(depth as u64, Ordering::Relaxed);
+    METRICS.cascade_events.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record an action-level metacognitive verdict.
+pub fn record_metacog_decision(approved: bool) {
+    if approved {
+        METRICS.metacog_approved.fetch_add(1, Ordering::Relaxed);
+    } else {
+        METRICS.metacog_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a newly formed emergent goal/pattern.
+pub fn record_goal_formed() {
+    METRICS.goals_formed.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a theory-of-mind prediction check.
+pub fn record_tom_prediction(correct: bool) {
+    METRICS.tom_predictions.fetch_add(1, Ordering::Relaxed);
+    if correct {
+        METRICS.tom_correct.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Reset the per-day cost accumulator when the accounting day rolls over.
 fn roll_day_if_needed() {
     let today = current_day();
@@ -224,6 +294,13 @@ pub struct MetricsSnapshot {
     pub avg_prompt_tokens: f64,
     pub avg_completion_tokens: f64,
     pub tokens_per_call: f64,
+    pub walk_sessions: u64,
+    pub avg_walk_novelty: f64,
+    pub repeated_walk_rate: f64,
+    pub avg_cascade_depth: f64,
+    pub metacog_approval_rate: f64,
+    pub goals_formed: u64,
+    pub tom_accuracy: f64,
 }
 
 /// Read the current metrics. Cheap; safe to call from a handler.
@@ -250,6 +327,17 @@ pub fn snapshot() -> MetricsSnapshot {
         .unwrap_or(0.0);
 
     let attempts = calls + dedup; // calls we would have made without dedup
+    let walk_sessions = METRICS.walk_sessions.load(Ordering::Relaxed);
+    let walk_novelty_micros = METRICS.walk_novelty_micros.load(Ordering::Relaxed);
+    let repeated_walks = METRICS.repeated_walks.load(Ordering::Relaxed);
+    let cascade_events = METRICS.cascade_events.load(Ordering::Relaxed);
+    let cascade_depth_total = METRICS.cascade_depth_total.load(Ordering::Relaxed);
+    let metacog_approved = METRICS.metacog_approved.load(Ordering::Relaxed);
+    let metacog_rejected = METRICS.metacog_rejected.load(Ordering::Relaxed);
+    let goals_formed = METRICS.goals_formed.load(Ordering::Relaxed);
+    let tom_predictions = METRICS.tom_predictions.load(Ordering::Relaxed);
+    let tom_correct = METRICS.tom_correct.load(Ordering::Relaxed);
+
     MetricsSnapshot {
         calls,
         failed_calls: METRICS.failed_calls.load(Ordering::Relaxed),
@@ -270,6 +358,23 @@ pub fn snapshot() -> MetricsSnapshot {
         avg_prompt_tokens: if calls > 0 { prompt_t as f64 / calls as f64 } else { 0.0 },
         avg_completion_tokens: if calls > 0 { completion_t as f64 / calls as f64 } else { 0.0 },
         tokens_per_call: if calls > 0 { (prompt_t + completion_t) as f64 / calls as f64 } else { 0.0 },
+        walk_sessions,
+        avg_walk_novelty: if walk_sessions > 0 {
+            (walk_novelty_micros as f64 / 1_000_000.0) / walk_sessions as f64
+        } else { 0.0 },
+        repeated_walk_rate: if walk_sessions > 0 {
+            repeated_walks as f64 / walk_sessions as f64 * 100.0
+        } else { 0.0 },
+        avg_cascade_depth: if cascade_events > 0 {
+            cascade_depth_total as f64 / cascade_events as f64
+        } else { 0.0 },
+        metacog_approval_rate: if (metacog_approved + metacog_rejected) > 0 {
+            metacog_approved as f64 / (metacog_approved + metacog_rejected) as f64 * 100.0
+        } else { 0.0 },
+        goals_formed,
+        tom_accuracy: if tom_predictions > 0 {
+            tom_correct as f64 / tom_predictions as f64 * 100.0
+        } else { 0.0 },
     }
 }
 

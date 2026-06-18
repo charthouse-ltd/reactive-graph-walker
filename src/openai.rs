@@ -188,6 +188,11 @@ pub async fn chat_completions(
         None
     };
 
+    if let Some(ref aid) = req.rgw_audience {
+        let mut sm = state.self_model.lock().await;
+        sm.active_audience_id = Some(aid.clone());
+    }
+
     let (walk_output, _walker_results) = walker::walk_parallel(
         &state.pool,
         &emotion,

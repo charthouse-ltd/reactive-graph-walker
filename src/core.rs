@@ -105,6 +105,40 @@ pub struct Noticing {
     pub timestamp: f64,
 }
 
+/// Runtime-tunable thresholds for the Tier-1 metacognitive critic.
+/// Stored in self-state so critique behavior can adapt without code edits.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct CriticRuleProfile {
+    pub min_energy: f32,
+    pub agreement_threshold_autonomous: f32,
+    pub agreement_threshold_compliant: f32,
+    pub max_attention_saturation: f32,
+    pub wound_guard_threshold: f32,
+    pub wound_confidence_floor: f32,
+}
+
+/// Runtime-configurable metacognitive pipeline phases.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetacogPhase {
+    Draft,
+    ReflectivePause,
+    Critique,
+}
+
+impl Default for CriticRuleProfile {
+    fn default() -> Self {
+        Self {
+            min_energy: 0.15,
+            agreement_threshold_autonomous: 0.2,
+            agreement_threshold_compliant: 0.3,
+            max_attention_saturation: 0.7,
+            wound_guard_threshold: 0.5,
+            wound_confidence_floor: 0.6,
+        }
+    }
+}
+
 // ── SelfModel ───────────────────────────────────────────────────
 // The system's understanding of itself. Present in every computation.
 // Not a log. Not a state dump. A living model that participates
@@ -158,11 +192,24 @@ pub struct SelfModel {
     /// What questions remain unanswered (from search gaps, dead ends)
     pub open_questions: Vec<String>,
 
+    // ── Pursuit state ──
+    /// Highest-strength emergent concern currently being pursued.
+    pub active_goal_domain: Option<String>,
+    /// Strength of the active goal at selection time.
+    pub active_goal_strength: f32,
+
     // ── Theory of Mind ──
     /// What Julian believes about specific audience members.
     /// Keyed by audience identifier (username, handle, platform:id).
     /// Populated on motor output, queried on next interaction.
     pub audience_model: HashMap<String, AudienceBeliefs>,
+    /// Audience currently foregrounded for decision shaping.
+    pub active_audience_id: Option<String>,
+
+    // ── Runtime critic rules ──
+    pub critic_rules: CriticRuleProfile,
+    /// Runtime phase ordering for action-level metacognition.
+    pub metacog_phase_order: Vec<MetacogPhase>,
 
     // ── Structural self-awareness ──
     /// The system notices its own architecture.
@@ -211,6 +258,8 @@ pub struct SelfModel {
 
     // ── Emergent biases ──
     pub learned_biases: Vec<crate::graph::LearnedBias>,
+    /// Session-level rotation across learned bias profiles.
+    pub learned_bias_rotation: u64,
 
     // ── Meta ──
     pub total_signals_processed: u64,
@@ -380,6 +429,8 @@ impl SelfModel {
             beliefs: Vec::new(),
             recent_interactions: Vec::new(),
             open_questions: Vec::new(),
+            active_goal_domain: None,
+            active_goal_strength: 0.0,
             dead_ends_by_domain: HashMap::new(),
             surprise_count: 0,
             signals_by_source: HashMap::new(),
@@ -397,6 +448,10 @@ impl SelfModel {
             critic_verdict: String::new(),
             critic_sessions_since_llm: 0,
             audience_model: HashMap::new(),
+            active_audience_id: None,
+            critic_rules: CriticRuleProfile::default(),
+            metacog_phase_order: vec![MetacogPhase::Draft, MetacogPhase::Critique],
+            learned_bias_rotation: 0,
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,
@@ -940,6 +995,7 @@ fn notice(sm: &SelfModel, before: &Snapshot, signal: &Signal) -> Option<Noticing
 
 fn detect_patterns(sm: &mut SelfModel) {
     let now = now();
+    let mut new_patterns = 0_u64;
 
     // Group recent noticings by domain
     let mut domain_noticings: HashMap<String, Vec<&Noticing>> = HashMap::new();
@@ -993,6 +1049,7 @@ fn detect_patterns(sm: &mut SelfModel) {
                 first_seen: noticings.first().map(|n| n.timestamp).unwrap_or(now),
                 last_seen: now,
             });
+            new_patterns += 1;
         }
     }
 
@@ -1009,6 +1066,20 @@ fn detect_patterns(sm: &mut SelfModel) {
             b.strength.partial_cmp(&a.strength).unwrap_or(std::cmp::Ordering::Equal)
         );
         sm.emergent_patterns.truncate(10);
+    }
+
+    // Promote strongest sufficiently-evidenced pattern into active pursuit.
+    if let Some(best) = sm.emergent_patterns
+        .iter()
+        .filter(|p| p.evidence_count >= 3)
+        .max_by(|a, b| a.strength.partial_cmp(&b.strength).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        sm.active_goal_domain = Some(best.domain.clone());
+        sm.active_goal_strength = best.strength;
+    }
+
+    for _ in 0..new_patterns {
+        crate::metrics::record_goal_formed();
     }
 
     // Strong patterns → beliefs (understanding, not counting)

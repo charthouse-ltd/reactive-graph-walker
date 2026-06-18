@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 
 use crate::db;
-use crate::core::{CognitiveMode, SelfModel};
+use crate::core::{CognitiveMode, MetacogPhase, SelfModel};
 use crate::diverger::{Diverger, EdgeChange};
 use crate::graph::*;
 use crate::openai;
@@ -136,6 +136,7 @@ pub async fn serve(
         .route("/metrics", get(metrics_endpoint))
         .route("/diverger", get(diverger_stats))
         .route("/self", get(self_state))
+        .route("/metacog/config", get(get_metacog_config).post(set_metacog_config))
         .route("/tools", get(list_tools))
         .route("/music", get(music_endpoint))
         .route("/music/midi", get(music_midi_endpoint))
@@ -312,6 +313,123 @@ async fn walk(
 async fn self_state(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let sm = state.self_model.lock().await;
     Json(serde_json::to_value(&*sm).unwrap_or_default())
+}
+
+/// GET /metacog/config — runtime metacognitive configuration.
+/// This endpoint is auth-protected via the protected router's middleware.
+async fn get_metacog_config(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let sm = state.self_model.lock().await;
+    Json(metacog_config_json(&sm))
+}
+
+#[derive(Deserialize, Default)]
+struct MetacogConfigPatch {
+    min_energy: Option<f32>,
+    agreement_threshold_autonomous: Option<f32>,
+    agreement_threshold_compliant: Option<f32>,
+    max_attention_saturation: Option<f32>,
+    wound_guard_threshold: Option<f32>,
+    wound_confidence_floor: Option<f32>,
+    phase_order: Option<Vec<MetacogPhase>>,
+    learned_bias_rotation: Option<u64>,
+    /// Spawn additional learned-bias profiles (bounded).
+    spawn_bias_variants: Option<u8>,
+}
+
+/// POST /metacog/config — mutate metacognitive runtime config.
+/// This endpoint is auth-protected via the protected router's middleware.
+async fn set_metacog_config(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MetacogConfigPatch>,
+) -> Json<serde_json::Value> {
+    let mut sm = state.self_model.lock().await;
+
+    if let Some(v) = req.min_energy {
+        sm.critic_rules.min_energy = v.clamp(0.05, 0.6);
+    }
+    if let Some(v) = req.agreement_threshold_autonomous {
+        sm.critic_rules.agreement_threshold_autonomous = v.clamp(0.05, 0.9);
+    }
+    if let Some(v) = req.agreement_threshold_compliant {
+        sm.critic_rules.agreement_threshold_compliant = v.clamp(0.05, 0.95);
+    }
+    if let Some(v) = req.max_attention_saturation {
+        sm.critic_rules.max_attention_saturation = v.clamp(0.3, 0.95);
+    }
+    if let Some(v) = req.wound_guard_threshold {
+        sm.critic_rules.wound_guard_threshold = v.clamp(0.1, 0.95);
+    }
+    if let Some(v) = req.wound_confidence_floor {
+        sm.critic_rules.wound_confidence_floor = v.clamp(0.1, 0.99);
+    }
+
+    if let Some(phases) = req.phase_order {
+        let has_draft = phases.iter().any(|p| p == &MetacogPhase::Draft);
+        let has_critique = phases.iter().any(|p| p == &MetacogPhase::Critique);
+        if !has_draft || !has_critique {
+            return Json(serde_json::json!({
+                "status": "error",
+                "error": "phase_order must include both 'draft' and 'critique'"
+            }));
+        }
+        sm.metacog_phase_order = phases;
+    }
+
+    if let Some(rot) = req.learned_bias_rotation {
+        sm.learned_bias_rotation = rot;
+    }
+
+    if let Some(spawn) = req.spawn_bias_variants {
+        spawn_bias_variants_api(&mut sm, spawn);
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "config": metacog_config_json(&sm),
+    }))
+}
+
+fn spawn_bias_variants_api(sm: &mut SelfModel, count: u8) {
+    const MAX_LEARNED_BIASES: usize = 16;
+
+    for _ in 0..count {
+        if sm.learned_biases.len() >= MAX_LEARNED_BIASES {
+            break;
+        }
+
+        if sm.learned_biases.is_empty() {
+            sm.learned_biases.push(crate::graph::LearnedBias::default());
+        }
+
+        let parent_idx = (sm.learned_bias_rotation as usize) % sm.learned_biases.len();
+        let mut child = sm.learned_biases[parent_idx].clone();
+        child.sessions_learned = 0;
+        child.novelty_seeking = (child.novelty_seeking + 0.08).clamp(0.05, 0.95);
+        child.cross_domain_curiosity = (child.cross_domain_curiosity + 0.06).clamp(0.05, 0.95);
+        child.experience_reliance = (child.experience_reliance - 0.05).clamp(0.05, 0.95);
+        sm.learned_biases.push(child);
+    }
+}
+
+fn metacog_config_json(sm: &SelfModel) -> serde_json::Value {
+    serde_json::json!({
+        "critic_rules": {
+            "min_energy": sm.critic_rules.min_energy,
+            "agreement_threshold_autonomous": sm.critic_rules.agreement_threshold_autonomous,
+            "agreement_threshold_compliant": sm.critic_rules.agreement_threshold_compliant,
+            "max_attention_saturation": sm.critic_rules.max_attention_saturation,
+            "wound_guard_threshold": sm.critic_rules.wound_guard_threshold,
+            "wound_confidence_floor": sm.critic_rules.wound_confidence_floor,
+        },
+        "phase_order": sm.metacog_phase_order,
+        "learned_bias_count": sm.learned_biases.len(),
+        "learned_bias_rotation": sm.learned_bias_rotation,
+        "active_goal_domain": sm.active_goal_domain,
+        "active_goal_strength": sm.active_goal_strength,
+        "active_audience_id": sm.active_audience_id,
+    })
 }
 
 /// POST /self/save — persist self-model to database
@@ -847,4 +965,107 @@ async fn benchmark(
             "fastest": fastest,
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+
+    struct ApiKeyGuard {
+        previous: Option<String>,
+    }
+
+    impl ApiKeyGuard {
+        fn set(value: Option<&str>) -> Self {
+            let previous = std::env::var("RGW_API_KEY").ok();
+            match value {
+                Some(v) => {
+                    // Safety: tests set process env in a narrow scope and restore on Drop.
+                    unsafe { std::env::set_var("RGW_API_KEY", v) };
+                }
+                None => {
+                    // Safety: tests set process env in a narrow scope and restore on Drop.
+                    unsafe { std::env::remove_var("RGW_API_KEY") };
+                }
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ApiKeyGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => {
+                    // Safety: restore prior value after test completes.
+                    unsafe { std::env::set_var("RGW_API_KEY", v) };
+                }
+                None => {
+                    // Safety: restore prior unset state after test completes.
+                    unsafe { std::env::remove_var("RGW_API_KEY") };
+                }
+            }
+        }
+    }
+
+    async fn spawn_auth_test_app() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/metacog/config", get(|| async { StatusCode::OK }))
+            .route_layer(middleware::from_fn(require_auth));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn metacog_config_auth_respects_rgw_api_key() {
+        let guard = ApiKeyGuard::set(Some("test-key"));
+        let (base_url, server) = spawn_auth_test_app().await;
+        let client = reqwest::Client::new();
+
+        // Missing key should be rejected when RGW_API_KEY is set.
+        let res = client
+            .get(format!("{}/metacog/config", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong key should also be rejected.
+        let res = client
+            .get(format!("{}/metacog/config", base_url))
+            .header("X-RGW-Key", "wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct key should be accepted.
+        let res = client
+            .get(format!("{}/metacog/config", base_url))
+            .header("X-RGW-Key", "test-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Fail-open behavior when key is unset.
+        // Safety: scoped mutation restored by guard drop.
+        unsafe { std::env::remove_var("RGW_API_KEY") };
+        let res = client
+            .get(format!("{}/metacog/config", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        server.abort();
+        drop(guard);
+    }
 }

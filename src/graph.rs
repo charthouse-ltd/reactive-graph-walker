@@ -210,6 +210,10 @@ impl WalkerBias {
     ///   wounds         — accumulated pain by domain
     ///   competencies   — accumulated skill by domain
     ///   wm_domains     — domains currently held in working memory
+    ///   goal_domain    — currently pursued emergent goal domain
+    ///   goal_strength  — strength of active goal pursuit
+    ///   audience_model — model of known audiences
+    ///   active_audience_id — audience currently foregrounded for decisions
     pub fn score_edge_with_context(
         &self,
         edge_type: &str,
@@ -224,6 +228,10 @@ impl WalkerBias {
         wounds: &HashMap<String, f32>,
         competencies: &HashMap<String, f32>,
         wm_domains: &HashSet<String>,
+        goal_domain: Option<&str>,
+        goal_strength: f32,
+        audience_model: Option<&HashMap<String, crate::core::AudienceBeliefs>>,
+        active_audience_id: Option<&str>,
     ) -> f32 {
         // Start with base emotional scoring
         let mut w = self.score_edge(edge_type, edge_weight, emotional_charge, traversal_count, emotion);
@@ -286,6 +294,27 @@ impl WalkerBias {
         // Working memory resonance: domain currently in conscious awareness → boost
         if wm_domains.contains(next_domain) {
             w *= 1.3;
+        }
+
+        // Active pursuit bias: pull traversal toward current emergent goal.
+        if let Some(goal) = goal_domain {
+            if !goal.is_empty() && goal == next_domain {
+                w *= 1.0 + goal_strength.clamp(0.0, 1.0) * 1.5;
+            }
+        }
+
+        // Audience-aware bias: prefer domains this audience is estimated to care about.
+        if let (Some(model), Some(audience_id)) = (audience_model, active_audience_id) {
+            if let Some(a) = model.get(audience_id) {
+                let interest = a.estimated_interest.get(next_domain).copied().unwrap_or(0.0);
+                let knowledge = a.estimated_knowledge.get(next_domain).copied().unwrap_or(0.0);
+                if interest > 0.1 {
+                    w *= 1.0 + (interest * 0.8).min(0.6);
+                }
+                if knowledge < 0.2 {
+                    w *= 1.05;
+                }
+            }
         }
 
         w.max(0.001)

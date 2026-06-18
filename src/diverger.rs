@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use rand::seq::SliceRandom;
 use sqlx::PgPool;
 use tokio::sync::{mpsc, RwLock};
 
@@ -215,7 +216,7 @@ impl Diverger {
                 // ran on constant defaults forever (audit A2). Now it tracks the
                 // real mood. Energy is still propagated in Compliant mode (below);
                 // only spontaneous firing is suppressed.
-                let (is_autonomous, emo) = {
+                let (is_autonomous, emo, goal_domain, goal_strength, active_audience_id, consecutive_repetitions) = {
                     let sm = self_model.lock().await;
                     (
                         sm.mode == crate::core::CognitiveMode::Autonomous,
@@ -224,6 +225,10 @@ impl Diverger {
                             arousal: sm.arousal,
                             energy: sm.energy,
                         },
+                        sm.active_goal_domain.clone(),
+                        sm.active_goal_strength,
+                        sm.active_audience_id.clone(),
+                        sm.consecutive_repetitions,
                     )
                 };
                 // Keep the stats cache live so GET /diverger reflects real mood.
@@ -277,6 +282,53 @@ impl Diverger {
                     }
                 }
 
+                // If we're repeating the same walk trajectory, inject a small
+                // exploration pulse into fresh seed nodes to break attractors.
+                if consecutive_repetitions >= 4 {
+                    let pulse_nodes = crate::db::seed_nodes(&pool, 3).await.unwrap_or_default();
+                    if !pulse_nodes.is_empty() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs_f64();
+                        let mut nodes_lock = nodes.write().await;
+                        for id in pulse_nodes {
+                            let node = nodes_lock.entry(id).or_insert(NodeEnergy {
+                                energy: 0.0,
+                                last_fired: 0.0,
+                                last_update: now,
+                            });
+                            node.energy += 0.08;
+                            node.last_update = now;
+                        }
+                    }
+                    if let Ok(mut sm) = self_model.try_lock() {
+                        sm.consecutive_repetitions = 0;
+                    }
+                }
+
+                // Goal-directed prioritization: fire nodes in goal domain first.
+                if let Some(goal) = goal_domain.as_ref() {
+                    let mut scored: Vec<(i32, f32)> = Vec::with_capacity(nodes_to_fire.len());
+                    for nid in nodes_to_fire {
+                        let mut score = 1.0;
+                        if let Ok(Some(node)) = db::get_node(&pool, nid).await {
+                            if node.domain == *goal {
+                                score += goal_strength.clamp(0.0, 1.0) * 2.0;
+                            }
+                        }
+                        scored.push((nid, score));
+                    }
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    nodes_to_fire = scored.into_iter().map(|(nid, _)| nid).collect();
+                }
+
+                // Stuck-mode jitter: randomize firing order to improve exploration.
+                if consecutive_repetitions >= 2 && nodes_to_fire.len() > 1 {
+                    let mut rng = rand::rng();
+                    nodes_to_fire.shuffle(&mut rng);
+                }
+
                 // In Compliant mode, suppress all spontaneous walks.
                 // Energy still propagated above (the graph stays alive), but
                 // no spontaneous behavior fires. The system only acts when
@@ -310,6 +362,7 @@ impl Diverger {
 
                     let sm_walk = self_model.clone();
                     let julian_url = julian_url_outer.clone();
+                    let audience_id_for_walk = active_audience_id.clone();
                         let kd = knowledge_domains.clone();
                         tokio::spawn(async move {
                         // Preload the seed's neighborhood (radius 1) before walking:
@@ -359,6 +412,7 @@ impl Diverger {
                             let hops = result.path.len();
                             let surprises = result.surprises;
                             let domains = result.domains_visited.clone();
+                            crate::metrics::record_cascade_depth(hops as u32);
 
                             tracing::debug!(
                                 "[diverger] Spontaneous walk from node {}: {} hops, {} surprises, domains: {:?}",
@@ -398,7 +452,7 @@ impl Diverger {
                                         novelty: surprises as f32 / hops.max(1) as f32,
                                         search_query,
                                         params: None,
-                                        audience_id: None,  // Spontaneous walks have no specific audience
+                                        audience_id: audience_id_for_walk.clone(),
                                     };
                                     crate::motor::execute(&julian_url, cmd).await;
                                 }
