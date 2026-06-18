@@ -46,7 +46,7 @@ Walkers traverse a knowledge graph in parallel, each with different biases. Conv
 - **Working memory** (PFC-equivalent, 5±2 slots)
 - **Predictive coding** — expects outcomes, learns from errors
 - **Metaplasticity gate** — modulates learning rate from experience
-- **Learned biases** — 6 per-walker emergent profiles that adapt each session
+- **Learned biases** — per-walker emergent profiles (default 6, can spawn variants up to 16) that adapt each session from walk outcomes. Fitness-based *selection* over the pool — breed-from-fittest, cull-weakest — is specified in [`PROTOCOL-self-selection.md`](PROTOCOL-self-selection.md)
 - **Structural noticings** — the system observes its own architecture (obsession, dead-end clusters, cognitive loops, signal poverty)
 
 ### LLM as Tool (DeepSeek)
@@ -136,6 +136,15 @@ Insight → integration → exploration → re-integration. The loop closes."
 - Edge cache: lock-free reads (DashMap), batch writes
 - Memory: proportional to graph size
 - Database: PostgreSQL 16 with pgvector (768-dim embeddings)
+
+## Design Protocols
+
+Design documents for capabilities that are specified but not yet (fully) implemented. Each follows the same house format: thesis → problem → solution → file-by-file changes → safety invariants → graduated rollout → references.
+
+- [`PROTOCOL-self-selection.md`](PROTOCOL-self-selection.md) — **closing the evolutionary loop.** Today RGW *mutates* its biases and rules but never *selects* among the mutations (variants are bred and never culled; rule changes are applied with no evaluation or rollback). This adds fitness-based selection over the learned-bias pool and evaluate-then-keep for metacognitive rule changes — both offline in the dream loop, scored by one "coherent insight" fitness signal — plus a minimal fix so emergent goals and audience-modelling, currently computed but bypassed by the live edge-scorer, actually steer walks. Framed as **bounded autonomy**: free variation inside a fixed, human-set fitness function.
+- [`PROTOCOL-unconscious-walker.md`](PROTOCOL-unconscious-walker.md) — an always-on, motor-disconnected third walker mode (Default Mode Network analogue) that consolidates and explores continuously and wakes the conscious walker on salience.
+- [`PROTOCOL-unconscious-v0.md`](PROTOCOL-unconscious-v0.md) — minimal read-only Observability implementation of the unconscious walker: computes everything, commits nothing.
+- [`PROTOCOL-compliance-mode.md`](PROTOCOL-compliance-mode.md) — Compliant (deterministic, graph frozen) vs Autonomous (full emotional agency) cognitive modes.
 
 ## License
 
