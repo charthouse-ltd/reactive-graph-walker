@@ -123,11 +123,25 @@ pub fn walk_single(
                 let next_domain = domain_map.get(&next_id).map(|s| s.as_str()).unwrap_or("");
 
                 let score = if let Some(lb) = learned_bias {
-                    // Emergent learned bias — adapts from experience
+                    // Emergent learned bias — adapts from experience.
+                    // Fix #3: goal pursuit + audience bias are Autonomous-only; Compliant
+                    // threads goal_strength = 0 / no audience so scoring stays deterministic.
+                    let (goal_domain, goal_strength, audience_model, audience_id) =
+                        if self_model.mode == core::CognitiveMode::Autonomous {
+                            (
+                                self_model.active_goal_domain.as_deref(),
+                                self_model.active_goal_strength,
+                                Some(&self_model.audience_model),
+                                self_model.active_audience_id.as_deref(),
+                            )
+                        } else {
+                            (None, 0.0, None, None)
+                        };
                     lb.score_edge(
                         &e.edge_type, e.weight, e.emotional_charge,
                         e.traversal_count, &current_emotion,
                         next_domain, &current_domain,
+                        goal_domain, goal_strength, audience_model, audience_id,
                     )
                 } else {
                     // Fallback: hardcoded WalkerBias with full context
