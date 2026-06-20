@@ -260,6 +260,9 @@ pub struct SelfModel {
     pub learned_biases: Vec<crate::graph::LearnedBias>,
     /// Session-level rotation across learned bias profiles.
     pub learned_bias_rotation: u64,
+    /// Tunable weights for the selection fitness composite (Stage 0+).
+    #[serde(default)]
+    pub selection_weights: crate::graph::SelectionWeights,
 
     // ── Meta ──
     pub total_signals_processed: u64,
@@ -452,6 +455,7 @@ impl SelfModel {
             critic_rules: CriticRuleProfile::default(),
             metacog_phase_order: vec![MetacogPhase::Draft, MetacogPhase::Critique],
             learned_bias_rotation: 0,
+            selection_weights: crate::graph::SelectionWeights::default(),
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,

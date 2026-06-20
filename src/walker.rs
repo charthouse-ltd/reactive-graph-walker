@@ -442,6 +442,11 @@ pub async fn walk_parallel(
         // Each walker's bias adapts based on what it found.
         // Walkers that found surprises → more contradiction-seeking.
         // Walkers that hit dead ends → more novelty-seeking.
+        // Stage 0 (PROTOCOL-self-selection): also accumulate each profile's intrinsic
+        // fitness scorecard — Autonomous-only, compute-only (nothing selects on it yet).
+        let selection_weights = sm.selection_weights.clone();
+        let session_repetition = (sm.consecutive_repetitions as f32 / 4.0).min(1.0);
+        let accumulate_fitness = sm.mode == core::CognitiveMode::Autonomous;
         for (i, (result, _walker_sm)) in results.iter().enumerate() {
             let bias_idx = if sm.learned_biases.is_empty() {
                 None
@@ -460,6 +465,12 @@ pub async fn walk_parallel(
                     novelty,
                     result.domains_visited.len(),
                 );
+                if accumulate_fitness {
+                    let (nov, surprise_kept, dead_end_rate) = crate::graph::fitness_inputs(result);
+                    bias.scorecard.record(
+                        nov, surprise_kept, dead_end_rate, session_repetition, 0.0, &selection_weights,
+                    );
+                }
             }
         }
         sm.learned_bias_rotation = sm.learned_bias_rotation.wrapping_add(1);
