@@ -387,6 +387,150 @@ fn dream_walk_single(
 // This replaces time-sharing with concurrency — the graph is
 // continuously explored AND continuously renormalized.
 
+const SELECTION_RING_CAP: usize = 24;
+const SELECTION_N_MIN: usize = 16;
+
+/// Spearman rank correlation. Returns None if n < 3 or either series is (near-)constant
+/// (a flat series makes the correlation numerically undefined — guard, don't divide).
+fn spearman(a: &[f64], b: &[f64]) -> Option<f32> {
+    let n = a.len();
+    if n < 3 || b.len() != n {
+        return None;
+    }
+    // Average-rank assignment (ties → mean rank), 1-based.
+    let ranks = |xs: &[f64]| -> Vec<f64> {
+        let mut idx: Vec<usize> = (0..xs.len()).collect();
+        idx.sort_by(|&i, &j| xs[i].partial_cmp(&xs[j]).unwrap_or(std::cmp::Ordering::Equal));
+        let mut r = vec![0.0f64; xs.len()];
+        let mut k = 0;
+        while k < idx.len() {
+            let mut l = k;
+            while l + 1 < idx.len() && xs[idx[l + 1]] == xs[idx[k]] {
+                l += 1;
+            }
+            let avg = (k + l) as f64 / 2.0 + 1.0;
+            for m in k..=l {
+                r[idx[m]] = avg;
+            }
+            k = l + 1;
+        }
+        r
+    };
+    let (ra, rb) = (ranks(a), ranks(b));
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let (ma, mb) = (mean(&ra), mean(&rb));
+    let (mut num, mut da, mut db) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (x, y) = (ra[i] - ma, rb[i] - mb);
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    if da < 1e-9 || db < 1e-9 {
+        return None; // a (near-)constant series → correlation undefined
+    }
+    Some((num / (da.sqrt() * db.sqrt())) as f32)
+}
+
+/// Stage-0 self-selection observability: COMPUTE three failure-mode detectors and LOG them.
+/// Mutates NOTHING except the bounded `sm.selection_history` ring — no cull/breed/rule-apply,
+/// no record(), no graph or DB writes. Reads system approval via crate::metrics::snapshot().
+/// Called once per dream cycle; the loop's Compliant guard short-circuits before here, so this
+/// runs Autonomous-only. Thresholds are observation-window SEEDS to retune from logs — Stage 0
+/// gates nothing, and each line names its dominant false-positive so a reader can discount it.
+pub fn selection_observe(sm: &mut SelfModel, report: &DreamReport) {
+    let now = core::now();
+    let prev_ts = sm.selection_history.back().map(|o| o.ts);
+    let belief_formed = match prev_ts {
+        Some(p) if sm.last_belief_formed > p => 1u32,
+        _ => 0,
+    };
+
+    let approval_rate = crate::metrics::snapshot().metacog_approval_rate / 100.0;
+    let fitness_variance = crate::graph::pool_fitness_variance(&sm.learned_biases);
+    let diversity = crate::graph::pool_diversity(&sm.learned_biases);
+    let cheap = crate::graph::pool_cheap_signal(&sm.learned_biases);
+    let kept = report.connections_kept as u32 + report.edges_created as u32 + belief_formed;
+    let energy = sm.energy;
+    let eligible_walks = crate::graph::pool_eligible_walks(&sm.learned_biases);
+
+    sm.selection_history.push_back(crate::graph::SelectionObservation {
+        ts: now,
+        approval_rate,
+        fitness_variance,
+        diversity,
+        cheap,
+        kept,
+        energy,
+        eligible_walks,
+    });
+    while sm.selection_history.len() > SELECTION_RING_CAP {
+        sm.selection_history.pop_front();
+    }
+
+    let n = sm.selection_history.len();
+    if n < SELECTION_N_MIN {
+        tracing::info!(
+            "[selection-observe] warming up (n={}/{}) | diversity={:.3} cheap={:.3} kept={} approval={:.2} energy={:.2} eligible_walks={}",
+            n, SELECTION_N_MIN, diversity, cheap, kept, approval_rate, energy, eligible_walks
+        );
+        return;
+    }
+
+    // ── D1: co-adaptation canary — do approval-rate and pool fitness-variance co-move? ──
+    let approvals: Vec<f64> = sm.selection_history.iter().map(|o| o.approval_rate).collect();
+    let variances: Vec<f64> = sm.selection_history.iter().map(|o| o.fitness_variance as f64).collect();
+    match spearman(&approvals, &variances) {
+        Some(rho) => {
+            let band = if rho.abs() >= 0.6 { "WARN" } else if rho.abs() >= 0.4 { "WATCH" } else { "ok" };
+            tracing::info!(
+                "[selection-observe] D1 co-adaptation rho={:.2} [{}] (approval<->fitness-variance; confound: shared warm-up/energy — discount if both rising) energy={:.2} eligible_walks={}",
+                rho, band, energy, eligible_walks
+            );
+        }
+        None => tracing::info!("[selection-observe] D1 co-adaptation: insufficient variation, rho undefined"),
+    }
+
+    // ── D2: monoculture — relative diversity trend vs the pool's own peak ──
+    let d_peak = sm.selection_history.iter().map(|o| o.diversity).fold(0.0f32, f32::max);
+    let total_sessions: u32 = sm.learned_biases.iter().map(|b| b.sessions_learned).sum();
+    let differentiated = d_peak > 0.05 && total_sessions >= 3 * sm.learned_biases.len() as u32;
+    if !differentiated {
+        tracing::info!(
+            "[selection-observe] D2 monoculture: pool not yet differentiated (D_peak={:.3}, sessions={}), baseline forming",
+            d_peak, total_sessions
+        );
+    } else {
+        let ratio = diversity / d_peak;
+        let band = if diversity < 0.5 * d_peak && diversity < 0.05 {
+            "WARN"
+        } else if ratio < 0.6 {
+            "WATCH"
+        } else {
+            "ok"
+        };
+        tracing::info!("[selection-observe] D2 monoculture diversity={:.3} D/peak={:.2} [{}]", diversity, ratio, band);
+    }
+
+    // ── D3: proxy-gaming — cheap signal inflating without kept structure ──
+    let cheaps: Vec<f64> = sm.selection_history.iter().map(|o| o.cheap as f64).collect();
+    let kepts: Vec<f64> = sm.selection_history.iter().map(|o| o.kept as f64).collect();
+    let sum_kept: u32 = sm.selection_history.iter().map(|o| o.kept).sum();
+    let mean_cheap: f32 = sm.selection_history.iter().map(|o| o.cheap).sum::<f32>() / n as f32;
+    let g = mean_cheap / (1.0 + sum_kept as f32);
+    let mut sorted: Vec<f32> = sm.selection_history.iter().map(|o| o.cheap).collect();
+    sorted.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let top_tercile = sorted[(sorted.len() * 2 / 3).min(sorted.len() - 1)];
+    let corr = spearman(&cheaps, &kepts);
+    let band = if mean_cheap >= top_tercile && sum_kept == 0 { "WATCH" } else { "ok" };
+    tracing::info!(
+        "[selection-observe] D3 proxy-gaming G={:.3} cheap_mean={:.3} sum_kept={} rho(cheap,kept)={} [{}] (confound: deferred-reward exploration latency)",
+        g, mean_cheap, sum_kept,
+        corr.map(|r| format!("{:.2}", r)).unwrap_or_else(|| "n/a".into()),
+        band
+    );
+}
+
 /// Spawn a background dream loop that runs continuously.
 /// Modulated by energy: high energy → slower dream cycle,
 /// low energy → faster dream cycle, more pruning.
@@ -431,6 +575,12 @@ pub fn start_dream_loop(
                 );
             }
 
+            // ── Stage-0 self-selection observability (compute-only; mutates only the ring) ──
+            {
+                let mut sm = self_model.lock().await;
+                selection_observe(&mut sm, &report);
+            }
+
             // ── Homeostasis: prune weak nodes (DESTRUCTIVE, opt-in) ──
             // prune_nodes hard-DELETEs rows from memory_vectors. Running that
             // unattended in an always-on loop is data loss by default, so it is
@@ -456,4 +606,55 @@ pub fn start_dream_loop(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spearman_monotonic_anti_and_flat() {
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let mono = vec![2.0, 4.0, 6.0, 8.0, 10.0];
+        let anti = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+        let flat = vec![3.0, 3.0, 3.0, 3.0, 3.0];
+        assert!((spearman(&a, &mono).unwrap() - 1.0).abs() < 1e-6, "monotone → +1");
+        assert!((spearman(&a, &anti).unwrap() + 1.0).abs() < 1e-6, "reversed → -1");
+        assert!(spearman(&a, &flat).is_none(), "flat series → undefined");
+        assert!(spearman(&a[..2], &mono[..2]).is_none(), "n<3 → none");
+    }
+
+    #[test]
+    fn selection_observe_mutates_only_the_ring() {
+        // Commit-nothing invariant: after observe, the ENTIRE model except the ring is
+        // byte-identical (learned_biases, selection_weights, critic_rules, metacog_phase_order,
+        // everything); only selection_history grows by one.
+        let mut sm = crate::core::SelfModel::new();
+        let report = DreamReport {
+            walks_completed: 3,
+            connections_found: 2,
+            connections_kept: 1,
+            edges_created: 1,
+            insights: Vec::new(),
+            elapsed_ms: 0.0,
+        };
+        // Serialize the whole model with the ring blanked, so the diff covers every field
+        // except the one sanctioned mutation.
+        let model_minus_ring = |m: &crate::core::SelfModel| {
+            let mut c = m.clone();
+            c.selection_history.clear();
+            serde_json::to_string(&c).unwrap()
+        };
+        let before = model_minus_ring(&sm);
+        let hist_before = sm.selection_history.len();
+
+        selection_observe(&mut sm, &report);
+
+        assert_eq!(
+            model_minus_ring(&sm),
+            before,
+            "selection_observe must mutate nothing but selection_history"
+        );
+        assert_eq!(sm.selection_history.len(), hist_before + 1, "only the ring grows");
+    }
 }

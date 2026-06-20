@@ -263,6 +263,9 @@ pub struct SelfModel {
     /// Tunable weights for the selection fitness composite (Stage 0+).
     #[serde(default)]
     pub selection_weights: crate::graph::SelectionWeights,
+    /// Stage-0 self-selection observability ring (compute-only; never read by control flow).
+    #[serde(default)]
+    pub selection_history: std::collections::VecDeque<crate::graph::SelectionObservation>,
 
     // ── Meta ──
     pub total_signals_processed: u64,
@@ -456,6 +459,7 @@ impl SelfModel {
             metacog_phase_order: vec![MetacogPhase::Draft, MetacogPhase::Critique],
             learned_bias_rotation: 0,
             selection_weights: crate::graph::SelectionWeights::default(),
+            selection_history: VecDeque::new(),
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,
@@ -1236,5 +1240,28 @@ mod tests {
         let v0 = sm.valence;
         process(Signal::new("friction", "boom").with_intensity(0.8), &mut sm);
         assert_eq!(sm.valence, v0, "compliant mode must not move valence");
+    }
+
+    #[test]
+    fn self_model_loads_without_selection_fields() {
+        // Backward compat: an old snapshot predates selection_weights/selection_history.
+        // load_self_model uses serde_json::from_str(..).ok(), so a deserialize error would
+        // silently wipe the entire learned self-model — the #[serde(default)] on these
+        // fields is what prevents that. This locks it in.
+        let mut v = serde_json::to_value(SelfModel::new()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("selection_weights");
+        o.remove("selection_history");
+        let s = serde_json::to_string(&v).unwrap();
+        let loaded: Option<SelfModel> = serde_json::from_str(&s).ok();
+        assert!(
+            loaded.is_some(),
+            "old snapshot missing selection fields must still load, not wipe the model"
+        );
+        assert_eq!(
+            loaded.unwrap().selection_history.len(),
+            0,
+            "missing selection_history defaults to an empty ring"
+        );
     }
 }
