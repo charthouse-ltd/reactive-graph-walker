@@ -850,24 +850,181 @@ fn apply_rule_delta(sm: &mut SelfModel, delta: &CriticRuleDelta) {
     }
 }
 
+// ── Stage 1: quality-diversity selection over the learned-bias pool ──────────────
+// PROTOCOL-self-selection.md. Ships gated behind SelfModStage (default Observability =
+// compute-only). The plan is computed by a pure, RNG-free `plan_selection`, so the
+// Observability would-cull/would-breed logs faithfully predict SelectionLive behaviour.
+const MAX_LEARNED_BIASES: usize = 16; // pool cap (shared with spawn_bias_variants)
+const SELECTION_FLOOR: usize = 6; // pool never shrinks below (matches the default-6 pool)
+const SELECTION_MIN_WALKS: u32 = 8; // cull eligibility — under-sampled profiles are immune
+const SELECTION_K: f32 = 1.0; // CI half-width multiplier (heuristic safety margin, retune)
+const ELITE_PER_NICHE: usize = 1; // a niche keeps its top-1 by fitness
+const SELECT_EVERY: u32 = 8; // act only every Nth cycle (let profiles accrue walks)
+
+/// The one perturbation, shared by spawn_bias_variants (critic path) and select_biases
+/// (breeding). Resets the child's scorecard → born under-sampled → cull-immune until it
+/// earns MIN_WALKS; sessions_learned=0 so it re-learns from scratch.
+fn perturb_child(parent: &crate::graph::LearnedBias) -> crate::graph::LearnedBias {
+    let mut child = parent.clone();
+    child.sessions_learned = 0;
+    child.scorecard = crate::graph::ProfileFitness::default();
+    child.novelty_seeking = (child.novelty_seeking + 0.08).clamp(0.05, 0.95);
+    child.cross_domain_curiosity = (child.cross_domain_curiosity + 0.06).clamp(0.05, 0.95);
+    child.experience_reliance = (child.experience_reliance - 0.05).clamp(0.05, 0.95);
+    child
+}
+
 fn spawn_bias_variants(sm: &mut SelfModel, count: u8) {
-    const MAX_LEARNED_BIASES: usize = 16;
     for _ in 0..count {
         if sm.learned_biases.len() >= MAX_LEARNED_BIASES {
             break;
         }
-
         if sm.learned_biases.is_empty() {
             sm.learned_biases.push(crate::graph::LearnedBias::default());
         }
-
         let parent_idx = (sm.learned_bias_rotation as usize) % sm.learned_biases.len();
-        let mut child = sm.learned_biases[parent_idx].clone();
-        child.sessions_learned = 0;
-        child.novelty_seeking = (child.novelty_seeking + 0.08).clamp(0.05, 0.95);
-        child.cross_domain_curiosity = (child.cross_domain_curiosity + 0.06).clamp(0.05, 0.95);
-        child.experience_reliance = (child.experience_reliance - 0.05).clamp(0.05, 0.95);
+        let child = perturb_child(&sm.learned_biases[parent_idx]);
         sm.learned_biases.push(child);
+    }
+}
+
+/// What a selection cycle would do — computed purely from the pool (no &mut, no RNG) so
+/// Observability and SelectionLive produce IDENTICAL plans (the keystone safety property).
+pub struct SelectionPlan {
+    pub acted: bool, // guards passed (pool above FLOOR)
+    pub cull: Option<CullPlan>, // at most one (CULL_PER_CYCLE = 1)
+    pub breed_parent: Option<crate::graph::LearnedBias>, // elite clone to perturb (replaces a cull)
+}
+
+pub struct CullPlan {
+    pub idx: usize,
+    pub niche: (u8, u8),
+    pub cand_fitness: f32,
+    pub cand_ucb: f32,
+    pub incumbent_idx: usize,
+    pub incumbent_fitness: f32,
+    pub incumbent_lcb: f32,
+}
+
+fn plan_selection(sm: &SelfModel) -> SelectionPlan {
+    let biases = &sm.learned_biases;
+    if biases.len() <= SELECTION_FLOOR {
+        return SelectionPlan { acted: false, cull: None, breed_parent: None };
+    }
+
+    // Niche-assign walked profiles; BTreeMap → deterministic iteration order (invariant #8).
+    let mut niches: std::collections::BTreeMap<(u8, u8), Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, b) in biases.iter().enumerate() {
+        if let Some(key) = crate::graph::behavioural_niche(&b.scorecard) {
+            niches.entry(key).or_default().push(i); // members ascending by index
+        }
+    }
+
+    let mut best: Option<CullPlan> = None;
+    let mut best_incumbent: Option<usize> = None; // global elite for breeding
+    for (&niche, members) in &niches {
+        // niche incumbent: max fitness, tie → lowest index (strict-greater keeps the first).
+        let mut inc = members[0];
+        for &m in &members[1..] {
+            if biases[m].scorecard.fitness > biases[inc].scorecard.fitness {
+                inc = m;
+            }
+        }
+        match best_incumbent {
+            Some(bi) if biases[inc].scorecard.fitness <= biases[bi].scorecard.fitness => {}
+            _ => best_incumbent = Some(inc),
+        }
+        if members.len() <= ELITE_PER_NICHE {
+            continue; // not over-full
+        }
+        let inc_walks = biases[inc].scorecard.walks;
+        let inc_lcb = biases[inc].scorecard.lcb(SELECTION_K);
+        for &m in members {
+            if m == inc {
+                continue;
+            }
+            let cand = &biases[m].scorecard;
+            if cand.walks < SELECTION_MIN_WALKS || inc_walks < SELECTION_MIN_WALKS {
+                continue; // under-sampled either side → never cull
+            }
+            let cand_ucb = cand.ucb(SELECTION_K);
+            if cand_ucb < inc_lcb {
+                // confidently dominated → eligible; keep the lowest-ucb candidate overall.
+                if best.as_ref().map_or(true, |b| cand_ucb < b.cand_ucb) {
+                    best = Some(CullPlan {
+                        idx: m,
+                        niche,
+                        cand_fitness: cand.fitness,
+                        cand_ucb,
+                        incumbent_idx: inc,
+                        incumbent_fitness: biases[inc].scorecard.fitness,
+                        incumbent_lcb: inc_lcb,
+                    });
+                }
+            }
+        }
+    }
+
+    // A single cull from len>FLOOR leaves len-1>=FLOOR (coverage safe). Breed (replacement)
+    // only when a cull is planned, from the global best elite — keeps pool size constant.
+    // DELIBERATE deviation from PROTOCOL §#1 step 4 (proactive empty-/under-represented-niche
+    // breeding): replacement-only is the safe Stage-1 interim (no FLOOR drift, no aimless
+    // growth); empty-niche breeding from a niche-local parent is deferred to Follow-up.
+    let breed_parent = best.as_ref().and_then(|_| best_incumbent.map(|i| biases[i].clone()));
+    SelectionPlan { acted: true, cull: best, breed_parent }
+}
+
+/// Stage-1 selection: cadence- and stage-gated quality-diversity over the bias pool.
+/// Observability logs the plan and commits nothing (only the cadence counter advances);
+/// SelectionLive+ applies cull-then-breed. Called once per dream cycle, Autonomous-only.
+pub fn select_biases(sm: &mut SelfModel) {
+    if sm.mode != CognitiveMode::Autonomous {
+        return; // frozen in Compliant (the dream loop already excludes it; defensive)
+    }
+    // Cadence: the ONLY mutation permitted at Observability.
+    sm.selection_cycle_counter = sm.selection_cycle_counter.wrapping_add(1);
+    if sm.selection_cycle_counter % SELECT_EVERY != 0 {
+        return;
+    }
+
+    let plan = plan_selection(sm);
+    if !plan.acted {
+        return;
+    }
+
+    let live = sm.self_mod_stage.allows_selection();
+    match &plan.cull {
+        Some(c) => tracing::info!(
+            "[select-biases] WOULD-CULL profile#{} niche={:?} fit={:.3} ucb={:.3} < incumbent#{} (fit={:.3}) lcb={:.3} committed={}",
+            c.idx, c.niche, c.cand_fitness, c.cand_ucb, c.incumbent_idx, c.incumbent_fitness, c.incumbent_lcb, live
+        ),
+        None => tracing::info!("[select-biases] no confident cull this cycle (pool len={})", sm.learned_biases.len()),
+    }
+
+    if !live {
+        return; // Observability: logged, commit nothing
+    }
+
+    // SelectionLive+: apply cull-then-breed (the bred parent is a clone, immune to index shift).
+    if let Some(c) = &plan.cull {
+        let idx = c.idx;
+        sm.learned_biases.remove(idx);
+        if let Some(parent) = &plan.breed_parent {
+            if sm.learned_biases.len() < MAX_LEARNED_BIASES {
+                let child = perturb_child(parent);
+                tracing::info!(
+                    "[select-biases] CULLED #{}; bred replacement from incumbent (novelty_seeking={:.3})",
+                    idx, child.novelty_seeking
+                );
+                sm.learned_biases.push(child);
+            }
+        }
+        // Re-normalise rotation so walker credit-attribution stays in-bounds after the shift.
+        if !sm.learned_biases.is_empty() {
+            sm.learned_bias_rotation %= sm.learned_biases.len() as u64;
+        }
+        // Signal the pool mutated → a walk that snapshotted the old pool skips stale credit.
+        sm.pool_generation = sm.pool_generation.wrapping_add(1);
     }
 }
 
@@ -1726,5 +1883,156 @@ mod tests {
             crate::budget::wants_reasoner(0.5, stuck.algorithmic_adjustments.escalate_to_llm),
             "a genuinely stuck session SHOULD escalate to the reasoner"
         );
+    }
+
+    // ── Stage 1: select_biases / plan_selection ──────────────────────────────
+
+    fn walked_bias(novelty: f32, surprise: f32, fitness: f32, walks: u32, m2: f32) -> crate::graph::LearnedBias {
+        let mut b = crate::graph::LearnedBias::default();
+        b.scorecard.novelty = novelty;
+        b.scorecard.surprise_kept = surprise;
+        b.scorecard.fitness = fitness;
+        b.scorecard.walks = walks;
+        b.scorecard.fitness_m2 = m2;
+        b
+    }
+
+    /// Pool with two same-niche, well-sampled profiles where B (idx 1) is confidently
+    /// dominated by A (idx 0), padded with unwalked defaults so len (7) > FLOOR (6).
+    fn confident_cull_pool() -> SelfModel {
+        let mut sm = SelfModel::new();
+        sm.learned_biases.clear();
+        sm.learned_biases.push(walked_bias(0.5, 0.5, 0.9, 10, 0.01)); // A incumbent, niche (2,2)
+        sm.learned_biases.push(walked_bias(0.5, 0.5, 0.1, 10, 0.01)); // B dominated, same niche
+        for _ in 0..5 {
+            sm.learned_biases.push(crate::graph::LearnedBias::default()); // unwalked → no niche, immune
+        }
+        sm
+    }
+
+    fn arm_cadence(sm: &mut SelfModel) {
+        sm.selection_cycle_counter = SELECT_EVERY - 1; // next select_biases call is an active cycle
+    }
+
+    #[test]
+    fn select_biases_observability_commits_nothing() {
+        let mut sm = confident_cull_pool();
+        arm_cadence(&mut sm);
+        assert_eq!(sm.self_mod_stage, crate::core::SelfModStage::Observability);
+        let before = serde_json::to_string(&sm.learned_biases).unwrap();
+        select_biases(&mut sm);
+        assert_eq!(
+            serde_json::to_string(&sm.learned_biases).unwrap(),
+            before,
+            "Observability must not mutate the pool even with a confident cull available"
+        );
+    }
+
+    #[test]
+    fn select_biases_culls_dominated_and_breeds_at_selection_live() {
+        let mut sm = confident_cull_pool();
+        sm.self_mod_stage = crate::core::SelfModStage::SelectionLive;
+        arm_cadence(&mut sm);
+        let len_before = sm.learned_biases.len();
+        select_biases(&mut sm);
+        assert_eq!(sm.learned_biases.len(), len_before, "cull-then-replacement-breed → size constant");
+        assert!(
+            !sm.learned_biases.iter().any(|b| (b.scorecard.fitness - 0.1).abs() < 1e-6 && b.scorecard.walks == 10),
+            "the confidently-dominated candidate (fitness 0.1, walks 10) was culled"
+        );
+        assert!(
+            sm.learned_biases.iter().any(|b| (b.novelty_seeking - 0.38).abs() < 1e-6 && b.scorecard.walks == 0),
+            "a fresh child bred from incumbent A (novelty_seeking 0.3+0.08, reset scorecard) was added"
+        );
+    }
+
+    #[test]
+    fn select_biases_never_culls_under_sampled() {
+        let mut sm = confident_cull_pool();
+        sm.self_mod_stage = crate::core::SelfModStage::SelectionLive;
+        sm.learned_biases[1].scorecard.walks = 3; // < MIN_WALKS
+        arm_cadence(&mut sm);
+        let before = serde_json::to_string(&sm.learned_biases).unwrap();
+        select_biases(&mut sm);
+        assert_eq!(
+            serde_json::to_string(&sm.learned_biases).unwrap(),
+            before,
+            "under-sampled (walks<MIN_WALKS) profile is cull-immune"
+        );
+    }
+
+    #[test]
+    fn select_biases_respects_floor() {
+        let mut sm = SelfModel::new();
+        sm.self_mod_stage = crate::core::SelfModStage::SelectionLive;
+        sm.learned_biases.clear();
+        sm.learned_biases.push(walked_bias(0.5, 0.5, 0.9, 10, 0.01));
+        sm.learned_biases.push(walked_bias(0.5, 0.5, 0.1, 10, 0.01));
+        for _ in 0..4 {
+            sm.learned_biases.push(crate::graph::LearnedBias::default());
+        }
+        assert_eq!(sm.learned_biases.len(), 6, "== FLOOR");
+        arm_cadence(&mut sm);
+        let before = serde_json::to_string(&sm.learned_biases).unwrap();
+        select_biases(&mut sm);
+        assert_eq!(serde_json::to_string(&sm.learned_biases).unwrap(), before, "pool at FLOOR never shrinks");
+    }
+
+    #[test]
+    fn select_biases_frozen_in_compliant() {
+        let mut sm = confident_cull_pool();
+        sm.self_mod_stage = crate::core::SelfModStage::SelectionLive;
+        sm.mode = CognitiveMode::Compliant;
+        arm_cadence(&mut sm);
+        let before = serde_json::to_string(&sm.learned_biases).unwrap();
+        let counter_before = sm.selection_cycle_counter;
+        select_biases(&mut sm);
+        assert_eq!(serde_json::to_string(&sm.learned_biases).unwrap(), before, "Compliant freezes the pool");
+        assert_eq!(sm.selection_cycle_counter, counter_before, "Compliant: not even the counter advances");
+    }
+
+    #[test]
+    fn plan_selection_is_deterministic() {
+        let sm = confident_cull_pool();
+        let p1 = plan_selection(&sm);
+        let p2 = plan_selection(&sm);
+        assert_eq!(
+            p1.cull.as_ref().map(|c| c.idx),
+            p2.cull.as_ref().map(|c| c.idx),
+            "plan_selection must be deterministic (no RNG / HashMap iteration order)"
+        );
+        assert_eq!(p1.cull.as_ref().map(|c| c.idx), Some(1), "the dominated candidate (idx 1) is the cull");
+    }
+
+    #[test]
+    fn perturb_child_resets_scorecard_and_perturbs() {
+        let mut parent = crate::graph::LearnedBias::default();
+        parent.scorecard.walks = 50;
+        parent.scorecard.fitness = 0.7;
+        parent.sessions_learned = 9;
+        let child = perturb_child(&parent);
+        assert_eq!(child.scorecard.walks, 0, "child born under-sampled → cull-immune");
+        assert_eq!(child.sessions_learned, 0);
+        assert!((child.novelty_seeking - (parent.novelty_seeking + 0.08)).abs() < 1e-6);
+        assert!((child.cross_domain_curiosity - (parent.cross_domain_curiosity + 0.06)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn select_biases_bumps_pool_generation_on_cull() {
+        let mut sm = confident_cull_pool();
+        sm.self_mod_stage = crate::core::SelfModStage::SelectionLive;
+        arm_cadence(&mut sm);
+        let gen_before = sm.pool_generation;
+        select_biases(&mut sm);
+        assert_eq!(sm.pool_generation, gen_before + 1, "a committed cull bumps pool_generation");
+    }
+
+    #[test]
+    fn select_biases_observability_does_not_bump_generation() {
+        let mut sm = confident_cull_pool(); // default Observability
+        arm_cadence(&mut sm);
+        let gen_before = sm.pool_generation;
+        select_biases(&mut sm);
+        assert_eq!(sm.pool_generation, gen_before, "Observability commits nothing → no generation bump");
     }
 }
