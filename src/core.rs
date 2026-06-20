@@ -144,6 +144,34 @@ impl Default for CriticRuleProfile {
 // Not a log. Not a state dump. A living model that participates
 // in and is changed by every operation.
 
+/// Self-modification rollout stage. Ordered: Observability < SelectionLive < RuleTrialsLive.
+/// Default (and any old/corrupt snapshot) is Observability — compute-only, commits nothing —
+/// so promotion can never happen by accident. Promote via POST /selection/stage only.
+/// Note: serde errors on an unknown variant string, which would wipe the model via
+/// load_self_model's `.ok()`; safe because we author the only writer and never downgrade-load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfModStage {
+    #[default]
+    Observability,
+    SelectionLive,
+    RuleTrialsLive,
+    /// Catch-all for an unknown stage string (e.g. a downgrade-load of a future variant).
+    /// Inert via `allows_selection() == false`. Without it, an unknown variant would error
+    /// the whole deserialize and load_self_model's `.ok()` would silently wipe the model.
+    /// (#[serde(other)] must be the last variant.)
+    #[serde(other)]
+    Unknown,
+}
+
+impl SelfModStage {
+    /// True only for stages that permit Stage-1 pool mutation (cull/breed). Observability and
+    /// the Unknown catch-all are inert.
+    pub fn allows_selection(&self) -> bool {
+        matches!(self, SelfModStage::SelectionLive | SelfModStage::RuleTrialsLive)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SelfModel {
     // ── How I operate ──
@@ -266,6 +294,16 @@ pub struct SelfModel {
     /// Stage-0 self-selection observability ring (compute-only; never read by control flow).
     #[serde(default)]
     pub selection_history: std::collections::VecDeque<crate::graph::SelectionObservation>,
+    /// Self-modification rollout stage (Stage 1+). Default Observability = compute-only.
+    #[serde(default)]
+    pub self_mod_stage: SelfModStage,
+    /// Cadence counter for select_biases — acts only every SELECT_EVERY cycles.
+    #[serde(default)]
+    pub selection_cycle_counter: u32,
+    /// Bumped whenever select_biases mutates the pool (cull/breed). Lets a parallel walk
+    /// detect a mid-walk pool change and skip now-stale bias-credit attribution.
+    #[serde(default)]
+    pub pool_generation: u64,
 
     // ── Meta ──
     pub total_signals_processed: u64,
@@ -460,6 +498,9 @@ impl SelfModel {
             learned_bias_rotation: 0,
             selection_weights: crate::graph::SelectionWeights::default(),
             selection_history: VecDeque::new(),
+            self_mod_stage: SelfModStage::default(),
+            selection_cycle_counter: 0,
+            pool_generation: 0,
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,
@@ -1252,16 +1293,49 @@ mod tests {
         let o = v.as_object_mut().unwrap();
         o.remove("selection_weights");
         o.remove("selection_history");
+        o.remove("self_mod_stage");
+        o.remove("selection_cycle_counter");
         let s = serde_json::to_string(&v).unwrap();
         let loaded: Option<SelfModel> = serde_json::from_str(&s).ok();
         assert!(
             loaded.is_some(),
             "old snapshot missing selection fields must still load, not wipe the model"
         );
+        let m = loaded.unwrap();
+        assert_eq!(m.selection_history.len(), 0, "missing selection_history → empty ring");
         assert_eq!(
-            loaded.unwrap().selection_history.len(),
-            0,
-            "missing selection_history defaults to an empty ring"
+            m.self_mod_stage,
+            SelfModStage::Observability,
+            "missing self_mod_stage → Observability (ships inert, no accidental promotion)"
+        );
+    }
+
+    #[test]
+    fn self_mod_stage_defaults_and_orders() {
+        assert_eq!(SelfModStage::default(), SelfModStage::Observability);
+        assert!(!SelfModStage::Observability.allows_selection(), "Observability is inert");
+        assert!(SelfModStage::SelectionLive.allows_selection());
+        assert!(SelfModStage::RuleTrialsLive.allows_selection());
+        assert!(!SelfModStage::Unknown.allows_selection(), "Unknown catch-all is inert");
+        let sm = SelfModel::new();
+        assert_eq!(sm.self_mod_stage, SelfModStage::Observability, "ships inert");
+        assert_eq!(sm.selection_cycle_counter, 0);
+    }
+
+    #[test]
+    fn self_mod_stage_unknown_variant_loads_inert_not_wipe() {
+        // A downgrade-load carrying a FUTURE stage string must degrade to an inert stage,
+        // not error and silently wipe the whole model (load_self_model uses from_str(..).ok()).
+        let mut v = serde_json::to_value(SelfModel::new()).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("self_mod_stage".into(), serde_json::json!("rule_trials_live_FUTURE"));
+        let s = serde_json::to_string(&v).unwrap();
+        let loaded: Option<SelfModel> = serde_json::from_str(&s).ok();
+        assert!(loaded.is_some(), "unknown stage variant must NOT wipe the model");
+        assert!(
+            !loaded.unwrap().self_mod_stage.allows_selection(),
+            "unknown variant degrades to an inert stage"
         );
     }
 }

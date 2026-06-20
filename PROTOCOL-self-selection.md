@@ -260,6 +260,7 @@ Recorded here so it is not lost — these are real and worth doing, but not this
 - **Enable `deferred_stuck`.** Turn on the eligibility-trace fitness term once the immediate terms are validated.
 - **Meta-selection (deliberately gated).** Selecting over fitness *weights* themselves — only behind its own rollout, and only after the identity/values question above is settled.
 - **Dead-path cleanup.** With fix #3 landed, `score_edge_with_context` is the unused branch (learned biases are always present). Fold its remaining unique logic into `LearnedBias::score_edge` and delete it, or have it delegate — removing the two-scorer duplication. Left out here to keep the fix minimal.
+- **Proactive empty-niche breeding (Stage 1.x).** Stage-1 breeding is *replacement-only* — a culled slot is refilled by perturbing the single global best elite — which keeps pool size constant but does not actively populate empty/under-represented behavioural niches as §#1 step 4 envisions, and pulls mildly toward one elite. Once the gated cull mechanism is validated live, breed into empty niches from a *niche-local* parent instead.
 
 ## Open questions
 

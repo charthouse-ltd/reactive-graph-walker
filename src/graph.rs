@@ -360,6 +360,13 @@ pub struct ProfileFitness {
     pub approval: f32,
     pub walks: u32,
     pub fitness: f32,
+    /// Welford accumulators over the per-walk intrinsic scalar — for confidence-aware
+    /// culling (Stage 1), separate from `fitness` (the EWMA point estimate everything ranks
+    /// on). serde-default so old scorecards still load (and stay cull-immune until repopulated).
+    #[serde(default)]
+    pub fitness_mean: f32,
+    #[serde(default)]
+    pub fitness_m2: f32,
 }
 
 impl ProfileFitness {
@@ -381,7 +388,71 @@ impl ProfileFitness {
             + w.deferred_stuck * self.deferred_stuck
             - w.dead_end_rate * self.dead_end_rate
             - w.repetition * self.repetition;
+
+        // Welford over the per-walk intrinsic scalar (raw inputs, not the EWMAs; excludes
+        // deferred_stuck, which has no per-walk input). Powers confidence-aware culling
+        // without touching the `fitness` EWMA above. Caveat: f_walk uses CURRENT weights,
+        // so the variance pools regimes if weights are ever tuned (static at Stage 1).
+        let f_walk = w.novelty * novelty + w.surprise_kept * surprise_kept
+            - w.dead_end_rate * dead_end_rate
+            - w.repetition * repetition;
+        let delta = f_walk - self.fitness_mean;
+        self.fitness_mean += delta / self.walks as f32;
+        self.fitness_m2 += delta * (f_walk - self.fitness_mean);
     }
+
+    /// Bessel-corrected sample variance of the per-walk intrinsic. INF until >=2 walks.
+    pub fn fitness_sample_var(&self) -> f32 {
+        if self.walks < 2 {
+            f32::INFINITY
+        } else {
+            self.fitness_m2 / (self.walks - 1) as f32
+        }
+    }
+
+    /// Standard error of `fitness`. INF when under-sampled (walks<2) OR dispersion is unknown
+    /// (m2==0 — e.g. a reloaded snapshot predating the Welford fields) → such a profile is
+    /// structurally un-cullable, the safe direction.
+    pub fn fitness_stderr(&self) -> f32 {
+        if self.walks < 2 || self.fitness_m2 == 0.0 {
+            return f32::INFINITY;
+        }
+        // The bracketed quantity is the fixed-ALPHA EWMA `fitness`, whose sampling variance
+        // FLOORS at ALPHA/(2-ALPHA)·σ² and never vanishes. Cap the effective sample size at
+        // the EWMA's memory horizon (~1/ALPHA ≈ 9 for ALPHA=0.2) instead of shrinking 1/√n
+        // unboundedly — otherwise the cull gate grows over-confident at high walk counts.
+        const EFF_N: u32 = 9;
+        let n = self.walks.min(EFF_N) as f32;
+        (self.fitness_sample_var() / n).sqrt()
+    }
+
+    /// Confidence bounds centered on the live EWMA `fitness` (NOT the Welford mean).
+    pub fn lcb(&self, k: f32) -> f32 {
+        self.fitness - k * self.fitness_stderr()
+    }
+    pub fn ucb(&self, k: f32) -> f32 {
+        self.fitness + k * self.fitness_stderr()
+    }
+}
+
+/// Coarse realized-behaviour niche key — (novelty-breadth bin, surprise-leap bin) — using
+/// fixed absolute cutpoints (<0.15, <0.40). None for unwalked profiles (no niche; never an
+/// incumbent or cull candidate). Stable: a profile's niche moves only when its OWN EWMA
+/// crosses a cutpoint, not when the pool shifts.
+pub fn behavioural_niche(sc: &ProfileFitness) -> Option<(u8, u8)> {
+    if sc.walks == 0 {
+        return None;
+    }
+    let bin = |x: f32| -> u8 {
+        if x < 0.15 {
+            0
+        } else if x < 0.40 {
+            1
+        } else {
+            2
+        }
+    };
+    Some((bin(sc.novelty), bin(sc.surprise_kept)))
 }
 
 /// Per-walker intrinsic fitness inputs from one walker's result, as rates over hops:
@@ -769,5 +840,57 @@ mod tests {
         let c2 = pool_cheap_signal(&[p, unwalked]);
         assert!(c > 0.0);
         assert_eq!(c, c2, "walks==0 profiles excluded from cheap signal");
+    }
+
+    #[test]
+    fn welford_variance_matches_two_pass() {
+        let w = SelectionWeights::default();
+        let mut p = ProfileFitness::default();
+        let samples = [
+            (0.2f32, 0.1f32, 0.0f32, 0.0f32),
+            (0.8, 0.3, 0.1, 0.0),
+            (0.5, 0.5, 0.0, 0.2),
+            (0.1, 0.0, 0.3, 0.1),
+        ];
+        let mut fwalks = Vec::new();
+        for &(n, s, d, r) in &samples {
+            p.record(n, s, d, r, 0.0, &w);
+            fwalks.push(w.novelty * n + w.surprise_kept * s - w.dead_end_rate * d - w.repetition * r);
+        }
+        let mean = fwalks.iter().sum::<f32>() / fwalks.len() as f32;
+        let var = fwalks.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / (fwalks.len() as f32 - 1.0);
+        assert!(
+            (p.fitness_sample_var() - var).abs() < 1e-4,
+            "welford {} vs two-pass {}",
+            p.fitness_sample_var(),
+            var
+        );
+    }
+
+    #[test]
+    fn under_sampled_and_zero_dispersion_are_cull_immune() {
+        let w = SelectionWeights::default();
+        let mut p = ProfileFitness::default();
+        assert!(p.fitness_stderr().is_infinite(), "walks=0 → INF");
+        p.record(0.5, 0.2, 0.0, 0.0, 0.0, &w);
+        assert!(p.fitness_stderr().is_infinite(), "walks=1 → INF");
+        p.record(0.5, 0.2, 0.0, 0.0, 0.0, &w); // identical sample → m2 == 0
+        assert!(p.fitness_stderr().is_infinite(), "walks>=2 but m2==0 → INF guard");
+        assert!(p.ucb(1.0).is_infinite() && p.ucb(1.0) > 0.0, "ucb = +INF when un-sampled");
+        assert!(p.lcb(1.0).is_infinite() && p.lcb(1.0) < 0.0, "lcb = -INF when un-sampled");
+    }
+
+    #[test]
+    fn behavioural_niche_bins_by_fixed_cutpoints() {
+        let mut sc = ProfileFitness::default();
+        sc.walks = 5;
+        sc.novelty = 0.10;
+        sc.surprise_kept = 0.50;
+        assert_eq!(behavioural_niche(&sc), Some((0, 2)), "0.10<0.15→0 ; 0.50>=0.40→2");
+        sc.novelty = 0.30;
+        sc.surprise_kept = 0.05;
+        assert_eq!(behavioural_niche(&sc), Some((1, 0)), "0.30 in [0.15,0.40)→1 ; 0.05<0.15→0");
+        sc.walks = 0;
+        assert_eq!(behavioural_niche(&sc), None, "walks==0 → no niche");
     }
 }

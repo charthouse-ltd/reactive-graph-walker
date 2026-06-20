@@ -575,10 +575,14 @@ pub fn start_dream_loop(
                 );
             }
 
-            // ── Stage-0 self-selection observability (compute-only; mutates only the ring) ──
+            // ── Self-selection: Stage-0 observe (compute-only) + Stage-1 select (gated) ──
+            // selection_observe captures the pre-selection pool as the cycle's baseline;
+            // select_biases then cull/breeds — but only at SelectionLive+ (default Observability
+            // logs would-cull/would-breed and commits nothing). Both Autonomous-only.
             {
                 let mut sm = self_model.lock().await;
                 selection_observe(&mut sm, &report);
+                crate::metacog::select_biases(&mut sm);
             }
 
             // ── Homeostasis: prune weak nodes (DESTRUCTIVE, opt-in) ──

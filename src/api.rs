@@ -137,6 +137,7 @@ pub async fn serve(
         .route("/diverger", get(diverger_stats))
         .route("/self", get(self_state))
         .route("/metacog/config", get(get_metacog_config).post(set_metacog_config))
+        .route("/selection/stage", post(set_selection_stage))
         .route("/tools", get(list_tools))
         .route("/music", get(music_endpoint))
         .route("/music/midi", get(music_midi_endpoint))
@@ -388,6 +389,30 @@ async fn set_metacog_config(
     Json(serde_json::json!({
         "status": "ok",
         "config": metacog_config_json(&sm),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SelectionStagePatch {
+    /// "observability" | "selection_live" | "rule_trials_live"
+    stage: crate::core::SelfModStage,
+}
+
+/// POST /selection/stage — promote/demote the self-modification rollout stage.
+/// Auth-protected. Default Observability = compute-only; SelectionLive enables cull/breed.
+/// Operator action only — explicit and logged at WARN, never time-based.
+async fn set_selection_stage(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SelectionStagePatch>,
+) -> Json<serde_json::Value> {
+    let mut sm = state.self_model.lock().await;
+    let prev = sm.self_mod_stage;
+    sm.self_mod_stage = req.stage;
+    tracing::warn!("[selection] self_mod_stage {:?} -> {:?} (operator via /selection/stage)", prev, sm.self_mod_stage);
+    Json(serde_json::json!({
+        "status": "ok",
+        "previous": format!("{:?}", prev),
+        "stage": format!("{:?}", sm.self_mod_stage),
     }))
 }
 

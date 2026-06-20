@@ -341,6 +341,7 @@ pub async fn walk_parallel(
     let base_total_signals = base_sm.total_signals_processed;
     let learned_len = base_sm.learned_biases.len();
     let learned_rotation = base_sm.learned_bias_rotation as usize;
+    let base_pool_generation = base_sm.pool_generation; // detect a Stage-1 cull/breed mid-walk
 
     // Create shared stigmergic collective — walkers leave trails for each other
     let collective = Arc::new(Mutex::new(WalkerCollective::new()));
@@ -447,29 +448,44 @@ pub async fn walk_parallel(
         let selection_weights = sm.selection_weights.clone();
         let session_repetition = (sm.consecutive_repetitions as f32 / 4.0).min(1.0);
         let accumulate_fitness = sm.mode == core::CognitiveMode::Autonomous;
-        for (i, (result, _walker_sm)) in results.iter().enumerate() {
-            let bias_idx = if sm.learned_biases.is_empty() {
-                None
-            } else {
-                Some((learned_rotation + i) % sm.learned_biases.len())
-            };
-            if let Some(bias) = bias_idx.and_then(|idx| sm.learned_biases.get_mut(idx)) {
-                let novelty = if result.path.len() > 1 {
-                    result.surprises as f32 / result.path.len() as f32
+        // System-level approval at credit time (observability only — excluded from `fitness`).
+        let session_approval =
+            (crate::metrics::snapshot().metacog_approval_rate as f32 / 100.0).clamp(0.0, 1.0);
+        // Stage 1: if the bias pool was culled/bred during this lock-released walk window, the
+        // rotation→index mapping is stale; crediting it would misattribute (and pollute the
+        // freshly-bred cull-immune child). Skip per-profile credit for the whole session.
+        let pool_stable = sm.pool_generation == base_pool_generation;
+        if !pool_stable {
+            tracing::debug!(
+                "[walker] learned-bias pool mutated mid-walk (gen {} -> {}); skipping stale bias credit",
+                base_pool_generation, sm.pool_generation
+            );
+        }
+        if pool_stable {
+            for (i, (result, _walker_sm)) in results.iter().enumerate() {
+                let bias_idx = if sm.learned_biases.is_empty() {
+                    None
                 } else {
-                    0.0
+                    Some((learned_rotation + i) % sm.learned_biases.len())
                 };
-                bias.update_from_session(
-                    result.surprises as u32,
-                    result.dead_ends as u32,
-                    novelty,
-                    result.domains_visited.len(),
-                );
-                if accumulate_fitness {
-                    let (nov, surprise_kept, dead_end_rate) = crate::graph::fitness_inputs(result);
-                    bias.scorecard.record(
-                        nov, surprise_kept, dead_end_rate, session_repetition, 0.0, &selection_weights,
+                if let Some(bias) = bias_idx.and_then(|idx| sm.learned_biases.get_mut(idx)) {
+                    let novelty = if result.path.len() > 1 {
+                        result.surprises as f32 / result.path.len() as f32
+                    } else {
+                        0.0
+                    };
+                    bias.update_from_session(
+                        result.surprises as u32,
+                        result.dead_ends as u32,
+                        novelty,
+                        result.domains_visited.len(),
                     );
+                    if accumulate_fitness {
+                        let (nov, surprise_kept, dead_end_rate) = crate::graph::fitness_inputs(result);
+                        bias.scorecard.record(
+                            nov, surprise_kept, dead_end_rate, session_repetition, session_approval, &selection_weights,
+                        );
+                    }
                 }
             }
         }
