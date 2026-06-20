@@ -46,8 +46,13 @@ Walkers traverse a knowledge graph in parallel, each with different biases. Conv
 - **Working memory** (PFC-equivalent, 5±2 slots)
 - **Predictive coding** — expects outcomes, learns from errors
 - **Metaplasticity gate** — modulates learning rate from experience
-- **Learned biases** — per-walker emergent profiles (default 6, can spawn variants up to 16) that adapt each session from walk outcomes. Fitness-based *selection* over the pool — breed-from-fittest, cull-weakest — is specified in [`PROTOCOL-self-selection.md`](PROTOCOL-self-selection.md)
+- **Learned biases** — per-walker emergent profiles (default 6, can spawn variants up to 16) that adapt each session from walk outcomes, each now carrying a **fitness scorecard** (novelty-that-sticks minus dead-ends/repetition; the metacog `approval` signal is held out to keep selection acyclic)
 - **Structural noticings** — the system observes its own architecture (obsession, dead-end clusters, cognitive loops, signal poverty)
+
+### Closed-Loop Self-Selection (staged)
+Variation alone is drift; *selection* is what makes self-modification cumulative. RGW is closing that loop on an **acyclic "coherent insight" fitness** — the metacog approval signal is held out of the objective so the bias pool and the metacog tuner can't co-adapt into mutual confirmation — under a **bounded-autonomy** frame: free variation inside a fixed, human-set fitness function.
+- **Implemented:** emergent goals + audience model now steer live walks (previously computed but bypassed by the live edge-scorer); per-profile fitness scorecards accumulate online; and an offline, **compute-only** `selection_observe` pass in the dream loop logs three failure-mode detectors — co-adaptation, monoculture, proxy-gaming — mutating nothing.
+- **Designed (staged rollout):** quality-diversity cull/breed over the pool, and evaluate-then-keep for metacognitive rule changes via dream-replay with rollback. See [`PROTOCOL-self-selection.md`](PROTOCOL-self-selection.md).
 
 ### LLM as Tool (DeepSeek)
 The LLM expresses RGW's state, not the other way around. RGW walks → self-model updates → snapshot sent to DeepSeek → insight returned as a signal → fed back into graph as a node → re-walk. The LLM observes; RGW thinks.
@@ -141,7 +146,7 @@ Insight → integration → exploration → re-integration. The loop closes."
 
 Design documents for capabilities that are specified but not yet (fully) implemented. Each follows the same house format: thesis → problem → solution → file-by-file changes → safety invariants → graduated rollout → references.
 
-- [`PROTOCOL-self-selection.md`](PROTOCOL-self-selection.md) — **closing the evolutionary loop.** Today RGW *mutates* its biases and rules but never *selects* among the mutations (variants are bred and never culled; rule changes are applied with no evaluation or rollback). This adds fitness-based selection over the learned-bias pool and evaluate-then-keep for metacognitive rule changes — both offline in the dream loop, scored by one "coherent insight" fitness signal — plus a minimal fix so emergent goals and audience-modelling, currently computed but bypassed by the live edge-scorer, actually steer walks. Framed as **bounded autonomy**: free variation inside a fixed, human-set fitness function.
+- [`PROTOCOL-self-selection.md`](PROTOCOL-self-selection.md) — **closing the evolutionary loop.** RGW *mutates* its biases and rules but historically never *selected* among the mutations (variants bred and never culled; rule changes applied with no evaluation or rollback). **Implemented so far:** emergent goals + audience model now steer live walks (fix #3 — previously computed but bypassed by the live edge-scorer); per-profile fitness scorecards; and a compute-only `selection_observe` pass logging three failure-mode detectors. **Designed (staged):** quality-diversity cull/breed over the pool and evaluate-then-keep for metacognitive rule changes (dream-replay + rollback), scored by one **acyclic** "coherent insight" fitness. Framed as **bounded autonomy**: free variation inside a fixed, human-set fitness function.
 - [`PROTOCOL-unconscious-walker.md`](PROTOCOL-unconscious-walker.md) — an always-on, motor-disconnected third walker mode (Default Mode Network analogue) that consolidates and explores continuously and wakes the conscious walker on salience.
 - [`PROTOCOL-unconscious-v0.md`](PROTOCOL-unconscious-v0.md) — minimal read-only Observability implementation of the unconscious walker: computes everything, commits nothing.
 - [`PROTOCOL-compliance-mode.md`](PROTOCOL-compliance-mode.md) — Compliant (deterministic, graph frozen) vs Autonomous (full emotional agency) cognitive modes.

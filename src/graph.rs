@@ -327,6 +327,156 @@ impl WalkerBias {
 // Over time, biases specialize — some become more curious, others
 // more analytical, based on what works. Pure algorithmic reinforcement.
 
+/// Tunable weights for the intrinsic ("coherent insight") fitness composite.
+/// `approval` is deliberately absent — it is the metacog output and is held out of the
+/// objective to keep selection acyclic (see PROTOCOL-self-selection.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionWeights {
+    pub novelty: f32,
+    pub surprise_kept: f32,
+    pub deferred_stuck: f32,
+    pub dead_end_rate: f32,
+    pub repetition: f32,
+}
+
+impl Default for SelectionWeights {
+    fn default() -> Self {
+        // Re-anchored after dropping approval from the objective.
+        Self { novelty: 0.35, surprise_kept: 0.30, deferred_stuck: 0.0, dead_end_rate: 0.20, repetition: 0.15 }
+    }
+}
+
+/// Per-profile fitness scorecard — the "report card", kept separate from the weights
+/// (the "genes"). EWMAs of each session's outcome; `fitness` is the cached *intrinsic*
+/// composite. `approval` is tracked for observability but excluded from `fitness`.
+/// Accumulated online (zero added latency); read offline by selection. Stage 0: compute only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileFitness {
+    pub novelty: f32,
+    pub surprise_kept: f32,
+    pub dead_end_rate: f32,
+    pub repetition: f32,
+    pub deferred_stuck: f32,
+    pub approval: f32,
+    pub walks: u32,
+    pub fitness: f32,
+}
+
+impl ProfileFitness {
+    const ALPHA: f32 = 0.2; // EWMA smoothing
+
+    /// Fold one walk session's outcome into the EWMAs and recompute the intrinsic fitness.
+    /// `approval` is recorded for observability but NOT included in `fitness` (acyclicity).
+    pub fn record(&mut self, novelty: f32, surprise_kept: f32, dead_end_rate: f32,
+                  repetition: f32, approval: f32, w: &SelectionWeights) {
+        let a = Self::ALPHA;
+        self.novelty = (1.0 - a) * self.novelty + a * novelty;
+        self.surprise_kept = (1.0 - a) * self.surprise_kept + a * surprise_kept;
+        self.dead_end_rate = (1.0 - a) * self.dead_end_rate + a * dead_end_rate;
+        self.repetition = (1.0 - a) * self.repetition + a * repetition;
+        self.approval = (1.0 - a) * self.approval + a * approval;
+        self.walks += 1;
+        self.fitness = w.novelty * self.novelty
+            + w.surprise_kept * self.surprise_kept
+            + w.deferred_stuck * self.deferred_stuck
+            - w.dead_end_rate * self.dead_end_rate
+            - w.repetition * self.repetition;
+    }
+}
+
+/// Per-walker intrinsic fitness inputs from one walker's result, as rates over hops:
+/// (novelty = distinct-domain breadth, surprise_kept = cross-domain leap rate, dead_end_rate).
+/// `repetition` is session-level and supplied separately by the caller.
+pub fn fitness_inputs(result: &WalkerResult) -> (f32, f32, f32) {
+    let hops = result.path.len().saturating_sub(1).max(1) as f32;
+    let mut domains = std::collections::HashSet::new();
+    for d in &result.domains_visited {
+        if !d.is_empty() {
+            domains.insert(d.as_str());
+        }
+    }
+    let novelty = (domains.len() as f32 / hops).min(1.0);
+    let surprise_kept = (result.surprises as f32 / hops).min(1.0);
+    let dead_end_rate = (result.dead_ends as f32 / hops).min(1.0);
+    (novelty, surprise_kept, dead_end_rate)
+}
+
+/// One reduced per-dream-cycle observation row for the Stage-0 self-selection ring.
+/// Compute-only; carries no control signal. Stored in SelfModel.selection_history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SelectionObservation {
+    pub ts: f64,               // crate::core::now() at sample time
+    pub approval_rate: f64,    // metacog_approval_rate / 100      (D1)
+    pub fitness_variance: f32, // pop variance of scorecard.fitness over walked profiles (D1)
+    pub diversity: f32,        // mean pairwise L2 over the 5 weight vectors (D2)
+    pub cheap: f32,            // mean(novelty)+mean(surprise_kept) over walked profiles (D3)
+    pub kept: u32,             // connections_kept + edges_created + belief_formed (D3)
+    pub energy: f32,           // confound logged for D1 discounting
+    pub eligible_walks: u32,   // sum scorecard.walks (confound + sample context)
+}
+
+/// Population variance of intrinsic fitness over profiles that have actually walked
+/// (walks > 0). The gate is mandatory: walks==0 scorecards sit at the 0.0 Default and
+/// would fake-deflate the variance.
+pub fn pool_fitness_variance(biases: &[LearnedBias]) -> f32 {
+    let xs: Vec<f32> = biases
+        .iter()
+        .filter(|b| b.scorecard.walks > 0)
+        .map(|b| b.scorecard.fitness)
+        .collect();
+    if xs.len() < 2 {
+        return 0.0;
+    }
+    let mean = xs.iter().sum::<f32>() / xs.len() as f32;
+    xs.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / xs.len() as f32
+}
+
+/// Mean pairwise Euclidean distance over the 5 learned-weight vectors (all profiles).
+/// The Stage-0 diversity statistic — stable at n=6, no density estimation.
+pub fn pool_diversity(biases: &[LearnedBias]) -> f32 {
+    let n = biases.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let vec5 = |b: &LearnedBias| {
+        [
+            b.novelty_seeking,
+            b.contradiction_seeking,
+            b.experience_reliance,
+            b.emotional_alignment,
+            b.cross_domain_curiosity,
+        ]
+    };
+    let mut sum = 0.0f32;
+    let mut pairs = 0u32;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (a, b) = (vec5(&biases[i]), vec5(&biases[j]));
+            let d = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+            sum += d;
+            pairs += 1;
+        }
+    }
+    sum / pairs as f32
+}
+
+/// Cheap (inflatable) fitness signal: mean(novelty)+mean(surprise_kept) over walked profiles.
+pub fn pool_cheap_signal(biases: &[LearnedBias]) -> f32 {
+    let walked: Vec<&LearnedBias> = biases.iter().filter(|b| b.scorecard.walks > 0).collect();
+    if walked.is_empty() {
+        return 0.0;
+    }
+    let n = walked.len() as f32;
+    let novelty = walked.iter().map(|b| b.scorecard.novelty).sum::<f32>() / n;
+    let surprise = walked.iter().map(|b| b.scorecard.surprise_kept).sum::<f32>() / n;
+    novelty + surprise
+}
+
+/// Sum of walks across all profiles — eligibility/sample-context for the observability log.
+pub fn pool_eligible_walks(biases: &[LearnedBias]) -> u32 {
+    biases.iter().map(|b| b.scorecard.walks).sum()
+}
+
 /// A learned bias profile with adjustable weights.
 /// Replaces the fixed WalkerBias enum with emergent, self-tuned behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +487,9 @@ pub struct LearnedBias {
     pub emotional_alignment: f32,
     pub cross_domain_curiosity: f32,
     pub sessions_learned: u32,
+    /// Fitness scorecard (serde-default so old snapshots without it still load).
+    #[serde(default)]
+    pub scorecard: ProfileFitness,
 }
 
 impl Default for LearnedBias {
@@ -348,6 +501,7 @@ impl Default for LearnedBias {
             emotional_alignment: 0.2,
             cross_domain_curiosity: 0.3,
             sessions_learned: 0,
+            scorecard: ProfileFitness::default(),
         }
     }
 }
@@ -526,5 +680,94 @@ mod tests {
             with_zero, without,
             "goal_strength=0 with no audience must not alter the score (Compliant determinism)"
         );
+    }
+
+    #[test]
+    fn profile_fitness_excludes_approval_from_composite() {
+        // Acyclicity: approval is tracked but must NOT move the fitness composite.
+        let w = SelectionWeights::default();
+        let mut a = ProfileFitness::default();
+        let mut b = ProfileFitness::default();
+        a.record(0.5, 0.3, 0.1, 0.0, 0.0, &w); // approval 0.0
+        b.record(0.5, 0.3, 0.1, 0.0, 1.0, &w); // approval 1.0, intrinsic identical
+        assert_eq!(a.fitness, b.fitness, "approval must not change the fitness composite");
+        assert!(b.approval > a.approval, "approval is still tracked for observability");
+        assert_eq!(a.walks, 1);
+    }
+
+    #[test]
+    fn profile_fitness_rewards_surviving_novelty() {
+        let w = SelectionWeights::default();
+        let mut low = ProfileFitness::default();
+        let mut high = ProfileFitness::default();
+        low.record(0.0, 0.0, 0.0, 0.0, 0.0, &w);
+        high.record(0.9, 0.0, 0.0, 0.0, 0.0, &w);
+        assert!(high.fitness > low.fitness, "higher novelty → higher intrinsic fitness");
+    }
+
+    #[test]
+    fn fitness_inputs_are_rates_over_hops() {
+        // 4 nodes = 3 hops; 2 distinct domains; 1 surprise; 1 dead end.
+        let r = WalkerResult {
+            bias: WalkerBias::Curiosity,
+            path: vec![1, 2, 3, 4],
+            domains_visited: vec!["a".into(), "a".into(), "b".into()],
+            edge_types_used: vec![],
+            total_weight: 0.0,
+            surprises: 1,
+            dead_ends: 1,
+            edges_traversed: vec![],
+        };
+        let (novelty, surprise_kept, dead_end_rate) = fitness_inputs(&r);
+        assert!((novelty - 2.0 / 3.0).abs() < 1e-6, "2 domains / 3 hops");
+        assert!((surprise_kept - 1.0 / 3.0).abs() < 1e-6, "1 surprise / 3 hops");
+        assert!((dead_end_rate - 1.0 / 3.0).abs() < 1e-6, "1 dead end / 3 hops");
+    }
+
+    #[test]
+    fn learned_bias_loads_without_scorecard_field() {
+        // Backward compat: an old persisted snapshot has no `scorecard`. It must still
+        // deserialize (serde default) rather than failing and wiping the self-model.
+        let old = r#"{"novelty_seeking":0.3,"contradiction_seeking":0.3,"experience_reliance":0.3,"emotional_alignment":0.2,"cross_domain_curiosity":0.3,"sessions_learned":7}"#;
+        let lb: LearnedBias =
+            serde_json::from_str(old).expect("old LearnedBias without scorecard must still load");
+        assert_eq!(lb.sessions_learned, 7);
+        assert_eq!(lb.scorecard.walks, 0, "missing scorecard defaults, not errors");
+    }
+
+    #[test]
+    fn pool_diversity_zero_for_identical_positive_when_spread() {
+        let a = LearnedBias::default();
+        let identical = vec![a.clone(), a.clone(), a.clone()];
+        assert_eq!(pool_diversity(&identical), 0.0, "identical profiles → zero diversity");
+        let mut b = LearnedBias::default();
+        b.novelty_seeking = 0.9;
+        assert!(pool_diversity(&[a, b]) > 0.0, "a spread profile → positive diversity");
+    }
+
+    #[test]
+    fn pool_fitness_variance_ignores_unwalked_profiles() {
+        let w = SelectionWeights::default();
+        let mut p1 = LearnedBias::default();
+        p1.scorecard.record(0.9, 0.0, 0.0, 0.0, 0.0, &w);
+        let mut p2 = LearnedBias::default();
+        p2.scorecard.record(0.1, 0.0, 0.0, 0.0, 0.0, &w);
+        let unwalked = LearnedBias::default(); // walks == 0, fitness 0.0 — must be excluded
+        let v_two = pool_fitness_variance(&[p1.clone(), p2.clone()]);
+        let v_with_unwalked = pool_fitness_variance(&[p1, p2, unwalked]);
+        assert!(v_two > 0.0);
+        assert_eq!(v_two, v_with_unwalked, "walks==0 profiles must not deflate variance");
+    }
+
+    #[test]
+    fn pool_cheap_signal_excludes_unwalked() {
+        let w = SelectionWeights::default();
+        let mut p = LearnedBias::default();
+        p.scorecard.record(0.8, 0.4, 0.0, 0.0, 0.0, &w);
+        let unwalked = LearnedBias::default();
+        let c = pool_cheap_signal(&[p.clone()]);
+        let c2 = pool_cheap_signal(&[p, unwalked]);
+        assert!(c > 0.0);
+        assert_eq!(c, c2, "walks==0 profiles excluded from cheap signal");
     }
 }
