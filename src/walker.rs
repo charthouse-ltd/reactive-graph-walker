@@ -123,11 +123,25 @@ pub fn walk_single(
                 let next_domain = domain_map.get(&next_id).map(|s| s.as_str()).unwrap_or("");
 
                 let score = if let Some(lb) = learned_bias {
-                    // Emergent learned bias — adapts from experience
+                    // Emergent learned bias — adapts from experience.
+                    // Fix #3: goal pursuit + audience bias are Autonomous-only; Compliant
+                    // threads goal_strength = 0 / no audience so scoring stays deterministic.
+                    let (goal_domain, goal_strength, audience_model, audience_id) =
+                        if self_model.mode == core::CognitiveMode::Autonomous {
+                            (
+                                self_model.active_goal_domain.as_deref(),
+                                self_model.active_goal_strength,
+                                Some(&self_model.audience_model),
+                                self_model.active_audience_id.as_deref(),
+                            )
+                        } else {
+                            (None, 0.0, None, None)
+                        };
                     lb.score_edge(
                         &e.edge_type, e.weight, e.emotional_charge,
                         e.traversal_count, &current_emotion,
                         next_domain, &current_domain,
+                        goal_domain, goal_strength, audience_model, audience_id,
                     )
                 } else {
                     // Fallback: hardcoded WalkerBias with full context
@@ -547,6 +561,34 @@ fn classify_votes(
     (consensus, divergent, blind_spots)
 }
 
+/// Domain-level agreement — robust to dispersed seeds, unlike node-overlap `agreement`.
+/// Each walker's dominant domain is its most-visited; the score is the fraction of
+/// domain-voting walkers whose dominant domain matches the modal dominant. Walkers that
+/// visited no domain do not vote. Computed and logged for observability; NOT yet wired
+/// into decisions — see PROTOCOL-self-selection.md §#2 (Stage-2 replacement for the
+/// structurally-near-zero node-overlap `agreement`).
+fn domain_agreement(results: &[WalkerResult]) -> f32 {
+    let mut dominant_counts: HashMap<String, usize> = HashMap::new();
+    let mut voters = 0usize;
+    for r in results {
+        let mut per: HashMap<&str, usize> = HashMap::new();
+        for d in &r.domains_visited {
+            if !d.is_empty() {
+                *per.entry(d.as_str()).or_insert(0) += 1;
+            }
+        }
+        if let Some((dom, _)) = per.into_iter().max_by_key(|(_, c)| *c) {
+            *dominant_counts.entry(dom.to_string()).or_insert(0) += 1;
+            voters += 1;
+        }
+    }
+    if voters == 0 {
+        return 0.0;
+    }
+    let modal = dominant_counts.values().copied().max().unwrap_or(0);
+    modal as f32 / voters as f32
+}
+
 /// Emotional resonance: the mean edge weight the collective traversed per hop.
 /// High = walks moved through strong, well-worn connections; low = weak/random.
 /// Clamped to 0..1.
@@ -606,6 +648,9 @@ async fn aggregate(
     // Agreement & novelty scores
     let total_unique = node_votes.len().max(1);
     let agreement = consensus.len() as f32 / total_unique as f32;
+    // Observability (PROTOCOL-self-selection §#2): domain-level agreement, robust to the
+    // dispersed-seed structural zero in node-overlap `agreement`. Logged, not yet acted on.
+    let domain_agree = domain_agreement(results);
     let total_surprises: usize = results.iter().map(|r| r.surprises).sum();
     let novelty = ((divergent.len() + total_surprises) as f32 / total_unique as f32).min(1.0);
 
@@ -642,7 +687,7 @@ async fn aggregate(
     tracing::info!(
         "[walker-perf] {} walkers × {} hops = {} total | \
          walk={:.0}ms total={:.0}ms | {:.0} hops/s | \
-         agreement={:.0}% novelty={:.0}%",
+         agreement={:.0}% domain_agreement={:.0}% novelty={:.0}%",
         n,
         total_hops / n.max(1),
         total_hops,
@@ -650,6 +695,7 @@ async fn aggregate(
         total_ms,
         hops_per_sec,
         agreement * 100.0,
+        domain_agree * 100.0,
         novelty * 100.0,
     );
 
@@ -837,6 +883,47 @@ mod tests {
             dead_ends: 0,
             edges_traversed: Vec::new(),
         }
+    }
+
+    fn wr_dom(path: Vec<i32>, domains: &[&str]) -> WalkerResult {
+        WalkerResult {
+            bias: WalkerBias::Curiosity,
+            path,
+            domains_visited: domains.iter().map(|s| s.to_string()).collect(),
+            edge_types_used: Vec::new(),
+            total_weight: 1.0,
+            surprises: 0,
+            dead_ends: 0,
+            edges_traversed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn domain_agreement_high_when_walkers_share_domain_despite_disjoint_paths() {
+        // Disjoint node paths → the legacy node-overlap `agreement` reads ~0 here.
+        // Domain-level agreement ignores node identity and must still see the convergence.
+        let results = vec![
+            wr_dom(vec![1, 2], &["markets", "markets", "risk"]),
+            wr_dom(vec![3, 4], &["markets", "markets", "trading"]),
+            wr_dom(vec![5, 6], &["markets", "markets"]),
+        ];
+        assert!(
+            domain_agreement(&results) > 0.6,
+            "all three walkers are dominated by 'markets' → high domain agreement"
+        );
+    }
+
+    #[test]
+    fn domain_agreement_low_when_walkers_diverge_across_domains() {
+        let results = vec![
+            wr_dom(vec![1, 2], &["markets"]),
+            wr_dom(vec![3, 4], &["philosophy"]),
+            wr_dom(vec![5, 6], &["music"]),
+        ];
+        assert!(
+            domain_agreement(&results) < 0.5,
+            "three walkers, three different dominant domains → low domain agreement"
+        );
     }
 
     #[test]

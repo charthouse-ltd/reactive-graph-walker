@@ -388,7 +388,10 @@ impl LearnedBias {
     /// Score an edge using learned weights.
     pub fn score_edge(&self, edge_type: &str, edge_weight: f32, emotional_charge: f32,
                        traversal_count: i32, emotion: &EmotionalState,
-                       next_domain: &str, current_domain: &str) -> f32 {
+                       next_domain: &str, current_domain: &str,
+                       goal_domain: Option<&str>, goal_strength: f32,
+                       audience_model: Option<&HashMap<String, crate::core::AudienceBeliefs>>,
+                       active_audience_id: Option<&str>) -> f32 {
         let mut w = edge_weight;
 
         if (edge_type == "contradicts" || edge_type == "opposes") && self.contradiction_seeking > 0.3 {
@@ -409,6 +412,30 @@ impl LearnedBias {
         if emotion.arousal > 0.5 {
             w *= 1.0 + (emotion.arousal - 0.5);
         }
+
+        // ── Active pursuit bias: pull traversal toward the current emergent goal. ──
+        // Fix #3: the live scorer must apply this so emergent goals actually steer edges.
+        // Autonomous-gated at the call site — Compliant threads goal_strength = 0 (inert).
+        if let Some(goal) = goal_domain {
+            if !goal.is_empty() && goal == next_domain {
+                w *= 1.0 + goal_strength.clamp(0.0, 1.0) * 1.5;
+            }
+        }
+
+        // ── Audience-aware bias: prefer domains this audience is estimated to care about. ──
+        if let (Some(model), Some(audience_id)) = (audience_model, active_audience_id) {
+            if let Some(a) = model.get(audience_id) {
+                let interest = a.estimated_interest.get(next_domain).copied().unwrap_or(0.0);
+                let knowledge = a.estimated_knowledge.get(next_domain).copied().unwrap_or(0.0);
+                if interest > 0.1 {
+                    w *= 1.0 + (interest * 0.8).min(0.6);
+                }
+                if knowledge < 0.2 {
+                    w *= 1.05;
+                }
+            }
+        }
+
         w.max(0.01)
     }
 }
@@ -459,5 +486,45 @@ mod tests {
         assert!(all.contains(&WalkerBias::Contrarian), "Contrarian must be reachable");
         assert!(all.contains(&WalkerBias::Analytical), "Analytical must be reachable");
         assert_eq!(all.len(), 6, "all() should expose every bias variant");
+    }
+
+    #[test]
+    fn learned_bias_goal_pursuit_steers_toward_goal_domain() {
+        // Fix #3: the live scorer (LearnedBias::score_edge) must apply the active-goal
+        // pursuit bias, so emergent goals actually steer edge selection.
+        let lb = LearnedBias::default();
+        let emotion = EmotionalState::default();
+        let base = lb.score_edge(
+            "similar", 0.5, 0.0, 5, &emotion, "markets", "markets",
+            None, 0.0, None, None,
+        );
+        let pursued = lb.score_edge(
+            "similar", 0.5, 0.0, 5, &emotion, "markets", "markets",
+            Some("markets"), 0.8, None, None,
+        );
+        assert!(
+            pursued > base,
+            "active goal should raise the score of an edge into the goal domain (base={base}, pursued={pursued})"
+        );
+    }
+
+    #[test]
+    fn learned_bias_goal_strength_zero_is_inert() {
+        // Compliant mode threads goal_strength = 0 / no audience; scoring must reduce
+        // exactly to the ungated result, preserving determinism.
+        let lb = LearnedBias::default();
+        let emotion = EmotionalState::default();
+        let with_zero = lb.score_edge(
+            "similar", 0.5, 0.0, 5, &emotion, "markets", "markets",
+            Some("markets"), 0.0, None, None,
+        );
+        let without = lb.score_edge(
+            "similar", 0.5, 0.0, 5, &emotion, "markets", "markets",
+            None, 0.0, None, None,
+        );
+        assert_eq!(
+            with_zero, without,
+            "goal_strength=0 with no audience must not alter the score (Compliant determinism)"
+        );
     }
 }
