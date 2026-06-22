@@ -754,7 +754,11 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
         // Decay toward baseline
         self_model.valence *= 0.999;
         self_model.arousal *= 0.998;
-        self_model.energy = self_model.energy + (0.7 - self_model.energy) * 0.0001;
+        // Homeostatic recovery toward baseline 0.7. Gain raised 0.0001 -> 0.01 so the
+        // per-signal drain (-0.001 above) no longer floors energy at 0: the equilibrium
+        // moves from negative to ~0.6 ((0.7-e)*0.01 == 0.001 at e=0.6). Was pinning
+        // energy at ~0 under steady ingest, starving the awake/selection loop.
+        self_model.energy = self_model.energy + (0.7 - self_model.energy) * 0.01;
 
         // Decay attention patterns (what I DON'T keep thinking about fades)
         for v in self_model.attention_patterns.values_mut() {
