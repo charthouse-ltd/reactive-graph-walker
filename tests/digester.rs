@@ -301,7 +301,10 @@ async fn test_digest_philosophy() -> anyhow::Result<()> {
 
     // Ensure schema exists
     let schema = include_str!("schema.sql");
-    sqlx::query(schema).execute(&pool).await?;
+    // schema.sql contains multiple statements; sqlx::query() uses the prepared-
+    // statement protocol, which Postgres forbids for multi-command strings.
+    // raw_sql() runs them via the simple query protocol instead.
+    sqlx::raw_sql(schema).execute(&pool).await?;
     println!("Schema ensured.\n");
 
     // Check if already seeded
