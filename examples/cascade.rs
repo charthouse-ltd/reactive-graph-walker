@@ -350,8 +350,15 @@ async fn run_cascade(pool: &PgPool, node_ids: &[i32]) -> anyhow::Result<()> {
     let seed_nodes: Vec<i32> = node_ids.iter().take(20).copied().collect();
     diverger.seed_energy(seed_nodes, 0.3).await;
 
-    // Set emotional state
-    diverger.set_emotion(EmotionalState { valence: 0.0, arousal: 0.4, energy: 0.8 }).await;
+    // Set emotional state on the shared self-model. The Diverger now reads
+    // its mood from the self-model (sm.valence/arousal/energy), not a separate
+    // set_emotion setter, so seeding the mood here flows into diverger modulation.
+    {
+        let mut sm = self_model.lock().await;
+        sm.valence = 0.0;
+        sm.arousal = 0.4;
+        sm.energy = 0.8;
+    }
 
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║   RGW CASCADE — Self-Propagating Cognition          ║");
@@ -362,7 +369,12 @@ async fn run_cascade(pool: &PgPool, node_ids: &[i32]) -> anyhow::Result<()> {
     println!("─── PHASE 1: Warm-up walks ───\n");
     for session in 0..3 {
         let arousal = 0.3 + session as f32 * 0.15;
-        diverger.set_emotion(EmotionalState { valence: 0.1, arousal, energy: 0.8 }).await;
+        {
+            let mut sm = self_model.lock().await;
+            sm.valence = 0.1;
+            sm.arousal = arousal;
+            sm.energy = 0.8;
+        }
         let (output, _) = walker::walk_parallel(pool, &EmotionalState { valence: 0.1, arousal, energy: 0.8 }, 6, 6, &self_model).await;
         println!("  Session {}: {:2} hops | agreement={:.2} novelty={:.2} | domain={} action={}",
             session + 1, output.total_hops, output.agreement_score, output.novelty_score,
@@ -401,7 +413,12 @@ async fn run_cascade(pool: &PgPool, node_ids: &[i32]) -> anyhow::Result<()> {
         sm.predict("epistemology", "connection between rationalists and empiricists", 0.6);
     }
 
-    diverger.set_emotion(EmotionalState { valence: 0.3, arousal: 0.8, energy: 0.7 }).await;
+    {
+        let mut sm = self_model.lock().await;
+        sm.valence = 0.3;
+        sm.arousal = 0.8;
+        sm.energy = 0.7;
+    }
     let (output3, _) = walker::walk_parallel(pool, &EmotionalState { valence: 0.3, arousal: 0.8, energy: 0.7 }, 8, 5, &self_model).await;
     println!("  {:2} walkers × {} hops | agreement={:.2} novelty={:.2} | domain={} action={}",
         8, output3.total_hops, output3.agreement_score, output3.novelty_score,
@@ -578,7 +595,12 @@ async fn run_cascade(pool: &PgPool, node_ids: &[i32]) -> anyhow::Result<()> {
 
             // ── TURN 2: Re-walk with LLM insight ──
             println!("  ╔══ TURN 2: RGW re-explores with new knowledge ══╗\n");
-            diverger.set_emotion(EmotionalState { valence: 0.2, arousal: 0.6, energy: 0.7 }).await;
+            {
+                let mut sm = self_model.lock().await;
+                sm.valence = 0.2;
+                sm.arousal = 0.6;
+                sm.energy = 0.7;
+            }
             let (_, _) = walker::walk_parallel(pool,
                 &EmotionalState { valence: 0.2, arousal: 0.6, energy: 0.7 },
                 6, 5, &self_model).await;

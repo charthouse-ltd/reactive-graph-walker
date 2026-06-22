@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Request, State},
+    extract::{Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
@@ -133,6 +133,7 @@ pub async fn serve(
     let protected = Router::new()
         // read-only introspection
         .route("/stats", get(stats))
+        .route("/recall", get(recall))
         .route("/metrics", get(metrics_endpoint))
         .route("/diverger", get(diverger_stats))
         .route("/self", get(self_state))
@@ -685,6 +686,56 @@ async fn stats(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// Query params for `GET /recall`.
+#[derive(Deserialize)]
+struct RecallParams {
+    from: Option<String>,
+    to: Option<String>,
+    place: Option<String>,
+    limit: Option<i32>,
+}
+
+/// GET /recall — read-only autobiographical recall (§7 of the
+/// autobiographical-timeline design).
+///
+/// `?from&to&place&limit` → `{ where, where_since, episodes, texture }`.
+/// `where`/`where_since` are the location in effect at-or-before `to` (the
+/// most-recent `kind='location'` episode); `episodes` are events in `[from, to]`
+/// (optionally filtered by `place`), chronological, capped at `limit`
+/// (default 20). `texture` is reserved for a future associative `/walk`
+/// colouring — null in v1. Strictly read-only: reads only the prune-exempt
+/// `rgw_episodes` table; never touches the awake-loop, energy, walk cadence, or
+/// selection. Query/DB errors degrade to an empty answer rather than 500.
+async fn recall(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RecallParams>,
+) -> Json<serde_json::Value> {
+    // Open-ended defaults: `infinity` for `to` means "as of now" (no episode is
+    // future-dated); `-infinity` for `from` means "since the beginning".
+    let to = params.to.filter(|s| !s.is_empty()).unwrap_or_else(|| "infinity".to_string());
+    let from = params.from.filter(|s| !s.is_empty()).unwrap_or_else(|| "-infinity".to_string());
+    let place = params.place.filter(|s| !s.is_empty());
+    let limit = params.limit.unwrap_or(20);
+
+    let location = db::location_as_of(&state.pool, &to).await.unwrap_or_else(|e| {
+        tracing::debug!("[recall] location_as_of failed: {}", e);
+        None
+    });
+    let episodes = db::recall_window(&state.pool, &from, &to, place.as_deref(), limit)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!("[recall] recall_window failed: {}", e);
+            Vec::new()
+        });
+
+    Json(serde_json::json!({
+        "where": location.as_ref().and_then(|l| l.location.clone()),
+        "where_since": location.as_ref().map(|l| l.occurred_at.clone()),
+        "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| serde_json::json!([])),
+        "texture": serde_json::Value::Null,
+    }))
 }
 
 /// GET /diverger — self-propagating reactive graph stats
