@@ -516,3 +516,177 @@ async fn compute_knowledge_domains(pool: &PgPool) -> Result<std::collections::Ha
     tracing::info!("[knowledge] {} memory domains anchored to RAG: {:?}", grounded.len(), grounded);
     Ok(grounded)
 }
+
+// ── Autobiographical recall (read-only) ─────────────────────────
+// Date-anchored autobiography served from `rgw_episodes` — a table owned and
+// migrated by project_julian and read here via runtime `sqlx::query(...)`
+// strings (no `query!` macro), so the build never needs the table to exist.
+// Strictly read-only: these never touch the awake-loop, energy, walk cadence,
+// or selection. `rgw_episodes` is prune-exempt — `prune_nodes`/`prune_edges`
+// must never touch it; it is permanent autobiography.
+// See the autobiographical-timeline design (2026-06-22), §5 / §7.
+
+/// The location in effect at a given instant — the answer to "where was he?".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LocationAsOf {
+    pub location: Option<String>,
+    pub lat: Option<f64>,
+    pub lng: Option<f64>,
+    /// ISO8601 (UTC) instant the location took effect — the arrival time.
+    pub occurred_at: String,
+}
+
+/// A single remembered event inside a recall window.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Episode {
+    /// ISO8601 (UTC).
+    pub occurred_at: String,
+    pub kind: String,
+    pub location: Option<String>,
+    pub headline: String,
+    pub detail: Option<String>,
+}
+
+/// SQL fragment shared by both recall queries: render a `timestamptz` as a
+/// `2026-03-31T19:12:14Z` UTC string, matching the `/recall` contract (§7).
+const OCCURRED_AT_ISO: &str =
+    "to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')";
+
+/// The single most-recent `kind='location'` episode with `occurred_at <= to`.
+///
+/// This is the key autobiographical semantic: a same-day "May 3" query returns
+/// Lisbon even though the arrival was March 31, because the location *in effect*
+/// at a date is the most recent arrival at-or-before it — never a later one.
+/// `to` is an ISO8601 string (`'infinity'` is accepted for "as of now").
+/// Returns `None` when no location is on record before `to`, so the caller can
+/// fall back rather than confabulate.
+pub async fn location_as_of(pool: &PgPool, to: &str) -> Result<Option<LocationAsOf>, sqlx::Error> {
+    let sql = format!(
+        "SELECT location, lat, lng, {OCCURRED_AT_ISO} AS occurred_at \
+         FROM rgw_episodes \
+         WHERE kind = 'location' AND occurred_at <= $1::timestamptz \
+         ORDER BY occurred_at DESC \
+         LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .bind(to)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row.map(|r| LocationAsOf {
+        location: r.get("location"),
+        lat: r.get("lat"),
+        lng: r.get("lng"),
+        occurred_at: r.get("occurred_at"),
+    }))
+}
+
+/// Episodes occurring in `[from, to]`, chronological, capped at `limit`.
+///
+/// `place`, when given, filters to a case-insensitive substring match on
+/// `location` (so "Porto" matches "Porto, Portugal"). `from`/`to` are ISO8601
+/// strings; `'-infinity'` / `'infinity'` are accepted for open-ended windows.
+pub async fn recall_window(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    place: Option<&str>,
+    limit: i32,
+) -> Result<Vec<Episode>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {OCCURRED_AT_ISO} AS occurred_at, kind, location, headline, detail \
+         FROM rgw_episodes \
+         WHERE occurred_at >= $1::timestamptz AND occurred_at <= $2::timestamptz \
+           AND ($3::text IS NULL OR location ILIKE $3) \
+         ORDER BY occurred_at ASC \
+         LIMIT $4"
+    );
+    let pattern = place
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("%{p}%"));
+
+    let rows = sqlx::query(&sql)
+        .bind(from)
+        .bind(to)
+        .bind(pattern)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows.iter().map(|r| Episode {
+        occurred_at: r.get("occurred_at"),
+        kind: r.get("kind"),
+        location: r.get("location"),
+        headline: r.get("headline"),
+        detail: r.get("detail"),
+    }).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    //! `location_as_of`'s selection runs in Postgres (`WHERE kind='location'
+    //! AND occurred_at <= to ORDER BY occurred_at DESC LIMIT 1`). `cargo test`
+    //! has no live database, so this mirrors that exact rule over in-memory
+    //! episodes to lock the *semantic*: the location in effect at a date is the
+    //! most recent arrival at-or-before it — never a later arrival, and never a
+    //! guess. Instants are modeled as day-of-year for legibility.
+
+    /// In-memory twin of the SQL: most-recent `(location, day)` with `day <= to`.
+    fn location_as_of_rule<'a>(episodes: &[(&'a str, f64)], to: f64) -> Option<&'a str> {
+        episodes
+            .iter()
+            .filter(|(_, day)| *day <= to)
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(loc, _)| *loc)
+    }
+
+    // Ground truth from the design: Lisbon arrived 2026-03-31 (~day 90),
+    // Chiang Mai arrived 2026-05-06 (~day 126); "50 days ago" = 2026-05-03 (~day 123).
+    const LISBON_ARRIVAL: f64 = 90.0;
+    const CHIANG_MAI_ARRIVAL: f64 = 126.0;
+    const MAY_3: f64 = 123.0;
+
+    fn seeded() -> [(&'static str, f64); 2] {
+        [
+            ("Lisbon, Portugal", LISBON_ARRIVAL),
+            ("Chiang Mai, Thailand", CHIANG_MAI_ARRIVAL),
+        ]
+    }
+
+    #[test]
+    fn returns_location_in_effect_not_a_later_arrival() {
+        // The bug: "where were you 50 days ago?" → must be Lisbon (arrived
+        // Mar 31), NOT Chiang Mai (arrived May 6, after the cutoff), NOT Fiji.
+        assert_eq!(location_as_of_rule(&seeded(), MAY_3), Some("Lisbon, Portugal"));
+    }
+
+    #[test]
+    fn includes_an_arrival_exactly_at_the_cutoff() {
+        // `<=`: querying as-of the arrival instant returns that location.
+        assert_eq!(
+            location_as_of_rule(&seeded(), CHIANG_MAI_ARRIVAL),
+            Some("Chiang Mai, Thailand")
+        );
+        assert_eq!(
+            location_as_of_rule(&seeded(), LISBON_ARRIVAL),
+            Some("Lisbon, Portugal")
+        );
+    }
+
+    #[test]
+    fn most_recent_wins_among_several_before_the_cutoff() {
+        // Well after May 6, the latest arrival on record is Chiang Mai.
+        assert_eq!(location_as_of_rule(&seeded(), 200.0), Some("Chiang Mai, Thailand"));
+    }
+
+    #[test]
+    fn none_before_the_first_arrival() {
+        // No location on record yet → None; the caller must not confabulate.
+        assert_eq!(location_as_of_rule(&seeded(), 1.0), None);
+    }
+
+    #[test]
+    fn none_when_no_episodes() {
+        assert_eq!(location_as_of_rule(&[], MAY_3), None);
+    }
+}
