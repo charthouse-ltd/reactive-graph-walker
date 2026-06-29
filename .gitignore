@@ -8,3 +8,10 @@ target/
 # A/B harness: real scenarios + results stay local
 ab_scenarios.json
 ab_results.json
+
+# stray planning/business docs — archived locally 2026-06-29, removed from repo
+/PROTOCOL-compliance-mode.md
+/PROTOCOL-self-selection.md
+/PROTOCOL-unconscious-v0.md
+/PROTOCOL-unconscious-walker.md
+/PROTOCOL-web-workflow-automator.md
