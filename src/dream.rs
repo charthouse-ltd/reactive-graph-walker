@@ -21,7 +21,6 @@ use sqlx::PgPool;
 
 use crate::core::{self, SelfModel, Signal};
 use crate::db;
-use crate::graph::*;
 
 /// Dream session configuration
 #[derive(Debug, Clone)]
@@ -195,8 +194,8 @@ pub async fn dream(
             coherence = (coherence + 0.25).min(1.0);
         }
 
-        if coherence >= config.coherence_threshold && kept_connections.len() < config.max_new_edges {
-            if let Some(best) = conns.first() {
+        if coherence >= config.coherence_threshold && kept_connections.len() < config.max_new_edges
+            && let Some(best) = conns.first() {
                 kept_connections.push(best.clone());
                 insights.push(DreamInsight {
                     source_domain: src_domain.clone(),
@@ -209,7 +208,6 @@ pub async fn dream(
                     novelty: 1.0 - coherence, // More surprising = more novel
                 });
             }
-        }
     }
 
     // Phase 5: Create permanent edges for kept connections

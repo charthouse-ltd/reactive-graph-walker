@@ -290,8 +290,8 @@ async fn walk(
             .unwrap_or(50);
         let periodic = sm.critic_sessions_since_llm > interval
             && diagnosis.primary_diagnosis != crate::metacog::DiagnosisLabel::Rest;
-        if escalate || periodic {
-            if let Some(ref provider) = state.provider {
+        if (escalate || periodic)
+            && let Some(ref provider) = state.provider {
                 let summary = crate::metacog::build_session_summary(&output, &walker_results, &sm);
                 let (system, user) = crate::metacog::build_critic_llm_prompt(&diagnosis, &summary);
 
@@ -299,7 +299,6 @@ async fn walk(
                 let result = provider.generate(&system, &user, 0.5, escalate, Some(256), 0.3).await;
                 crate::metacog::run_llm_critic(&diagnosis, &summary, &mut sm, &result.text).await;
             }
-        }
     }
 
     // Restore previous mode if we overrode it
@@ -891,16 +890,16 @@ async fn ingest_signal_endpoint(
                                 edge_id: 0,
                                 source_id: *node_id,
                                 target_id: *node_id, // self-loop: activate the node itself
-                                delta: *similarity as f32 * req.intensity,
+                                delta: *similarity * req.intensity,
                                 edge_type: "activated_by".into(),
                             });
                         }
                         tracing::debug!(
                             "[ingest] Content matched {} nodes (best sim={:.2}), injected energy",
                             nodes.len(),
-                            nodes.first().map(|(_, s, _)| *s as f32).unwrap_or(0.0)
+                            nodes.first().map(|(_, s, _)| *s).unwrap_or(0.0)
                         );
-                        nodes.iter().map(|(id, sim, _)| (*id, *sim as f32)).collect()
+                        nodes.iter().map(|(id, sim, _)| (*id, (*sim))).collect()
                     }
                     Err(e) => {
                         tracing::debug!("[ingest] find_similar_nodes failed: {}", e);

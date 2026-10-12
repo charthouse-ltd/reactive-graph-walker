@@ -255,28 +255,25 @@ impl WalkerBias {
             }
 
             // Domain diversification: too many walkers in same domain → explore elsewhere
-            if let Some(&active_count) = c.active_domains.get(next_domain) {
-                if active_count >= 2 {
+            if let Some(&active_count) = c.active_domains.get(next_domain)
+                && active_count >= 2 {
                     w *= 0.5;
                 }
-            }
         }
 
         // ── Self-model modulation (accumulated knowledge) ──
 
         // Wound avoidance: this domain has caused pain → avoid
-        if let Some(&wound) = wounds.get(next_domain) {
-            if wound > 0.3 {
+        if let Some(&wound) = wounds.get(next_domain)
+            && wound > 0.3 {
                 w *= 1.0 - wound * 0.5; // High wound = strong avoidance
             }
-        }
 
         // Competence preference: I'm good at this domain → prefer
-        if let Some(&comp) = competencies.get(next_domain) {
-            if comp > 0.3 {
+        if let Some(&comp) = competencies.get(next_domain)
+            && comp > 0.3 {
                 w *= 1.0 + comp * 0.5; // High competence = mild preference
             }
-        }
 
         // Belief alignment: does this edge align or contradict a known belief?
         for belief in beliefs {
@@ -297,15 +294,14 @@ impl WalkerBias {
         }
 
         // Active pursuit bias: pull traversal toward current emergent goal.
-        if let Some(goal) = goal_domain {
-            if !goal.is_empty() && goal == next_domain {
+        if let Some(goal) = goal_domain
+            && !goal.is_empty() && goal == next_domain {
                 w *= 1.0 + goal_strength.clamp(0.0, 1.0) * 1.5;
             }
-        }
 
         // Audience-aware bias: prefer domains this audience is estimated to care about.
-        if let (Some(model), Some(audience_id)) = (audience_model, active_audience_id) {
-            if let Some(a) = model.get(audience_id) {
+        if let (Some(model), Some(audience_id)) = (audience_model, active_audience_id)
+            && let Some(a) = model.get(audience_id) {
                 let interest = a.estimated_interest.get(next_domain).copied().unwrap_or(0.0);
                 let knowledge = a.estimated_knowledge.get(next_domain).copied().unwrap_or(0.0);
                 if interest > 0.1 {
@@ -315,7 +311,6 @@ impl WalkerBias {
                     w *= 1.05;
                 }
             }
-        }
 
         w.max(0.001)
     }
@@ -641,15 +636,14 @@ impl LearnedBias {
         // ── Active pursuit bias: pull traversal toward the current emergent goal. ──
         // Fix #3: the live scorer must apply this so emergent goals actually steer edges.
         // Autonomous-gated at the call site — Compliant threads goal_strength = 0 (inert).
-        if let Some(goal) = goal_domain {
-            if !goal.is_empty() && goal == next_domain {
+        if let Some(goal) = goal_domain
+            && !goal.is_empty() && goal == next_domain {
                 w *= 1.0 + goal_strength.clamp(0.0, 1.0) * 1.5;
             }
-        }
 
         // ── Audience-aware bias: prefer domains this audience is estimated to care about. ──
-        if let (Some(model), Some(audience_id)) = (audience_model, active_audience_id) {
-            if let Some(a) = model.get(audience_id) {
+        if let (Some(model), Some(audience_id)) = (audience_model, active_audience_id)
+            && let Some(a) = model.get(audience_id) {
                 let interest = a.estimated_interest.get(next_domain).copied().unwrap_or(0.0);
                 let knowledge = a.estimated_knowledge.get(next_domain).copied().unwrap_or(0.0);
                 if interest > 0.1 {
@@ -659,7 +653,6 @@ impl LearnedBias {
                     w *= 1.05;
                 }
             }
-        }
 
         w.max(0.01)
     }
