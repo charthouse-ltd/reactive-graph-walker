@@ -15,3 +15,6 @@ ab_results.json
 /PROTOCOL-unconscious-v0.md
 /PROTOCOL-unconscious-walker.md
 /PROTOCOL-web-workflow-automator.md
+
+# local tooling pins
+.gbrain-source

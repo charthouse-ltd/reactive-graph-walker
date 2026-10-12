@@ -2,6 +2,7 @@
 name = "rgw"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "RGW — Reactive Graph Walker. Self-propagating cognitive engine."
 
 [dependencies]
