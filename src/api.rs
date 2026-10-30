@@ -121,24 +121,18 @@ pub async fn serve(
         motor_gate: motor_gate.clone(),
     });
 
-    if std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
-        tracing::warn!(
-            "[rgw] RGW_API_KEY not set — protected endpoints are UNAUTHENTICATED (fail-open). \
-             Set RGW_API_KEY (and send X-RGW-Key on callers) to require auth on \
-             /walk, /v1/chat/completions, /ingest/signal, etc."
-        );
-    }
+    // RGW_API_KEY is validated in main() before startup (refuse to start without
+    // it); require_auth additionally rejects every request if it is missing.
 
     // ── Public endpoint (no auth) — health only ──
     // Strict posture: ONLY /health is open (liveness probes work without a key).
-    // Everything else — including read-only introspection — requires X-RGW-Key
-    // when RGW_API_KEY is set.
+    // Everything else — including read-only introspection — always requires X-RGW-Key.
     let public = Router::new()
         .route("/health", get(health));
 
-    // ── Protected endpoints (require X-RGW-Key when RGW_API_KEY is set) ──
+    // ── Protected endpoints (always require X-RGW-Key) ──
     // Everything except /health: read-only introspection AND mutations / actions
-    // / LLM-spend. Fail-open until the key is set on both sides. See audit C1/S3.
+    // / LLM-spend. Fail-closed: no key configured → 401. See audit C1/S3.
     let protected = Router::new()
         // read-only introspection
         .route("/stats", get(stats))
@@ -202,16 +196,40 @@ pub async fn serve(
     Ok(())
 }
 
-/// Auth middleware for mutating / cost endpoints.
+/// Minimum recommended RGW_API_KEY length (shorter keys are accepted with a WARN).
+const MIN_STRONG_KEY_LEN: usize = 32;
+
+/// Validate the RGW_API_KEY value at startup. Unset, empty or whitespace → Err.
+/// Never echoes the value. Short keys are accepted with a WARN (existing
+/// deployments' key lengths are unknown, so they are not rejected).
+pub fn validate_api_key(v: Option<&str>) -> Result<(), String> {
+    match v.map(str::trim) {
+        None | Some("") => Err(
+            "RGW_API_KEY is not set (or is empty). RGW refuses to start without it. \
+             Generate one with `openssl rand -hex 32`, set RGW_API_KEY, and send it \
+             as the X-RGW-Key header from callers."
+                .to_string(),
+        ),
+        Some(k) => {
+            if k.len() < MIN_STRONG_KEY_LEN {
+                tracing::warn!(
+                    "[rgw] RGW_API_KEY is shorter than {} characters; consider `openssl rand -hex 32`",
+                    MIN_STRONG_KEY_LEN
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Auth middleware for every route except /health.
 /// Convention shared with the deployed backends: the secret travels as the
-/// `X-RGW-Key` header and matches the `RGW_API_KEY` env var. Fail-open when
-/// `RGW_API_KEY` is unset on this side (preserves behaviour during graceful
-/// rollout — the callers send nothing until the key is set on both sides);
-/// fail-closed once it is configured. Only /health bypasses this (liveness).
+/// `X-RGW-Key` header and matches the `RGW_API_KEY` env var. Fail-closed: if
+/// `RGW_API_KEY` is unset or empty here, every request gets 401 (main() also
+/// refuses to start in that case; this is the second line of defence).
 async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {
-    let Some(expected) = std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()) else {
-        // Fail-open: no key configured → allow (a startup WARN already fired).
-        return Ok(next.run(req).await);
+    let Some(expected) = std::env::var("RGW_API_KEY").ok().filter(|s| !s.trim().is_empty()) else {
+        return Err(StatusCode::UNAUTHORIZED);
     };
 
     let presented = req
@@ -1238,7 +1256,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // Fail-open behavior when key is unset.
+        // Fail-closed when the key is unset: 401 even with a header.
         // Safety: scoped mutation restored by guard drop.
         unsafe { std::env::remove_var("RGW_API_KEY") };
         let res = client
@@ -1246,10 +1264,42 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = client
+            .get(format!("{}/metacog/config", base_url))
+            .header("X-RGW-Key", "")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Empty key configured → also 401.
+        // Safety: scoped mutation restored by guard drop.
+        unsafe { std::env::set_var("RGW_API_KEY", "") };
+        let res = client
+            .get(format!("{}/metacog/config", base_url))
+            .header("X-RGW-Key", "")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
         server.abort();
         drop(guard);
+    }
+
+    #[test]
+    fn validate_api_key_table() {
+        assert!(validate_api_key(None).is_err());
+        assert!(validate_api_key(Some("")).is_err());
+        assert!(validate_api_key(Some("   ")).is_err());
+        assert!(validate_api_key(Some("short")).is_ok(), "short keys warn, not reject");
+        let dummy = "0123456789abcdef".repeat(4); // 64-hex dummy
+        assert!(validate_api_key(Some(&dummy)).is_ok());
+
+        let msg = validate_api_key(Some("  ")).unwrap_err();
+        assert!(msg.contains("RGW_API_KEY"));
+        assert!(msg.contains("openssl rand -hex 32"));
     }
 
     #[tokio::test]

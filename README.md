@@ -69,6 +69,7 @@ Walkers leave trails (visited nodes, dead ends, surprise domains). Other walkers
 # Prerequisites: PostgreSQL 16+, pgvector extension
 # Set environment
 export DATABASE_URL=postgresql:///rgw_test?host=/tmp
+export RGW_API_KEY="$(openssl rand -hex 32)"   # REQUIRED: rgw refuses to start without it
 export DEEPSEEK_API_KEY=sk-...
 export RUST_LOG=info,rgw=debug
 
@@ -86,6 +87,9 @@ cargo build --release --example digester
   --ollama-url http://localhost:11434 \
   --julian-url http://localhost:8000 \
   --port 11435
+
+# Every endpoint except /health requires the X-RGW-Key header
+curl -H "X-RGW-Key: $RGW_API_KEY" http://localhost:11435/self
 ```
 
 ## Cascade Demo Output
@@ -150,6 +154,7 @@ case-sensitive) and the `X-RGW-Key` header. It sends exactly once. Held tool cal
 | Env Var | Default | Description |
 |---------|---------|-------------|
 | `DATABASE_URL` | required | PostgreSQL connection string |
+| `RGW_API_KEY` | **required** | Shared secret. RGW refuses to start if unset/empty. Callers send it as `X-RGW-Key` (all endpoints except `/health`). Generate with `openssl rand -hex 32`. |
 | `DEEPSEEK_API_KEY` | — | DeepSeek API key for LLM expression |
 | `DEEPSEEK_MODEL` | deepseek-chat | Model name (also: deepseek-reasoner) |
 | `RUST_LOG` | info | Log level (rgw=debug for detail) |
