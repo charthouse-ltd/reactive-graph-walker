@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use rand::seq::SliceRandom;
 use sqlx::PgPool;
@@ -19,7 +18,6 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::db;
 use crate::graph::*;
-use crate::walker;
 
 /// Activation energy accumulated at each node.
 /// When energy crosses threshold → spontaneous walk fires.
@@ -312,11 +310,10 @@ impl Diverger {
                     let mut scored: Vec<(i32, f32)> = Vec::with_capacity(nodes_to_fire.len());
                     for nid in nodes_to_fire {
                         let mut score = 1.0;
-                        if let Ok(Some(node)) = db::get_node(&pool, nid).await {
-                            if node.domain == *goal {
+                        if let Ok(Some(node)) = db::get_node(&pool, nid).await
+                            && node.domain == *goal {
                                 score += goal_strength.clamp(0.0, 1.0) * 2.0;
                             }
-                        }
                         scored.push((nid, score));
                     }
                     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -388,7 +385,7 @@ impl Diverger {
                                 crate::graph::WalkerCollective::new()
                             ));
                             let result = crate::walker::walk_single(
-                                &*cache_walk, node_id,
+                                &cache_walk, node_id,
                                 WalkerBias::all()[node_id as usize % WalkerBias::all().len()],
                                 &emo, steps, &mut walked, &collective, None, &kd,
                             );
@@ -454,7 +451,7 @@ impl Diverger {
                                         params: None,
                                         audience_id: audience_id_for_walk.clone(),
                                     };
-                                    crate::motor::execute(&julian_url, cmd).await;
+                                    crate::motor::gate().dispatch("diverger", &julian_url, cmd).await;
                                 }
                             }
                         }

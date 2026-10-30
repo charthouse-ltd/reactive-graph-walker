@@ -309,8 +309,8 @@ fn critique(proposed: &ProposedAction, sm: &SelfModel) -> SelfEvaluation {
             ));
         }
 
-        if let Some(&wound) = sm.wounds.get(&proposed.domain) {
-            if wound > sm.critic_rules.wound_guard_threshold
+        if let Some(&wound) = sm.wounds.get(&proposed.domain)
+            && wound > sm.critic_rules.wound_guard_threshold
                 && proposed.confidence < sm.critic_rules.wound_confidence_floor
             {
                 approved = false;
@@ -319,7 +319,6 @@ fn critique(proposed: &ProposedAction, sm: &SelfModel) -> SelfEvaluation {
                     proposed.domain, wound * 100.0
                 ));
             }
-        }
     } else {
         efficiency = true;
     }
@@ -950,7 +949,7 @@ fn plan_selection(sm: &SelfModel) -> SelectionPlan {
             let cand_ucb = cand.ucb(SELECTION_K);
             if cand_ucb < inc_lcb {
                 // confidently dominated → eligible; keep the lowest-ucb candidate overall.
-                if best.as_ref().map_or(true, |b| cand_ucb < b.cand_ucb) {
+                if best.as_ref().is_none_or(|b| cand_ucb < b.cand_ucb) {
                     best = Some(CullPlan {
                         idx: m,
                         niche,
@@ -983,7 +982,7 @@ pub fn select_biases(sm: &mut SelfModel) {
     }
     // Cadence: the ONLY mutation permitted at Observability.
     sm.selection_cycle_counter = sm.selection_cycle_counter.wrapping_add(1);
-    if sm.selection_cycle_counter % SELECT_EVERY != 0 {
+    if !sm.selection_cycle_counter.is_multiple_of(SELECT_EVERY) {
         return;
     }
 
@@ -1009,8 +1008,8 @@ pub fn select_biases(sm: &mut SelfModel) {
     if let Some(c) = &plan.cull {
         let idx = c.idx;
         sm.learned_biases.remove(idx);
-        if let Some(parent) = &plan.breed_parent {
-            if sm.learned_biases.len() < MAX_LEARNED_BIASES {
+        if let Some(parent) = &plan.breed_parent
+            && sm.learned_biases.len() < MAX_LEARNED_BIASES {
                 let child = perturb_child(parent);
                 tracing::info!(
                     "[select-biases] CULLED #{}; bred replacement from incumbent (novelty_seeking={:.3})",
@@ -1018,7 +1017,6 @@ pub fn select_biases(sm: &mut SelfModel) {
                 );
                 sm.learned_biases.push(child);
             }
-        }
         // Re-normalise rotation so walker credit-attribution stays in-bounds after the shift.
         if !sm.learned_biases.is_empty() {
             sm.learned_bias_rotation %= sm.learned_biases.len() as u64;
@@ -1045,11 +1043,10 @@ pub fn record_audience_output(sm: &mut SelfModel, audience_id: &str, message: &s
         if audience.topics_discussed.len() > 20 { audience.topics_discussed.remove(0); }
     }
 
-    if message.len() > 10 {
-        if let Ok(emb) = crate::embed::embed_text(message) {
+    if message.len() > 10
+        && let Ok(emb) = crate::embed::embed_text(message) {
             audience.last_context_embedding = Some(emb);
         }
-    }
 
     if !domain.is_empty() {
         let knowledge = audience.estimated_knowledge.entry(domain.to_string()).or_insert(0.0);
@@ -1060,8 +1057,8 @@ pub fn record_audience_output(sm: &mut SelfModel, audience_id: &str, message: &s
     // beyond the cap, evict the least-recently-seen audience. The entry we just
     // touched has last_interaction = now, so it is never the one evicted.
     const MAX_AUDIENCES: usize = 500;
-    if sm.audience_model.len() > MAX_AUDIENCES {
-        if let Some(oldest) = sm
+    if sm.audience_model.len() > MAX_AUDIENCES
+        && let Some(oldest) = sm
             .audience_model
             .iter()
             .min_by(|a, b| {
@@ -1073,7 +1070,6 @@ pub fn record_audience_output(sm: &mut SelfModel, audience_id: &str, message: &s
         {
             sm.audience_model.remove(&oldest);
         }
-    }
 }
 
 /// Record a response from an audience member. Compares expected vs actual — ToM prediction error.

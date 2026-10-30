@@ -62,11 +62,10 @@ pub fn emotion_to_prompt(sm: &SelfModel) -> String {
     if !sm.wounds.is_empty() {
         let worst_wound = sm.wounds.iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal));
-        if let Some((domain, &severity)) = worst_wound {
-            if severity > 0.3 {
+        if let Some((domain, &severity)) = worst_wound
+            && severity > 0.3 {
                 parts.push(format!("unresolved tension around {}, dissonant undertones", domain));
             }
-        }
     }
 
     // Open questions create space/silence
@@ -234,7 +233,7 @@ pub fn generate_midi(params: &MusicParams) -> Vec<u8> {
     let mut current_tick = 0u32;
     let mut prev_note_idx = 3usize; // Start in middle of scale
 
-    for beat in 0..total_beats {
+    for _beat in 0..total_beats {
         // Decide how many notes this beat based on density
         let notes_this_beat = if rng.random::<f32>() < params.note_density {
             if params.note_density > 0.6 { 2 } else { 1 }

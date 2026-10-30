@@ -12,7 +12,6 @@
 //! recent episodes → store as permanent semantic rules.
 
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 
 /// An episode: one complete cognitive cycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +59,12 @@ pub struct Lesson {
     pub evidence_count: u32,
     pub first_learned: f64,
     pub last_reinforced: f64,
+}
+
+impl Default for EpisodicMemory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EpisodicMemory {

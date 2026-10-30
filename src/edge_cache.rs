@@ -6,9 +6,8 @@
 //!
 //! This is the difference between 20 hops/second and 2000+.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use sqlx::PgPool;
@@ -113,11 +112,10 @@ impl EdgeCache {
             if !self.loaded_nodes.contains_key(&nid) {
                 let edges = crate::db::edges_from(&self.pool, nid).await?;
                 // Also cache node domain
-                if let Ok(Some(node)) = crate::db::get_node(&self.pool, nid).await {
-                    if !node.domain.is_empty() {
+                if let Ok(Some(node)) = crate::db::get_node(&self.pool, nid).await
+                    && !node.domain.is_empty() {
                         self.node_domains.insert(nid, node.domain);
                     }
-                }
                 // Add neighbors to the load set
                 for e in &edges {
                     let neighbor = if e.source_id == nid { e.target_id } else { e.source_id };

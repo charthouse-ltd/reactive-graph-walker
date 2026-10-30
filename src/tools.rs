@@ -230,6 +230,17 @@ pub async fn execute_tool(
 /// at arbitrary internal services (SSRF). See the security audit (C2).
 async fn motor_tool(action: &str, params: serde_json::Value) -> ToolResult {
     let motor_url = std::env::var("RGW_MOTOR_URL").unwrap_or_default();
+    motor_tool_via(crate::motor::gate(), &motor_url, action, params).await
+}
+
+/// Testable core of [`motor_tool`]: takes the gate and the server-side URL.
+pub(crate) async fn motor_tool_via(
+    gate: &crate::motor::MotorGate,
+    motor_url: &str,
+    action: &str,
+    params: serde_json::Value,
+) -> ToolResult {
+    use crate::motor::DispatchOutcome;
 
     if motor_url.is_empty() {
         return ToolResult {
@@ -263,43 +274,40 @@ async fn motor_tool(action: &str, params: serde_json::Value) -> ToolResult {
     };
 
     // Motor commands are fire-and-forget by design, but for tool
-    // invocations we want acknowledgment. Use a direct POST.
-    let url = format!("{}/api/admin/rgw/execute", motor_url);
-    match reqwest::Client::new()
-        .post(&url)
-        .json(&cmd)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
+    // invocations we want acknowledgment: 30 s timeout, body returned.
+    let source = format!("tool:{}", action);
+    let mode = gate.mode().as_str();
+    match gate
+        .dispatch_with_timeout(&source, motor_url, cmd, std::time::Duration::from_secs(30))
         .await
     {
-        Ok(resp) if resp.status().is_success() => {
-            let body = resp.text().await.unwrap_or_default();
-            ToolResult {
-                tool: action.into(),
-                success: true,
-                content: if body.is_empty() {
-                    format!("{} command accepted by motor cortex", action)
-                } else {
-                    crate::core::safe_truncate(&body, 2000).to_string()
-                },
-                metadata: serde_json::json!({"action": action}),
-            }
-        }
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            ToolResult {
-                tool: action.into(),
-                success: false,
-                content: format!("Motor cortex rejected {} (HTTP {}): {}", action, status, crate::core::safe_truncate(&body, 200)),
-                metadata: serde_json::json!({"action": action, "status": status}),
-            }
-        }
-        Err(e) => ToolResult {
+        DispatchOutcome::Sent(_, body) => ToolResult {
+            tool: action.into(),
+            success: true,
+            content: if body.is_empty() {
+                format!("{} command accepted by motor cortex", action)
+            } else {
+                crate::core::safe_truncate(&body, 2000).to_string()
+            },
+            metadata: serde_json::json!({"action": action}),
+        },
+        DispatchOutcome::SendFailed(err) => ToolResult {
             tool: action.into(),
             success: false,
-            content: format!("Motor cortex unreachable for {}: {}", action, e),
-            metadata: serde_json::json!({"action": action, "error": e.to_string()}),
+            content: format!("Motor cortex failed for {}: {}", action, err),
+            metadata: serde_json::json!({"action": action, "error": err}),
+        },
+        DispatchOutcome::Queued(id) => ToolResult {
+            tool: action.into(),
+            success: false,
+            content: format!("Queued for approval as proposal #{}; nothing was sent", id),
+            metadata: serde_json::json!({"action": action, "held": true, "mode": mode, "proposal_id": id}),
+        },
+        DispatchOutcome::Dropped | DispatchOutcome::Shadowed => ToolResult {
+            tool: action.into(),
+            success: false,
+            content: format!("Held: motor mode is {}; nothing was sent", mode),
+            metadata: serde_json::json!({"action": action, "held": true, "mode": mode, "proposal_id": null}),
         },
     }
 }
@@ -580,4 +588,3 @@ mod urlencoding {
 }
 
 use sqlx::Row;
-use chrono;

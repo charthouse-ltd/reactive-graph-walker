@@ -11,7 +11,6 @@
 //! nothing works. It's structural, not optional.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
 
 use serde::Serialize;
 
@@ -450,6 +449,12 @@ pub struct WorkingMemorySlot {
 // High novelty/surprise → gate opens → learn faster.
 // High confidence/familiarity → gate closes → protect existing knowledge.
 
+impl Default for SelfModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SelfModel {
     pub fn new() -> Self {
         let now = now();
@@ -557,8 +562,8 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
     }
 
     // Embed the signal content (semantic understanding, not just counters)
-    if !signal.content.is_empty() && signal.content.len() > 10 {
-        if let Ok(emb) = crate::embed::embed_text(&signal.content) {
+    if !signal.content.is_empty() && signal.content.len() > 10
+        && let Ok(emb) = crate::embed::embed_text(&signal.content) {
             // Update thought embedding (what I'm thinking right now)
             self_model.thought_embedding = Some(emb.clone());
 
@@ -589,7 +594,6 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
                 }
             }
         }
-    }
 
     // Track open questions (from dead ends and search requests)
     if signal.kind == "dead_end" || signal.kind == "search" {
@@ -651,12 +655,12 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
     }
 
     // ── Predictive Coding: compare signal to expectations ──
-    if !signal.domain.is_empty() {
-        if let Some(prediction) = self_model.predictions.remove(&signal.domain) {
+    if !signal.domain.is_empty()
+        && let Some(prediction) = self_model.predictions.remove(&signal.domain) {
             let age = now - prediction.predicted_at;
             // Prediction was recent enough to matter
-            if age < 60.0 {
-                if signal.kind == "walk_end" || signal.kind == "surprise" {
+            if age < 60.0
+                && (signal.kind == "walk_end" || signal.kind == "surprise") {
                     // Check if the outcome matches the prediction
                     let predicted_ok = signal.content.contains(&prediction.predicted)
                         || prediction.predicted.is_empty();
@@ -670,9 +674,7 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
                         );
                     }
                 }
-            }
         }
-    }
 
     // ── 2. The self-model INFLUENCES the signal ──
     // The signal is transformed by who I am right now.
@@ -920,8 +922,8 @@ fn notice(sm: &SelfModel, before: &Snapshot, signal: &Signal) -> Option<Noticing
     }
 
     // Wound activation (signal in a domain that hurts)
-    if let Some(&wound) = sm.wounds.get(&signal.domain) {
-        if wound > 0.3 {
+    if let Some(&wound) = sm.wounds.get(&signal.domain)
+        && wound > 0.3 {
             return Some(Noticing {
                 kind: "wound_activated".into(),
                 observation: format!("Signal about {} hits a sore spot (wound: {:.0}%)",
@@ -932,7 +934,6 @@ fn notice(sm: &SelfModel, before: &Snapshot, signal: &Signal) -> Option<Noticing
                 timestamp: now,
             });
         }
-    }
 
     // Energy depletion
     if sm.energy < 0.2 && before.energy >= 0.2 {

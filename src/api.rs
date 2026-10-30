@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Query, Request, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
@@ -33,6 +33,8 @@ pub struct AppState {
     pub julian_url: String,
     /// Intelligent LLM router (local + cloud). If None, falls back to Ollama.
     pub provider: Option<crate::provider::Provider>,
+    /// The single gate for outbound motor actions (RGW_MOTOR_MODE).
+    pub motor_gate: Arc<crate::motor::MotorGate>,
 }
 
 /// Walk request (matches Python WalkRequest)
@@ -63,6 +65,7 @@ pub struct HealthResponse {
     pub db_connected: bool,
     pub version: String,
     pub runtime: String,
+    pub motor_mode: String,
 }
 
 /// Start the HTTP server with the Diverger engine
@@ -76,6 +79,11 @@ pub async fn serve(
     // Create the self-model FIRST — the continuous state of self-awareness
     let self_model = std::sync::Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
     tracing::info!("[rgw] Self-model initialized. Consciousness online.");
+
+    // Motor gate FIRST: every outbound action goes through it. Default shadow.
+    let motor_mode = crate::motor::MotorMode::from_env_value(std::env::var("RGW_MOTOR_MODE").ok().as_deref());
+    let motor_gate = crate::motor::install_gate(motor_mode);
+    tracing::info!("[motor] Motor gate mode: {}", motor_gate.mode().as_str());
 
     // Create the Diverger with shared self-model + Julian URL for motor commands
     let diverger = Diverger::new(pool.clone(), self_model.clone(), julian_url);
@@ -110,26 +118,21 @@ pub async fn serve(
         expression_model: expression_model.to_string(),
         julian_url: julian_url.to_string(),
         provider,
+        motor_gate: motor_gate.clone(),
     });
 
-    if std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
-        tracing::warn!(
-            "[rgw] RGW_API_KEY not set — protected endpoints are UNAUTHENTICATED (fail-open). \
-             Set RGW_API_KEY (and send X-RGW-Key on callers) to require auth on \
-             /walk, /v1/chat/completions, /ingest/signal, etc."
-        );
-    }
+    // RGW_API_KEY is validated in main() before startup (refuse to start without
+    // it); require_auth additionally rejects every request if it is missing.
 
     // ── Public endpoint (no auth) — health only ──
     // Strict posture: ONLY /health is open (liveness probes work without a key).
-    // Everything else — including read-only introspection — requires X-RGW-Key
-    // when RGW_API_KEY is set.
+    // Everything else — including read-only introspection — always requires X-RGW-Key.
     let public = Router::new()
         .route("/health", get(health));
 
-    // ── Protected endpoints (require X-RGW-Key when RGW_API_KEY is set) ──
+    // ── Protected endpoints (always require X-RGW-Key) ──
     // Everything except /health: read-only introspection AND mutations / actions
-    // / LLM-spend. Fail-open until the key is set on both sides. See audit C1/S3.
+    // / LLM-spend. Fail-closed: no key configured → 401. See audit C1/S3.
     let protected = Router::new()
         // read-only introspection
         .route("/stats", get(stats))
@@ -161,6 +164,8 @@ pub async fn serve(
         .route("/tom/record", post(tom_record_endpoint))
         // OpenAI-compatible chat (triggers a walk + paid LLM expression)
         .route("/v1/chat/completions", post(openai::chat_completions))
+        // Motor gate: inspect / approve / reject held actions (human only)
+        .merge(motor_routes(motor_gate))
         .route_layer(middleware::from_fn(require_auth));
 
     let app = public
@@ -191,16 +196,40 @@ pub async fn serve(
     Ok(())
 }
 
-/// Auth middleware for mutating / cost endpoints.
+/// Minimum recommended RGW_API_KEY length (shorter keys are accepted with a WARN).
+const MIN_STRONG_KEY_LEN: usize = 32;
+
+/// Validate the RGW_API_KEY value at startup. Unset, empty or whitespace → Err.
+/// Never echoes the value. Short keys are accepted with a WARN (existing
+/// deployments' key lengths are unknown, so they are not rejected).
+pub fn validate_api_key(v: Option<&str>) -> Result<(), String> {
+    match v.map(str::trim) {
+        None | Some("") => Err(
+            "RGW_API_KEY is not set (or is empty). RGW refuses to start without it. \
+             Generate one with `openssl rand -hex 32`, set RGW_API_KEY, and send it \
+             as the X-RGW-Key header from callers."
+                .to_string(),
+        ),
+        Some(k) => {
+            if k.len() < MIN_STRONG_KEY_LEN {
+                tracing::warn!(
+                    "[rgw] RGW_API_KEY is shorter than {} characters; consider `openssl rand -hex 32`",
+                    MIN_STRONG_KEY_LEN
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Auth middleware for every route except /health.
 /// Convention shared with the deployed backends: the secret travels as the
-/// `X-RGW-Key` header and matches the `RGW_API_KEY` env var. Fail-open when
-/// `RGW_API_KEY` is unset on this side (preserves behaviour during graceful
-/// rollout — the callers send nothing until the key is set on both sides);
-/// fail-closed once it is configured. Only /health bypasses this (liveness).
+/// `X-RGW-Key` header and matches the `RGW_API_KEY` env var. Fail-closed: if
+/// `RGW_API_KEY` is unset or empty here, every request gets 401 (main() also
+/// refuses to start in that case; this is the second line of defence).
 async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {
-    let Some(expected) = std::env::var("RGW_API_KEY").ok().filter(|s| !s.is_empty()) else {
-        // Fail-open: no key configured → allow (a startup WARN already fired).
-        return Ok(next.run(req).await);
+    let Some(expected) = std::env::var("RGW_API_KEY").ok().filter(|s| !s.trim().is_empty()) else {
+        return Err(StatusCode::UNAUTHORIZED);
     };
 
     let presented = req
@@ -239,7 +268,97 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         db_connected: db_ok,
         version: env!("CARGO_PKG_VERSION").into(),
         runtime: "rust".into(),
+        motor_mode: state.motor_gate.mode().as_str().into(),
     })
+}
+
+/// Motor gate routes. Mounted inside the protected router (behind require_auth).
+fn motor_routes<S: Clone + Send + Sync + 'static>(gate: Arc<crate::motor::MotorGate>) -> Router<S> {
+    Router::new()
+        .route("/motor/proposals", get(motor_proposals))
+        .route("/motor/proposals/{id}/approve", post(motor_approve))
+        .route("/motor/proposals/{id}/reject", post(motor_reject))
+        .with_state(gate)
+}
+
+fn gate_error_response(e: crate::motor::GateError) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::motor::GateError;
+    let (code, msg) = match e {
+        GateError::NotFound => (StatusCode::NOT_FOUND, "proposal not found"),
+        GateError::AlreadyDecided => (StatusCode::CONFLICT, "proposal already decided"),
+        GateError::Expired => (StatusCode::GONE, "proposal expired"),
+    };
+    (code, Json(serde_json::json!({"error": msg})))
+}
+
+/// GET /motor/proposals
+async fn motor_proposals(State(gate): State<Arc<crate::motor::MotorGate>>) -> Json<serde_json::Value> {
+    Json(gate.snapshot())
+}
+
+/// POST /motor/proposals/{id}/approve — human only. Body must be exactly {"confirm":"yes"}.
+async fn motor_approve(
+    State(gate): State<Arc<crate::motor::MotorGate>>,
+    Path(id): Path<u64>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let confirmed = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("confirm").and_then(|c| c.as_str()).map(|c| c == "yes"))
+        .unwrap_or(false);
+    if !confirmed {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "approve requires the JSON body {\"confirm\": \"yes\"}; nothing was sent"})),
+        );
+    }
+    match gate.approve(id).await {
+        Ok(p) => {
+            tracing::warn!(
+                "[motor] APPROVED proposal #{} action={} domain={} result={:?}",
+                p.id, p.command.action, p.command.domain, p.send_result
+            );
+            (StatusCode::OK, Json(serde_json::to_value(&p).unwrap_or_default()))
+        }
+        Err(e) => gate_error_response(e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct RejectBody {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// POST /motor/proposals/{id}/reject — optional body {"note": "..."}.
+async fn motor_reject(
+    State(gate): State<Arc<crate::motor::MotorGate>>,
+    Path(id): Path<u64>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let note = if body.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<RejectBody>(&body) {
+            Ok(b) => b.note,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "body must be JSON like {\"note\": \"...\"}"})),
+                );
+            }
+        }
+    };
+    match gate.reject(id, note) {
+        Ok(p) => {
+            tracing::warn!(
+                "[motor] REJECTED proposal #{} action={} domain={}",
+                p.id, p.command.action, p.command.domain
+            );
+            (StatusCode::OK, Json(serde_json::to_value(&p).unwrap_or_default()))
+        }
+        Err(e) => gate_error_response(e),
+    }
 }
 
 /// POST /walk — main cognitive endpoint
@@ -290,8 +409,8 @@ async fn walk(
             .unwrap_or(50);
         let periodic = sm.critic_sessions_since_llm > interval
             && diagnosis.primary_diagnosis != crate::metacog::DiagnosisLabel::Rest;
-        if escalate || periodic {
-            if let Some(ref provider) = state.provider {
+        if (escalate || periodic)
+            && let Some(ref provider) = state.provider {
                 let summary = crate::metacog::build_session_summary(&output, &walker_results, &sm);
                 let (system, user) = crate::metacog::build_critic_llm_prompt(&diagnosis, &summary);
 
@@ -299,7 +418,6 @@ async fn walk(
                 let result = provider.generate(&system, &user, 0.5, escalate, Some(256), 0.3).await;
                 crate::metacog::run_llm_critic(&diagnosis, &summary, &mut sm, &result.text).await;
             }
-        }
     }
 
     // Restore previous mode if we overrode it
@@ -535,8 +653,10 @@ async fn execute_tool_endpoint(
     // Feed tool result through self-model
     {
         let mut sm = state.self_model.lock().await;
+        // A motor hold (gate not live) is not a failure.
+        let held = result.metadata.get("held").and_then(|v| v.as_bool()) == Some(true);
         let signal = crate::core::Signal::new(
-            if result.success { "tool_success" } else { "tool_failure" },
+            if result.success { "tool_success" } else if held { "motor_held" } else { "tool_failure" },
             &format!("{}: {}", result.tool, crate::core::safe_truncate(&result.content, 100)),
         ).with_intensity(if result.success { 0.3 } else { 0.2 });
         crate::core::process(signal, &mut sm);
@@ -891,16 +1011,16 @@ async fn ingest_signal_endpoint(
                                 edge_id: 0,
                                 source_id: *node_id,
                                 target_id: *node_id, // self-loop: activate the node itself
-                                delta: *similarity as f32 * req.intensity,
+                                delta: *similarity * req.intensity,
                                 edge_type: "activated_by".into(),
                             });
                         }
                         tracing::debug!(
                             "[ingest] Content matched {} nodes (best sim={:.2}), injected energy",
                             nodes.len(),
-                            nodes.first().map(|(_, s, _)| *s as f32).unwrap_or(0.0)
+                            nodes.first().map(|(_, s, _)| *s).unwrap_or(0.0)
                         );
-                        nodes.iter().map(|(id, sim, _)| (*id, *sim as f32)).collect()
+                        nodes.iter().map(|(id, sim, _)| (*id, (*sim))).collect()
                     }
                     Err(e) => {
                         tracing::debug!("[ingest] find_similar_nodes failed: {}", e);
@@ -1050,12 +1170,17 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::get;
 
+    /// Serialises tests that mutate RGW_API_KEY (process env is shared across test threads).
+    static API_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct ApiKeyGuard {
         previous: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ApiKeyGuard {
         fn set(value: Option<&str>) -> Self {
+            let lock = API_KEY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let previous = std::env::var("RGW_API_KEY").ok();
             match value {
                 Some(v) => {
@@ -1067,7 +1192,7 @@ mod tests {
                     unsafe { std::env::remove_var("RGW_API_KEY") };
                 }
             }
-            Self { previous }
+            Self { previous, _lock: lock }
         }
     }
 
@@ -1131,7 +1256,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // Fail-open behavior when key is unset.
+        // Fail-closed when the key is unset: 401 even with a header.
         // Safety: scoped mutation restored by guard drop.
         unsafe { std::env::remove_var("RGW_API_KEY") };
         let res = client
@@ -1139,9 +1264,132 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = client
+            .get(format!("{}/metacog/config", base_url))
+            .header("X-RGW-Key", "")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Empty key configured → also 401.
+        // Safety: scoped mutation restored by guard drop.
+        unsafe { std::env::set_var("RGW_API_KEY", "") };
+        let res = client
+            .get(format!("{}/metacog/config", base_url))
+            .header("X-RGW-Key", "")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
         server.abort();
+        drop(guard);
+    }
+
+    #[test]
+    fn validate_api_key_table() {
+        assert!(validate_api_key(None).is_err());
+        assert!(validate_api_key(Some("")).is_err());
+        assert!(validate_api_key(Some("   ")).is_err());
+        assert!(validate_api_key(Some("short")).is_ok(), "short keys warn, not reject");
+        let dummy = "0123456789abcdef".repeat(4); // 64-hex dummy
+        assert!(validate_api_key(Some(&dummy)).is_ok());
+
+        let msg = validate_api_key(Some("  ")).unwrap_err();
+        assert!(msg.contains("RGW_API_KEY"));
+        assert!(msg.contains("openssl rand -hex 32"));
+    }
+
+    #[tokio::test]
+    async fn t5_motor_routes_auth_and_confirm() {
+        use crate::motor::{DispatchOutcome, MotorGate, MotorMode, test_support};
+        use std::sync::atomic::Ordering;
+
+        let guard = ApiKeyGuard::set(Some("test-key"));
+        let (capture_url, hits, capture) = test_support::spawn_capture().await;
+
+        let gate = Arc::new(MotorGate::new(MotorMode::Propose));
+        let DispatchOutcome::Queued(id) = gate.dispatch("diverger", &capture_url, test_support::cmd("journal")).await
+        else {
+            panic!("expected Queued")
+        };
+
+        let app: Router = motor_routes(gate.clone()).route_layer(middleware::from_fn(require_auth));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+
+        // No key → 401.
+        let res = client.get(format!("{}/motor/proposals", base)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // With key → snapshot shows the pending proposal.
+        let res = client
+            .get(format!("{}/motor/proposals", base))
+            .header("X-RGW-Key", "test-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let snap: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(snap["mode"], "propose");
+        assert_eq!(snap["pending"].as_array().unwrap().len(), 1);
+
+        let approve = format!("{}/motor/proposals/{}/approve", base, id);
+        // Missing body, wrong value, wrong case → 400, nothing sent.
+        for body in [None, Some(r#"{"confirm":"y"}"#), Some(r#"{"confirm":"YES"}"#), Some("not json")] {
+            let mut req = client.post(&approve).header("X-RGW-Key", "test-key");
+            if let Some(b) = body {
+                req = req.header("content-type", "application/json").body(b);
+            }
+            let res = req.send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body {:?}", body);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // Approve with confirm but without the key → 401, nothing sent.
+        let res = client.post(&approve).json(&serde_json::json!({"confirm": "yes"})).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // Proper approve → 200, exactly one POST.
+        let res = client
+            .post(&approve)
+            .header("X-RGW-Key", "test-key")
+            .json(&serde_json::json!({"confirm": "yes"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let p: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(p["status"], "approved_sent");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Again → 409; unknown → 404; neither sends.
+        let res = client
+            .post(&approve)
+            .header("X-RGW-Key", "test-key")
+            .json(&serde_json::json!({"confirm": "yes"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let res = client
+            .post(format!("{}/motor/proposals/9999/reject", base))
+            .header("X-RGW-Key", "test-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        server.abort();
+        capture.abort();
         drop(guard);
     }
 }

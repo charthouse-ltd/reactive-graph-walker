@@ -16,7 +16,7 @@ use rand::Rng;
 use rayon::prelude::*;
 use sqlx::PgPool;
 
-use crate::core::{self, Signal, SelfModel, Noticing, safe_truncate};
+use crate::core::{self, Signal, SelfModel, safe_truncate};
 use crate::db;
 use crate::edge_cache::EdgeCache;
 use crate::graph::*;
@@ -29,7 +29,7 @@ pub fn walk_single(
     cache: &EdgeCache,
     seed_id: i32,
     bias: WalkerBias,
-    emotion: &EmotionalState,
+    _emotion: &EmotionalState,
     steps: usize,
     self_model: &mut SelfModel,
     collective: &Arc<Mutex<WalkerCollective>>,
@@ -278,7 +278,7 @@ pub fn walk_single(
 /// Returns (WalkOutput, per-walker results) for post-walk analysis.
 pub async fn walk_parallel(
     pool: &PgPool,
-    emotion: &EmotionalState,
+    _emotion: &EmotionalState,
     n_walkers: usize,
     steps: usize,
     self_model: &std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
@@ -690,7 +690,7 @@ async fn aggregate(
     let novel_connections = total_surprises;
 
     // Recommended action
-    let action = recommend_action(agreement, novelty, &results);
+    let action = recommend_action(agreement, novelty, results);
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     let hops_per_sec = if total_ms > 0.0 {
@@ -898,6 +898,7 @@ fn empty_output() -> WalkOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Noticing;
 
     fn wr(path: Vec<i32>, total_weight: f32) -> WalkerResult {
         WalkerResult {
