@@ -179,17 +179,6 @@ pub fn metacognitive_loop(
     self_model: &mut SelfModel,
     max_attempts: u32,
 ) -> Option<ValidatedAction> {
-    metacognitive_loop_inner(walk, self_model, max_attempts, crate::metrics::record_metacog_decision)
-}
-
-/// Body of [`metacognitive_loop`] with the approval-metric recorder injected, so tests can run
-/// the real loop without mutating process-global METRICS (which walker/dream read).
-fn metacognitive_loop_inner(
-    walk: &WalkOutput,
-    self_model: &mut SelfModel,
-    max_attempts: u32,
-    mut record_decision: impl FnMut(bool),
-) -> Option<ValidatedAction> {
     let mut attempt = 0;
     let mut prior_critiques: Vec<String> = Vec::new();
 
@@ -235,7 +224,10 @@ fn metacognitive_loop_inner(
         ).with_domain(&proposed.domain)
          .with_intensity(if evaluation.approved { 0.3 } else { 0.5 });
         crate::core::process(signal, self_model);
-        record_decision(evaluation.approved);
+        // Unit tests run the real loop without mutating process-global METRICS (read by
+        // walker/dream under parallel tests). Production records exactly as before.
+        #[cfg(not(test))]
+        crate::metrics::record_metacog_decision(evaluation.approved);
 
         if evaluation.approved {
             return Some(ValidatedAction {
@@ -2818,15 +2810,15 @@ mod tests {
 
         let mut legacy = base.clone();
         legacy.agreement_metric = crate::core::AgreementMetric::Legacy;
-        assert!(metacognitive_loop_inner(&walk, &mut legacy, 2, |_| {}).is_none(), "Legacy reads 0.0 → rejected");
+        assert!(metacognitive_loop(&walk, &mut legacy, 2).is_none(), "Legacy reads 0.0 → rejected");
 
         let mut domain = base.clone();
         domain.agreement_metric = crate::core::AgreementMetric::Domain;
-        assert!(metacognitive_loop_inner(&walk, &mut domain, 2, |_| {}).is_some(), "Domain reads 0.9 → approved");
+        assert!(metacognitive_loop(&walk, &mut domain, 2).is_some(), "Domain reads 0.9 → approved");
 
         let mut unknown = base.clone();
         unknown.agreement_metric = crate::core::AgreementMetric::Unknown;
-        assert!(metacognitive_loop_inner(&walk, &mut unknown, 2, |_| {}).is_none(), "Unknown behaves as Legacy");
+        assert!(metacognitive_loop(&walk, &mut unknown, 2).is_none(), "Unknown behaves as Legacy");
     }
 
     // ── Stage 2: rule trials, replay, rollback (PROTOCOL-self-selection §#2, §Compliance) ──
@@ -3197,9 +3189,8 @@ mod tests {
             let entry = ReplayEntry::from_walk(&walk, &sm, 0.0);
             let cfg = RuleConfigSnapshot::of(&sm);
             let replay = replay_decide(&entry, &cfg, sm.agreement_metric, max_attempts);
-            // The real loop (same body as metacognitive_loop) with a no-op approval recorder,
-            // so this test does not mutate process-global METRICS.
-            let live = metacognitive_loop_inner(&walk, &mut sm.clone(), max_attempts, |_| {}).is_some();
+            // metacognitive_loop does not touch global METRICS under cfg(test) (see the loop).
+            let live = metacognitive_loop(&walk, &mut sm.clone(), max_attempts).is_some();
             assert_eq!(replay, live, "case {case}: replay_decide diverged from metacognitive_loop");
             if live { approved_n += 1 } else { rejected_n += 1 }
         }
