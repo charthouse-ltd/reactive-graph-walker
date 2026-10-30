@@ -142,6 +142,8 @@ pub async fn serve(
         .route("/self", get(self_state))
         .route("/metacog/config", get(get_metacog_config).post(set_metacog_config))
         .route("/selection/stage", post(set_selection_stage))
+        .route("/selection/stats", get(selection_stats))
+        .route("/selection/rollback", post(selection_rollback))
         .route("/tools", get(list_tools))
         .route("/music", get(music_endpoint))
         .route("/music/midi", get(music_midi_endpoint))
@@ -458,6 +460,8 @@ struct MetacogConfigPatch {
     learned_bias_rotation: Option<u64>,
     /// Spawn additional learned-bias profiles (bounded).
     spawn_bias_variants: Option<u8>,
+    /// "legacy" | "domain" — which agreement signal drives decisions (default legacy).
+    agreement_metric: Option<crate::core::AgreementMetric>,
 }
 
 /// POST /metacog/config — mutate metacognitive runtime config.
@@ -465,8 +469,24 @@ struct MetacogConfigPatch {
 async fn set_metacog_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MetacogConfigPatch>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Validate before taking the lock or mutating anything: an invalid patch applies nothing.
+    if let Err((status, body)) = validate_agreement_metric(req.agreement_metric) {
+        return (status, Json(body));
+    }
+
     let mut sm = state.self_model.lock().await;
+    let rules_before = crate::metacog::RuleConfigSnapshot::of(&sm);
+
+    if let Some(metric) = req.agreement_metric {
+        let prev = sm.agreement_metric;
+        sm.agreement_metric = metric;
+        tracing::warn!(
+            "[selection] agreement_metric {:?} -> {:?} (operator via /metacog/config)",
+            prev, sm.agreement_metric
+        );
+        crate::metacog::on_metric_change(&mut sm, prev);
+    }
 
     if let Some(v) = req.min_energy {
         sm.critic_rules.min_energy = v.clamp(0.05, 0.6);
@@ -491,10 +511,13 @@ async fn set_metacog_config(
         let has_draft = phases.iter().any(|p| p == &MetacogPhase::Draft);
         let has_critique = phases.iter().any(|p| p == &MetacogPhase::Critique);
         if !has_draft || !has_critique {
-            return Json(serde_json::json!({
+            // Fields earlier in this patch may already be applied (pre-existing partial apply);
+            // still log them and clear the watch like any operator rule edit.
+            crate::metacog::note_operator_rule_edit(&mut sm, &rules_before);
+            return (StatusCode::OK, Json(serde_json::json!({
                 "status": "error",
                 "error": "phase_order must include both 'draft' and 'critique'"
-            }));
+            })));
         }
         sm.metacog_phase_order = phases;
     }
@@ -507,10 +530,93 @@ async fn set_metacog_config(
         spawn_bias_variants_api(&mut sm, spawn);
     }
 
-    Json(serde_json::json!({
+    // Operator rule edits bypass Stage-2 trials by design (explicit human action): WARN-log
+    // them and clear any regression watch (its baseline no longer belongs to the accept).
+    crate::metacog::note_operator_rule_edit(&mut sm, &rules_before);
+
+    (StatusCode::OK, Json(serde_json::json!({
         "status": "ok",
         "config": metacog_config_json(&sm),
-    }))
+    })))
+}
+
+/// Validate the agreement_metric field of a /metacog/config patch. Only "legacy" and "domain"
+/// are settable; anything else (deserialized as Unknown) is a 400 with the error body.
+fn validate_agreement_metric(
+    metric: Option<crate::core::AgreementMetric>,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    match metric {
+        Some(crate::core::AgreementMetric::Unknown) => Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "status": "error",
+                "error": "agreement_metric must be 'legacy' or 'domain'"
+            }),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// GET /selection/stats — Stage 0-2 self-selection state (read-only). Auth-protected.
+async fn selection_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let sm = state.self_model.lock().await;
+    Json(selection_stats_json(&sm))
+}
+
+fn selection_stats_json(sm: &SelfModel) -> serde_json::Value {
+    const HISTORY_SHOWN: usize = 20;
+    let pool: Vec<serde_json::Value> = sm
+        .learned_biases
+        .iter()
+        .enumerate()
+        .map(|(i, b)| serde_json::json!({
+            "index": i,
+            "walks": b.scorecard.walks,
+            "fitness": b.scorecard.fitness,
+            "niche": crate::graph::behavioural_niche(&b.scorecard),
+        }))
+        .collect();
+    let history: Vec<&crate::metacog::RuleTrialRecord> =
+        sm.rule_trial_history.iter().rev().take(HISTORY_SHOWN).collect();
+    serde_json::json!({
+        "self_mod_stage": sm.self_mod_stage,
+        "agreement_metric": sm.agreement_metric,
+        "trials_live": crate::metacog::trials_live(sm),
+        "pool": pool,
+        "live_pool_fitness": crate::metacog::live_pool_fitness(sm),
+        "pending_rule_proposals": sm.pending_rule_proposals,
+        "rule_trial_history_latest_first": history,
+        "rollback_depth": sm.rule_rollback_entries.len(),
+        "newest_rollback_changed_fields": sm.rule_rollback_entries.back().map(|e| e.changed_field_names()),
+        "regression_watch": sm.rule_regression_watch,
+        "replay_buffer": {"len": sm.recent_walk_fitness.len(), "required": crate::metacog::REPLAY_M},
+        "trial_config": crate::metacog::RULE_TRIAL_CONFIG,
+    })
+}
+
+/// POST /selection/rollback — restore the rule config replaced by the last accepted trial.
+/// 409 when the rollback ring is empty. Auth-protected, operator action, WARN-logged.
+async fn selection_rollback(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    let mut sm = state.self_model.lock().await;
+    match crate::metacog::rollback_last_rule(&mut sm) {
+        Some(out) => {
+            tracing::warn!(
+                "[selection] ROLLBACK by operator via /selection/rollback; restored {:?}, skipped {:?} (depth now {})",
+                out.restored, out.skipped, sm.rule_rollback_entries.len()
+            );
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "ok",
+                "restored_fields": out.restored,
+                "skipped_fields": out.skipped,
+                "entry": out.entry,
+                "rollback_depth": sm.rule_rollback_entries.len(),
+            })))
+        }
+        None => (StatusCode::CONFLICT, Json(serde_json::json!({
+            "status": "error",
+            "error": "rollback ring is empty",
+        }))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -530,6 +636,7 @@ async fn set_selection_stage(
     let prev = sm.self_mod_stage;
     sm.self_mod_stage = req.stage;
     tracing::warn!("[selection] self_mod_stage {:?} -> {:?} (operator via /selection/stage)", prev, sm.self_mod_stage);
+    crate::metacog::on_stage_change(&mut sm, prev);
     Json(serde_json::json!({
         "status": "ok",
         "previous": format!("{:?}", prev),
@@ -570,6 +677,7 @@ fn metacog_config_json(sm: &SelfModel) -> serde_json::Value {
             "wound_confidence_floor": sm.critic_rules.wound_confidence_floor,
         },
         "phase_order": sm.metacog_phase_order,
+        "agreement_metric": sm.agreement_metric,
         "learned_bias_count": sm.learned_biases.len(),
         "learned_bias_rotation": sm.learned_bias_rotation,
         "active_goal_domain": sm.active_goal_domain,
@@ -1393,5 +1501,34 @@ mod tests {
         server.abort();
         capture.abort();
         drop(guard);
+    }
+
+    #[test]
+    fn selection_stats_json_reports_stage2_state() {
+        let sm = SelfModel::new();
+        let v = selection_stats_json(&sm);
+        assert_eq!(v["self_mod_stage"], "observability");
+        assert_eq!(v["agreement_metric"], "legacy");
+        assert_eq!(v["trials_live"], false);
+        assert_eq!(v["rollback_depth"], 0);
+        assert_eq!(v["replay_buffer"]["required"], crate::metacog::REPLAY_M);
+        assert!(v["regression_watch"].is_null());
+    }
+
+    #[test]
+    fn validate_agreement_metric_accepts_legacy_domain_rejects_unknown_with_400() {
+        use crate::core::AgreementMetric;
+        assert!(validate_agreement_metric(None).is_ok(), "field absent: nothing to validate");
+        assert!(validate_agreement_metric(Some(AgreementMetric::Legacy)).is_ok());
+        assert!(validate_agreement_metric(Some(AgreementMetric::Domain)).is_ok());
+        let (status, body) = validate_agreement_metric(Some(AgreementMetric::Unknown)).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], "error");
+
+        // The patch's own deserialization maps an unknown string to Unknown (→ 400), not a 422.
+        let patch: MetacogConfigPatch = serde_json::from_str(r#"{"agreement_metric":"domian"}"#).unwrap();
+        assert!(validate_agreement_metric(patch.agreement_metric).is_err());
+        let ok: MetacogConfigPatch = serde_json::from_str(r#"{"agreement_metric":"domain"}"#).unwrap();
+        assert!(validate_agreement_metric(ok.agreement_metric).is_ok());
     }
 }

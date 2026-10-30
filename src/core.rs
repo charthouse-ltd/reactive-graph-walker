@@ -106,7 +106,7 @@ pub struct Noticing {
 
 /// Runtime-tunable thresholds for the Tier-1 metacognitive critic.
 /// Stored in self-state so critique behavior can adapt without code edits.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct CriticRuleProfile {
     pub min_energy: f32,
     pub agreement_threshold_autonomous: f32,
@@ -168,6 +168,30 @@ impl SelfModStage {
     /// the Unknown catch-all are inert.
     pub fn allows_selection(&self) -> bool {
         matches!(self, SelfModStage::SelectionLive | SelfModStage::RuleTrialsLive)
+    }
+}
+
+/// Which walker-agreement signal drives `recommend_action` and the metacog hallucination check.
+/// Legacy = node-overlap `agreement` (≈0 by construction with dispersed seeds); Domain =
+/// `domain_agreement` (do walkers converge on a dominant domain?). Default Legacy, so behaviour
+/// is unchanged until an operator switches it via POST /metacog/config. Stage-2 rule trials
+/// refuse to apply anything unless this is Domain (PROTOCOL-self-selection §#2 prerequisite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgreementMetric {
+    #[default]
+    Legacy,
+    Domain,
+    /// Catch-all for an unknown string (downgrade-load). Behaves as Legacy. Without it an
+    /// unknown variant would error the whole deserialize and wipe the model.
+    #[serde(other)]
+    Unknown,
+}
+
+impl AgreementMetric {
+    /// True only for Domain; Legacy and Unknown both mean the legacy node-overlap metric.
+    pub fn is_domain(&self) -> bool {
+        matches!(self, AgreementMetric::Domain)
     }
 }
 
@@ -303,6 +327,27 @@ pub struct SelfModel {
     /// detect a mid-walk pool change and skip now-stale bias-credit attribution.
     #[serde(default)]
     pub pool_generation: u64,
+    /// Which agreement signal drives decisions (default Legacy). See AgreementMetric.
+    #[serde(default)]
+    pub agreement_metric: AgreementMetric,
+    // ── Stage 2 rule trials (PROTOCOL-self-selection §#2). All bounded; see metacog caps. ──
+    /// FIFO of critic rule deltas awaiting an offline trial (cap metacog::PENDING_CAP).
+    #[serde(default)]
+    pub pending_rule_proposals: VecDeque<crate::metacog::PendingRuleProposal>,
+    /// Accepted trials as before/after configs, newest last (cap metacog::ROLLBACK_N). Replaces
+    /// the pre-2.1 `rule_rollback_ring` (whole-snapshot elements); an old snapshot carrying that
+    /// field still loads (unknown fields are ignored) and starts with no entries.
+    #[serde(default)]
+    pub rule_rollback_entries: VecDeque<crate::metacog::RollbackEntry>,
+    /// Replay buffer of recent Autonomous walks + intrinsic fitness (cap metacog::REPLAY_M).
+    #[serde(default)]
+    pub recent_walk_fitness: VecDeque<crate::metacog::ReplayEntry>,
+    /// Outcomes of rule trials, shadow and live (cap metacog::TRIAL_HISTORY_CAP).
+    #[serde(default)]
+    pub rule_trial_history: VecDeque<crate::metacog::RuleTrialRecord>,
+    /// Live-regression guard armed by the last accepted trial.
+    #[serde(default)]
+    pub rule_regression_watch: Option<crate::metacog::RegressionWatch>,
 
     // ── Meta ──
     pub total_signals_processed: u64,
@@ -506,6 +551,12 @@ impl SelfModel {
             self_mod_stage: SelfModStage::default(),
             selection_cycle_counter: 0,
             pool_generation: 0,
+            agreement_metric: AgreementMetric::default(),
+            pending_rule_proposals: VecDeque::new(),
+            rule_rollback_entries: VecDeque::new(),
+            recent_walk_fitness: VecDeque::new(),
+            rule_trial_history: VecDeque::new(),
+            rule_regression_watch: None,
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,
@@ -1300,6 +1351,12 @@ mod tests {
         o.remove("selection_history");
         o.remove("self_mod_stage");
         o.remove("selection_cycle_counter");
+        o.remove("agreement_metric");
+        o.remove("pending_rule_proposals");
+        o.remove("rule_rollback_entries");
+        o.remove("recent_walk_fitness");
+        o.remove("rule_trial_history");
+        o.remove("rule_regression_watch");
         let s = serde_json::to_string(&v).unwrap();
         let loaded: Option<SelfModel> = serde_json::from_str(&s).ok();
         assert!(
@@ -1308,6 +1365,10 @@ mod tests {
         );
         let m = loaded.unwrap();
         assert_eq!(m.selection_history.len(), 0, "missing selection_history → empty ring");
+        assert_eq!(m.agreement_metric, AgreementMetric::Legacy, "missing agreement_metric → Legacy");
+        assert!(m.pending_rule_proposals.is_empty() && m.rule_rollback_entries.is_empty());
+        assert!(m.recent_walk_fitness.is_empty() && m.rule_trial_history.is_empty());
+        assert!(m.rule_regression_watch.is_none(), "missing Stage-2 fields → empty/None");
         assert_eq!(
             m.self_mod_stage,
             SelfModStage::Observability,
@@ -1342,5 +1403,40 @@ mod tests {
             !loaded.unwrap().self_mod_stage.allows_selection(),
             "unknown variant degrades to an inert stage"
         );
+    }
+
+    #[test]
+    fn agreement_metric_defaults_legacy_and_unknown_loads_as_legacy_not_wipe() {
+        assert_eq!(AgreementMetric::default(), AgreementMetric::Legacy);
+        assert_eq!(SelfModel::new().agreement_metric, AgreementMetric::Legacy, "ships legacy");
+        assert!(AgreementMetric::Domain.is_domain());
+        assert!(!AgreementMetric::Legacy.is_domain());
+        assert!(!AgreementMetric::Unknown.is_domain(), "Unknown behaves as Legacy");
+
+        let mut v = serde_json::to_value(SelfModel::new()).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("agreement_metric".into(), serde_json::json!("path_cosine_FUTURE"));
+        let s = serde_json::to_string(&v).unwrap();
+        let loaded: Option<SelfModel> = serde_json::from_str(&s).ok();
+        assert!(loaded.is_some(), "unknown agreement_metric must NOT wipe the model");
+        let m = loaded.unwrap();
+        assert_eq!(m.agreement_metric, AgreementMetric::Unknown);
+        assert!(!m.agreement_metric.is_domain(), "Unknown degrades to legacy behaviour");
+    }
+
+    #[test]
+    fn self_model_loads_with_pre_2_1_rule_rollback_ring() {
+        // Stage 2.1 replaced rule_rollback_ring (RuleConfigSnapshot elements) with
+        // rule_rollback_entries. An old snapshot still carrying a non-empty ring must load
+        // (unknown fields are ignored), not fail and wipe the model.
+        let mut v = serde_json::to_value(SelfModel::new()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("rule_rollback_entries");
+        let old_elem = serde_json::to_value(crate::metacog::RuleConfigSnapshot::of(&SelfModel::new())).unwrap();
+        o.insert("rule_rollback_ring".into(), serde_json::json!([old_elem]));
+        let loaded: Option<SelfModel> = serde_json::from_str(&serde_json::to_string(&v).unwrap()).ok();
+        assert!(loaded.is_some(), "old-format ring must not wipe the model");
+        assert!(loaded.unwrap().rule_rollback_entries.is_empty());
     }
 }

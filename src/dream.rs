@@ -605,10 +605,14 @@ pub fn start_dream_loop(
             // selection_observe captures the pre-selection pool as the cycle's baseline;
             // select_biases then cull/breeds — but only at SelectionLive+ (default Observability
             // logs would-cull/would-breed and commits nothing). Both Autonomous-only.
+            // Stage 2: at most one rule trial per cycle (shadow unless trials_live), then the
+            // live-regression guard (acts only when trials_live).
             {
                 let mut sm = self_model.lock().await;
                 selection_observe(&mut sm, &report);
                 crate::metacog::select_biases(&mut sm);
+                crate::metacog::trial_pending_rules(&mut sm);
+                crate::metacog::check_rule_regression(&mut sm);
             }
 
             // ── Homeostasis: prune weak nodes (DESTRUCTIVE, opt-in) ──

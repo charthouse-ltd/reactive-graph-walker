@@ -16,7 +16,7 @@ use rand::Rng;
 use rayon::prelude::*;
 use sqlx::PgPool;
 
-use crate::core::{self, Signal, SelfModel, safe_truncate};
+use crate::core::{self, AgreementMetric, Signal, SelfModel, safe_truncate};
 use crate::db;
 use crate::edge_cache::EdgeCache;
 use crate::graph::*;
@@ -342,6 +342,7 @@ pub async fn walk_parallel(
     let learned_len = base_sm.learned_biases.len();
     let learned_rotation = base_sm.learned_bias_rotation as usize;
     let base_pool_generation = base_sm.pool_generation; // detect a Stage-1 cull/breed mid-walk
+    let agreement_metric = base_sm.agreement_metric; // Legacy (default) or Domain — see aggregate()
 
     // Create shared stigmergic collective — walkers leave trails for each other
     let collective = Arc::new(Mutex::new(WalkerCollective::new()));
@@ -374,6 +375,9 @@ pub async fn walk_parallel(
 
     // ── Flush edge cache writes to DB ──
     let _ = cache.flush().await;
+
+    // Stage 2 replay buffer: session-mean intrinsic fitness (Autonomous only; set below).
+    let mut session_fitness: Option<f32> = None;
 
     // Merge per-walker self-models back into the shared self-model
     // Each walker saw different things — integrate all perspectives
@@ -489,6 +493,19 @@ pub async fn walk_parallel(
                 }
             }
         }
+        // Stage 2: per-walker intrinsic f_walk (same formula as ProfileFitness::record),
+        // averaged over the session for the replay buffer. Approval is NOT an input.
+        // Independent of pool_stable: it does not credit any profile.
+        if accumulate_fitness && !results.is_empty() {
+            let total: f32 = results
+                .iter()
+                .map(|(result, _)| {
+                    let (nov, surprise_kept, dead_end_rate) = crate::graph::fitness_inputs(result);
+                    crate::graph::walk_intrinsic(&selection_weights, nov, surprise_kept, dead_end_rate, session_repetition)
+                })
+                .sum();
+            session_fitness = Some(total / results.len() as f32);
+        }
         sm.learned_bias_rotation = sm.learned_bias_rotation.wrapping_add(1);
     }
 
@@ -496,7 +513,16 @@ pub async fn walk_parallel(
     let walker_results: Vec<WalkerResult> = results.into_iter().map(|(r, _)| r).collect();
 
     // Aggregate results (borrows walker_results, doesn't consume)
-    let output = aggregate(pool, &walker_results, walk_ms, start).await;
+    let output = aggregate(pool, &walker_results, walk_ms, start, agreement_metric).await;
+
+    // Stage 2: record this walk for offline rule-trial replay (Autonomous only, bounded).
+    if let Some(fitness) = session_fitness {
+        let mut sm = self_model.lock().await;
+        if sm.mode == core::CognitiveMode::Autonomous {
+            let entry = crate::metacog::ReplayEntry::from_walk(&output, &sm, fitness);
+            crate::metacog::record_replay_entry(&mut sm, entry);
+        }
+    }
 
     // Behavioral integration metric: track novelty and repetition tendency.
     let repeated = {
@@ -588,6 +614,49 @@ fn classify_votes(
     (consensus, divergent, blind_spots)
 }
 
+/// Node-vote statistics for one session (pure): votes per node, the consensus / divergent /
+/// blind-spot partition, total hops, legacy node-overlap `agreement`, and `novelty`.
+struct VoteStats {
+    node_votes: HashMap<i32, usize>,
+    consensus: Vec<i32>,
+    divergent: Vec<i32>,
+    blind_spots: Vec<i32>,
+    total_hops: usize,
+    agreement: f32,
+    novelty: f32,
+}
+
+fn vote_stats(results: &[WalkerResult]) -> VoteStats {
+    let n = results.len();
+    // Vote counting: which nodes did walkers visit?
+    let mut node_votes: HashMap<i32, usize> = HashMap::new();
+    let mut total_hops = 0;
+    for r in results {
+        for &node_id in &r.path {
+            *node_votes.entry(node_id).or_insert(0) += 1;
+        }
+        total_hops += r.path.len();
+    }
+
+    // Classify nodes by agreement level (pure, complete partition — see helper).
+    let (consensus, divergent, blind_spots) = classify_votes(&node_votes, n);
+
+    // Agreement & novelty scores
+    let total_unique = node_votes.len().max(1);
+    let agreement = consensus.len() as f32 / total_unique as f32;
+    let total_surprises: usize = results.iter().map(|r| r.surprises).sum();
+    let novelty = ((divergent.len() + total_surprises) as f32 / total_unique as f32).min(1.0);
+
+    VoteStats { node_votes, consensus, divergent, blind_spots, total_hops, agreement, novelty }
+}
+
+/// The agreement value that drives `recommend_action`: domain-level when the operator has
+/// switched `agreement_metric` to Domain, otherwise the legacy node-overlap value
+/// (Legacy and Unknown both mean legacy).
+fn effective_agreement(metric: AgreementMetric, legacy: f32, domain: f32) -> f32 {
+    if metric.is_domain() { domain } else { legacy }
+}
+
 /// Domain-level agreement — robust to dispersed seeds, unlike node-overlap `agreement`.
 /// Each walker's dominant domain is its most-visited; the score is the fraction of
 /// domain-voting walkers whose dominant domain matches the modal dominant. Walkers that
@@ -640,24 +709,16 @@ async fn aggregate(
     results: &[WalkerResult],
     walk_ms: f64,
     start: Instant,
+    agreement_metric: AgreementMetric,
 ) -> WalkOutput {
     let n = results.len();
     if n == 0 {
         return empty_output();
     }
 
-    // Vote counting: which nodes did walkers visit?
-    let mut node_votes: HashMap<i32, usize> = HashMap::new();
-    let mut total_hops = 0;
-    for r in results {
-        for &node_id in &r.path {
-            *node_votes.entry(node_id).or_insert(0) += 1;
-        }
-        total_hops += r.path.len();
-    }
-
-    // Classify nodes by agreement level (pure, complete partition — see helper).
-    let (consensus, divergent, blind_spots) = classify_votes(&node_votes, n);
+    // Vote counting + partition + legacy agreement/novelty (pure helper).
+    let VoteStats { node_votes, consensus, divergent, blind_spots, total_hops, agreement, novelty } =
+        vote_stats(results);
 
     // Domain distribution
     let mut domain_counts: HashMap<String, usize> = HashMap::new();
@@ -672,14 +733,11 @@ async fn aggregate(
         .map(|(k, _)| k.clone())
         .unwrap_or_default();
 
-    // Agreement & novelty scores
-    let total_unique = node_votes.len().max(1);
-    let agreement = consensus.len() as f32 / total_unique as f32;
-    // Observability (PROTOCOL-self-selection §#2): domain-level agreement, robust to the
-    // dispersed-seed structural zero in node-overlap `agreement`. Logged, not yet acted on.
+    // PROTOCOL-self-selection §#2: domain-level agreement, robust to the dispersed-seed
+    // structural zero in node-overlap `agreement`. Always reported; it drives
+    // recommend_action only when agreement_metric == Domain (default Legacy).
     let domain_agree = domain_agreement(results);
     let total_surprises: usize = results.iter().map(|r| r.surprises).sum();
-    let novelty = ((divergent.len() + total_surprises) as f32 / total_unique as f32).min(1.0);
 
     // Emotional resonance: how strongly the collective moved through well-worn
     // (high-weight) edges vs. weak/random ones (pure helper). Previously this
@@ -689,8 +747,9 @@ async fn aggregate(
     // Novel connections count
     let novel_connections = total_surprises;
 
-    // Recommended action
-    let action = recommend_action(agreement, novelty, results);
+    // Recommended action (agreement_score below always keeps the legacy value)
+    let effective = effective_agreement(agreement_metric, agreement, domain_agree);
+    let action = recommend_action(effective, novelty, results);
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     let hops_per_sec = if total_ms > 0.0 {
@@ -731,6 +790,7 @@ async fn aggregate(
         primary_domain,
         domain_distribution: domain_counts,
         agreement_score: agreement,
+        domain_agreement_score: domain_agree,
         novelty_score: novelty,
         emotional_resonance: resonance,
         search_query: None,
@@ -747,10 +807,14 @@ async fn aggregate(
     }
 }
 
+/// "express" threshold for recommend_action. Tuned for the legacy metric; reused unchanged for
+/// the domain metric (unresolved design parameter — PROTOCOL-self-selection Q3).
+const EXPRESS_AGREEMENT_THRESHOLD: f32 = 0.6;
+
 fn recommend_action(agreement: f32, novelty: f32, results: &[WalkerResult]) -> String {
     let total_surprises: usize = results.iter().map(|r| r.surprises).sum();
 
-    if agreement > 0.6 {
+    if agreement > EXPRESS_AGREEMENT_THRESHOLD {
         "express".to_string()
     } else if novelty > 0.6 {
         "explore".to_string()
@@ -879,6 +943,7 @@ fn empty_output() -> WalkOutput {
         primary_domain: String::new(),
         domain_distribution: HashMap::new(),
         agreement_score: 0.0,
+        domain_agreement_score: 0.0,
         novelty_score: 0.0,
         emotional_resonance: 0.0,
         search_query: None,
@@ -1012,5 +1077,52 @@ mod tests {
         assert!(shared.valence > 0.0 && shared.valence < 1.0, "emotion blended, not replaced");
         assert_eq!(shared.attention_patterns.get("markets"), Some(&2.0), "attention delta merged");
         assert!(shared.noticings.iter().any(|n| n.observation == "unexpected link"));
+    }
+
+    // ── Stage 2 Step 1: flag-gated domain agreement ──
+
+    fn wr_surprises(surprises: usize) -> WalkerResult {
+        WalkerResult { surprises, ..wr(vec![1, 2], 1.0) }
+    }
+
+    #[test]
+    fn recommend_action_legacy_table_matches_pre_flag_behaviour() {
+        // (agreement, novelty, total surprises) -> action, exactly as the code always did.
+        let cases: &[(f32, f32, usize, &str)] = &[
+            (0.61, 0.0, 0, "express"),
+            (0.60, 0.0, 0, "rest"),     // strict >
+            (0.60, 0.61, 0, "explore"),
+            (0.0, 0.60, 3, "search"),   // strict > on novelty
+            (0.0, 0.0, 2, "rest"),
+            (0.9, 0.9, 5, "express"),   // agreement wins the tie-break order
+        ];
+        for &(agreement, novelty, surprises, want) in cases {
+            let results = vec![wr_surprises(surprises)];
+            let eff = effective_agreement(AgreementMetric::Legacy, agreement, 0.99);
+            assert_eq!(eff, agreement, "Legacy must pass the legacy value through");
+            assert_eq!(recommend_action(eff, novelty, &results), want, "{agreement} {novelty} {surprises}");
+        }
+        // Unknown behaves exactly like Legacy.
+        assert_eq!(effective_agreement(AgreementMetric::Unknown, 0.1, 0.99), 0.1);
+    }
+
+    #[test]
+    fn domain_metric_expresses_on_shared_domain_with_disjoint_paths_legacy_does_not() {
+        // Same fixture as domain_agreement_high_when_walkers_share_domain_despite_disjoint_paths.
+        let results = vec![
+            wr_dom(vec![1, 2], &["markets", "markets", "risk"]),
+            wr_dom(vec![3, 4], &["markets", "markets", "trading"]),
+            wr_dom(vec![5, 6], &["markets", "markets"]),
+        ];
+        let v = vote_stats(&results);
+        let dom = domain_agreement(&results);
+        assert_eq!(v.agreement, 0.0, "disjoint paths: legacy node-overlap agreement is 0");
+
+        let legacy = recommend_action(
+            effective_agreement(AgreementMetric::Legacy, v.agreement, dom), v.novelty, &results);
+        let domain = recommend_action(
+            effective_agreement(AgreementMetric::Domain, v.agreement, dom), v.novelty, &results);
+        assert_eq!(domain, "express", "Domain: all walkers converge on 'markets'");
+        assert_ne!(legacy, "express", "Legacy: structural zero never expresses");
     }
 }
