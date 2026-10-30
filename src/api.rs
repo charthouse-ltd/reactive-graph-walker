@@ -511,6 +511,9 @@ async fn set_metacog_config(
         let has_draft = phases.iter().any(|p| p == &MetacogPhase::Draft);
         let has_critique = phases.iter().any(|p| p == &MetacogPhase::Critique);
         if !has_draft || !has_critique {
+            // Fields earlier in this patch may already be applied (pre-existing partial apply);
+            // still log them and clear the watch like any operator rule edit.
+            crate::metacog::note_operator_rule_edit(&mut sm, &rules_before);
             return (StatusCode::OK, Json(serde_json::json!({
                 "status": "error",
                 "error": "phase_order must include both 'draft' and 'critique'"
