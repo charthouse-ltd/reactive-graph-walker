@@ -17,11 +17,14 @@
 //! If LLM is unavailable, the algorithmic diagnosis alone drives adjustments.
 //! The system degrades gracefully — no LLM dependency for core function.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{AudienceBeliefs, CognitiveMode, MetacogPhase, Noticing, SelfModel, Signal};
+use crate::core::{
+    AgreementMetric, AudienceBeliefs, CognitiveMode, CriticRuleProfile, MetacogPhase, Noticing,
+    SelfModStage, SelfModel, Signal,
+};
 use crate::graph::{WalkOutput, WalkerResult};
 
 /// The agent's cognitive state. Cannot skip steps.
@@ -158,7 +161,7 @@ pub struct CriticAdjustment {
 }
 
 /// Runtime updates for Tier-1 critique thresholds.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CriticRuleDelta {
     pub min_energy: Option<f32>,
     pub agreement_threshold_autonomous: Option<f32>,
@@ -192,48 +195,22 @@ pub fn metacognitive_loop(
         }
 
         // Phase 1: Draft a plan from walker output
-        let proposed = ProposedAction {
-            action: walk.recommended_action.clone(),
-            domain: walk.primary_domain.clone(),
-            reasoning: format!(
-                "Agreement {:.0}%, novelty {:.0}%, {} perspectives",
-                walk.agreement_score * 100.0,
-                walk.novelty_score * 100.0,
-                walk.walker_count,
-            ),
-            confidence: walk.agreement_score,
+        let mut proposed = draft_proposal(
+            &walk.recommended_action,
+            &walk.primary_domain,
+            walk.agreement_score,
+            walk.novelty_score,
+            walk.walker_count,
             // Hallucination check reads the operator-selected agreement signal; confidence
             // (and the wound floor that reads it) stays on the legacy score.
-            walker_agreement: if self_model.agreement_metric.is_domain() {
-                walk.domain_agreement_score
-            } else {
-                walk.agreement_score
-            },
-            walker_novelty: walk.novelty_score,
-            walker_context: String::new(), // Filled by caller
+            select_walker_agreement(self_model.agreement_metric, walk.agreement_score, walk.domain_agreement_score),
             attempt,
-            prior_critiques: prior_critiques.clone(),
-        };
+            &prior_critiques,
+        );
 
-        let mut proposed = proposed;
+        // Phases in configured order (shared with the Stage-2 pure replay).
         let phases = self_model.metacog_phase_order.clone();
-        let mut evaluation: Option<SelfEvaluation> = None;
-
-        for phase in phases {
-            match phase {
-                MetacogPhase::Draft => {}
-                MetacogPhase::ReflectivePause => {
-                    proposed.confidence = (proposed.confidence * 0.95).clamp(0.0, 1.0);
-                    proposed.reasoning = format!("{}; pause: rechecked assumptions", proposed.reasoning);
-                }
-                MetacogPhase::Critique => {
-                    evaluation = Some(critique(&proposed, self_model));
-                }
-            }
-        }
-
-        // Safety fallback: critique can never be skipped, even if phase order is misconfigured.
-        let evaluation = evaluation.unwrap_or_else(|| critique(&proposed, self_model));
+        let evaluation = run_phases(&mut proposed, &phases, |p| critique(p, self_model));
 
         // Feed through self-model (Julian notices his own deliberation)
         let signal = Signal::new(
@@ -265,25 +242,111 @@ pub fn metacognitive_loop(
     }
 }
 
+/// Phase-1 draft (shared by metacognitive_loop and the Stage-2 replay).
+#[allow(clippy::too_many_arguments)]
+fn draft_proposal(
+    action: &str,
+    domain: &str,
+    legacy_agreement: f32,
+    novelty: f32,
+    walker_count: usize,
+    walker_agreement: f32,
+    attempt: u32,
+    prior_critiques: &[String],
+) -> ProposedAction {
+    ProposedAction {
+        action: action.to_string(),
+        domain: domain.to_string(),
+        reasoning: format!(
+            "Agreement {:.0}%, novelty {:.0}%, {} perspectives",
+            legacy_agreement * 100.0,
+            novelty * 100.0,
+            walker_count,
+        ),
+        confidence: legacy_agreement,
+        walker_agreement,
+        walker_novelty: novelty,
+        walker_context: String::new(), // Filled by caller
+        attempt,
+        prior_critiques: prior_critiques.to_vec(),
+    }
+}
+
+/// The agreement value the hallucination check reads (Domain only when the operator chose it).
+fn select_walker_agreement(metric: AgreementMetric, legacy: f32, domain: f32) -> f32 {
+    if metric.is_domain() { domain } else { legacy }
+}
+
+/// Run the configured phases over a draft and return the evaluation.
+/// Safety fallback: critique can never be skipped, even if phase order is misconfigured.
+fn run_phases(
+    proposed: &mut ProposedAction,
+    phases: &[MetacogPhase],
+    mut critique_fn: impl FnMut(&ProposedAction) -> SelfEvaluation,
+) -> SelfEvaluation {
+    let mut evaluation: Option<SelfEvaluation> = None;
+    for phase in phases {
+        match phase {
+            MetacogPhase::Draft => {}
+            MetacogPhase::ReflectivePause => {
+                proposed.confidence = (proposed.confidence * 0.95).clamp(0.0, 1.0);
+                proposed.reasoning = format!("{}; pause: rechecked assumptions", proposed.reasoning);
+            }
+            MetacogPhase::Critique => {
+                evaluation = Some(critique_fn(proposed));
+            }
+        }
+    }
+    evaluation.unwrap_or_else(|| critique_fn(proposed))
+}
+
+/// The slice of self-model state critique() reads, captured for one domain.
+#[derive(Debug, Clone)]
+struct CritiqueContext {
+    mode: CognitiveMode,
+    energy: f32,
+    /// attention[domain] / total attention; None when total attention is 0.
+    attention_share: Option<f32>,
+    wound: Option<f32>,
+}
+
+impl CritiqueContext {
+    fn of(sm: &SelfModel, domain: &str) -> Self {
+        let domain_saturation = sm.attention_patterns.get(domain).copied().unwrap_or(0.0);
+        let total_attention: f32 = sm.attention_patterns.values().sum();
+        Self {
+            mode: sm.mode.clone(),
+            energy: sm.energy,
+            attention_share: (total_attention > 0.0).then(|| domain_saturation / total_attention),
+            wound: sm.wounds.get(domain).copied(),
+        }
+    }
+}
+
 /// Tier 1 critic: evaluate a proposed action against self-model state.
 /// Deterministic, no LLM. Checks safety, hallucination, efficiency, wounds.
 fn critique(proposed: &ProposedAction, sm: &SelfModel) -> SelfEvaluation {
+    critique_with(proposed, &CritiqueContext::of(sm, &proposed.domain), &sm.critic_rules)
+}
+
+/// Pure core of [`critique`]: reads only the captured context and the given rules.
+fn critique_with(proposed: &ProposedAction, ctx: &CritiqueContext, rules: &CriticRuleProfile) -> SelfEvaluation {
     let mut approved = true;
     let mut critiques: Vec<String> = Vec::new();
 
-    let safety = sm.energy > sm.critic_rules.min_energy;
+    let safety = ctx.energy > rules.min_energy;
     if !safety {
         approved = false;
         critiques.push(format!(
             "Energy too low ({:.0}%) — rest instead (min {:.0}%)",
-            sm.energy * 100.0,
-            sm.critic_rules.min_energy * 100.0
+            ctx.energy * 100.0,
+            rules.min_energy * 100.0
         ));
     }
 
-    let agreement_threshold = match sm.mode {
-        CognitiveMode::Autonomous => sm.critic_rules.agreement_threshold_autonomous,
-        CognitiveMode::Compliant => sm.critic_rules.agreement_threshold_compliant,
+    let agreement_threshold = match ctx.mode {
+        CognitiveMode::Autonomous => rules.agreement_threshold_autonomous,
+        CognitiveMode::Compliant => rules.agreement_threshold_compliant,
     };
     let hallucination = proposed.walker_agreement > agreement_threshold;
     if !hallucination {
@@ -296,28 +359,22 @@ fn critique(proposed: &ProposedAction, sm: &SelfModel) -> SelfEvaluation {
     }
 
     let efficiency;
-    if sm.mode == CognitiveMode::Autonomous {
-        let domain_saturation = sm.attention_patterns
-            .get(&proposed.domain)
-            .copied()
-            .unwrap_or(0.0);
-        let total_attention: f32 = sm.attention_patterns.values().sum();
-        efficiency = if total_attention > 0.0 {
-            domain_saturation / total_attention < sm.critic_rules.max_attention_saturation
-        } else {
-            true
+    if ctx.mode == CognitiveMode::Autonomous {
+        efficiency = match ctx.attention_share {
+            Some(share) => share < rules.max_attention_saturation,
+            None => true,
         };
         if !efficiency {
             approved = false;
             critiques.push(format!(
                 "{} already dominates attention ({:.0}%) — explore something else",
-                proposed.domain, domain_saturation / total_attention * 100.0
+                proposed.domain, ctx.attention_share.unwrap_or(0.0) * 100.0
             ));
         }
 
-        if let Some(&wound) = sm.wounds.get(&proposed.domain)
-            && wound > sm.critic_rules.wound_guard_threshold
-                && proposed.confidence < sm.critic_rules.wound_confidence_floor
+        if let Some(wound) = ctx.wound
+            && wound > rules.wound_guard_threshold
+                && proposed.confidence < rules.wound_confidence_floor
             {
                 approved = false;
                 critiques.push(format!(
@@ -780,7 +837,7 @@ pub async fn run_llm_critic(
         *entry = (*entry + delta).max(0.0);
     }
 
-    apply_rule_delta(sm, &adjustment.critic_rule_delta);
+    route_rule_delta(sm, &adjustment.critic_rule_delta, "llm_critic");
     spawn_bias_variants(sm, adjustment.spawn_bias_variants);
 
     let signal = Signal::new("critic_llm_adjustment", &format!(
@@ -816,7 +873,7 @@ pub fn apply_critic_adjustments(sm: &mut SelfModel, adj: &CriticAdjustment) {
         *entry = (*entry + delta).max(0.0);
     }
 
-    apply_rule_delta(sm, &adj.critic_rule_delta);
+    route_rule_delta(sm, &adj.critic_rule_delta, "algorithmic_critic");
     spawn_bias_variants(sm, adj.spawn_bias_variants);
 
     let signal = Signal::new("critic_adjustment", &format!(
@@ -827,30 +884,35 @@ pub fn apply_critic_adjustments(sm: &mut SelfModel, adj: &CriticAdjustment) {
 }
 
 fn apply_rule_delta(sm: &mut SelfModel, delta: &CriticRuleDelta) {
+    apply_rule_delta_parts(&mut sm.critic_rules, &mut sm.metacog_phase_order, delta);
+}
+
+/// The clamps of [`apply_rule_delta`], on bare parts (so trials can apply to a snapshot).
+fn apply_rule_delta_parts(rules: &mut CriticRuleProfile, phase_order: &mut Vec<MetacogPhase>, delta: &CriticRuleDelta) {
     if let Some(v) = delta.min_energy {
-        sm.critic_rules.min_energy = v.clamp(0.05, 0.6);
+        rules.min_energy = v.clamp(0.05, 0.6);
     }
     if let Some(v) = delta.agreement_threshold_autonomous {
-        sm.critic_rules.agreement_threshold_autonomous = v.clamp(0.05, 0.9);
+        rules.agreement_threshold_autonomous = v.clamp(0.05, 0.9);
     }
     if let Some(v) = delta.agreement_threshold_compliant {
-        sm.critic_rules.agreement_threshold_compliant = v.clamp(0.05, 0.95);
+        rules.agreement_threshold_compliant = v.clamp(0.05, 0.95);
     }
     if let Some(v) = delta.max_attention_saturation {
-        sm.critic_rules.max_attention_saturation = v.clamp(0.3, 0.95);
+        rules.max_attention_saturation = v.clamp(0.3, 0.95);
     }
     if let Some(v) = delta.wound_guard_threshold {
-        sm.critic_rules.wound_guard_threshold = v.clamp(0.1, 0.95);
+        rules.wound_guard_threshold = v.clamp(0.1, 0.95);
     }
     if let Some(v) = delta.wound_confidence_floor {
-        sm.critic_rules.wound_confidence_floor = v.clamp(0.1, 0.99);
+        rules.wound_confidence_floor = v.clamp(0.1, 0.99);
     }
     if let Some(phases) = &delta.phase_order {
         // Keep a safe floor: Draft + Critique must be present.
         let has_draft = phases.iter().any(|p| p == &MetacogPhase::Draft);
         let has_critique = phases.iter().any(|p| p == &MetacogPhase::Critique);
         if has_draft && has_critique {
-            sm.metacog_phase_order = phases.clone();
+            *phase_order = phases.clone();
         }
     }
 }
@@ -1029,6 +1091,450 @@ pub fn select_biases(sm: &mut SelfModel) {
         }
         // Signal the pool mutated → a walk that snapshotted the old pool skips stale credit.
         sm.pool_generation = sm.pool_generation.wrapping_add(1);
+    }
+}
+
+// ── Stage 2: evaluate-then-keep over rule changes (PROTOCOL-self-selection §#2) ──────────
+// A CriticRuleDelta is trialled offline in the dream loop by replaying recent walks under the
+// current and proposed rule configs, scored by calibration against the acyclic intrinsic
+// fitness (approval held out). It reaches live config ONLY via an accepted trial, and only when
+// trials_live(): Autonomous + RuleTrialsLive + agreement_metric == Domain. Below that, deltas
+// keep applying directly (flag-off parity) and are trialled in shadow (log only).
+//
+// Every constant below is a placeholder for a parameter the protocol leaves open (see the PR's
+// "Unresolved design parameters"); retune from Observability logs before promoting.
+
+/// Pending-proposal FIFO cap; oldest dropped when full. [GAP: coalescing unspecified]
+pub const PENDING_CAP: usize = 8;
+/// Rollback ring depth ("last N"). [GAP]
+pub const ROLLBACK_N: usize = 5;
+/// Replay buffer size M (doc §Open questions: "Start at M=50").
+pub const REPLAY_M: usize = 50;
+/// Rule-trial history cap. [GAP]
+pub const TRIAL_HISTORY_CAP: usize = 50;
+
+/// Tunables of the trial score and guards. All placeholders. [GAP]
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RuleTrialConfig {
+    /// Accept iff calib(proposed) > calib(current) + margin.
+    pub margin: f32,
+    /// Over-abort penalty weight in replay_calibration.
+    pub lambda: f32,
+    /// Overall abort rate above which the over-abort penalty applies.
+    pub abort_cap: f32,
+    /// Attempts per replayed walk. With a frozen context approval does not depend on the
+    /// attempt number, so any value >= 1 gives the same decision.
+    pub replay_max_attempts: u32,
+    /// Regression window T in dream cycles (placeholder = SELECT_EVERY).
+    pub regression_cycles: u32,
+}
+
+pub const RULE_TRIAL_CONFIG: RuleTrialConfig = RuleTrialConfig {
+    margin: 0.05,
+    lambda: 1.0,
+    abort_cap: 0.5,
+    replay_max_attempts: 3,
+    regression_cycles: SELECT_EVERY,
+};
+
+/// The rule config a trial compares and a rollback restores (critic_rules + phase order).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleConfigSnapshot {
+    pub critic_rules: CriticRuleProfile,
+    pub phase_order: Vec<MetacogPhase>,
+}
+
+impl RuleConfigSnapshot {
+    pub fn of(sm: &SelfModel) -> Self {
+        Self { critic_rules: sm.critic_rules.clone(), phase_order: sm.metacog_phase_order.clone() }
+    }
+
+    /// Exact, field-for-field restore.
+    pub fn restore_into(&self, sm: &mut SelfModel) {
+        sm.critic_rules = self.critic_rules.clone();
+        sm.metacog_phase_order = self.phase_order.clone();
+    }
+
+    /// This config with a delta applied using the same clamps as the live path.
+    pub fn with_delta(&self, delta: &CriticRuleDelta) -> Self {
+        let mut out = self.clone();
+        apply_rule_delta_parts(&mut out.critic_rules, &mut out.phase_order, delta);
+        out
+    }
+}
+
+impl CriticRuleDelta {
+    /// True when no field is set (nothing to apply or trial).
+    pub fn is_empty(&self) -> bool {
+        self.min_energy.is_none()
+            && self.agreement_threshold_autonomous.is_none()
+            && self.agreement_threshold_compliant.is_none()
+            && self.max_attention_saturation.is_none()
+            && self.wound_guard_threshold.is_none()
+            && self.wound_confidence_floor.is_none()
+            && self.phase_order.is_none()
+    }
+}
+
+/// A rule delta awaiting an offline trial.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingRuleProposal {
+    pub delta: CriticRuleDelta,
+    pub reason: String,
+    pub created_at: f64,
+    /// The rule config when the proposal was made.
+    pub base: RuleConfigSnapshot,
+    /// True when the delta was already applied by the legacy direct path (below Stage 2), so
+    /// it is only ever trialled in shadow, even if the stage is promoted before its trial.
+    #[serde(default)]
+    pub applied_directly: bool,
+}
+
+/// One replayable walk: exactly what critique() reads, captured at walk time, plus the walk's
+/// intrinsic fitness. The doc's "WalkOutputSummary". Deliberately has NO approval input
+/// (acyclicity: the trial objective must never see metacog's own output).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayEntry {
+    pub recommended_action: String,
+    pub primary_domain: String,
+    pub agreement_score: f32,
+    pub domain_agreement_score: f32,
+    pub novelty_score: f32,
+    pub walker_count: usize,
+    pub mode: CognitiveMode,
+    pub energy: f32,
+    /// attention[primary_domain] / total attention at walk time; None when total is 0.
+    pub attention_share: Option<f32>,
+    pub wound: Option<f32>,
+    /// Session-mean per-walker intrinsic fitness (graph::walk_intrinsic).
+    pub fitness: f32,
+}
+
+impl ReplayEntry {
+    pub fn from_walk(walk: &WalkOutput, sm: &SelfModel, fitness: f32) -> Self {
+        let ctx = CritiqueContext::of(sm, &walk.primary_domain);
+        Self {
+            recommended_action: walk.recommended_action.clone(),
+            primary_domain: walk.primary_domain.clone(),
+            agreement_score: walk.agreement_score,
+            domain_agreement_score: walk.domain_agreement_score,
+            novelty_score: walk.novelty_score,
+            walker_count: walk.walker_count,
+            mode: ctx.mode,
+            energy: ctx.energy,
+            attention_share: ctx.attention_share,
+            wound: ctx.wound,
+            fitness,
+        }
+    }
+
+    fn context(&self) -> CritiqueContext {
+        CritiqueContext {
+            mode: self.mode.clone(),
+            energy: self.energy,
+            attention_share: self.attention_share,
+            wound: self.wound,
+        }
+    }
+}
+
+/// Outcome of one rule trial (the doc's "EvaluationResult").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleTrialRecord {
+    pub ts: f64,
+    pub delta: CriticRuleDelta,
+    pub calib_current: f32,
+    pub calib_proposed: f32,
+    pub margin: f32,
+    /// Live: applied. Shadow: would-accept (nothing applied).
+    pub accepted: bool,
+    pub shadow: bool,
+}
+
+/// Live-regression guard armed by an accepted trial (doc §"Rollback has two triggers").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegressionWatch {
+    pub baseline_fitness: f32,
+    pub cycles_below: u32,
+    pub cycles_observed: u32,
+}
+
+/// Rule trials may APPLY only when all three hold (doc §Compliance: agreement-soundness gate).
+pub fn trials_live(sm: &SelfModel) -> bool {
+    sm.mode == CognitiveMode::Autonomous
+        && sm.self_mod_stage == SelfModStage::RuleTrialsLive
+        && sm.agreement_metric.is_domain()
+}
+
+/// Push a replay entry (Autonomous only), keeping the buffer at REPLAY_M.
+pub fn record_replay_entry(sm: &mut SelfModel, entry: ReplayEntry) {
+    if sm.mode != CognitiveMode::Autonomous {
+        return;
+    }
+    sm.recent_walk_fitness.push_back(entry);
+    while sm.recent_walk_fitness.len() > REPLAY_M {
+        sm.recent_walk_fitness.pop_front();
+    }
+}
+
+fn enqueue_rule_proposal(sm: &mut SelfModel, proposal: PendingRuleProposal) {
+    sm.pending_rule_proposals.push_back(proposal);
+    while sm.pending_rule_proposals.len() > PENDING_CAP {
+        if let Some(dropped) = sm.pending_rule_proposals.pop_front() {
+            tracing::info!(
+                "[selection] pending rule queue full ({}); dropped oldest ({})",
+                PENDING_CAP, dropped.reason
+            );
+        }
+    }
+}
+
+/// Route a critic rule delta. At Stage 2 (trials_live) it is ENQUEUED ONLY — never applied
+/// directly. Below that it applies exactly as before (flag-off parity) and, in Autonomous mode,
+/// a shadow proposal is enqueued so the dream loop can log would-accept. Compliant: apply as
+/// before, enqueue nothing. Empty deltas are a no-op either way.
+pub fn route_rule_delta(sm: &mut SelfModel, delta: &CriticRuleDelta, reason: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    let base = RuleConfigSnapshot::of(sm);
+    if trials_live(sm) {
+        tracing::info!("[selection] rule delta queued for trial ({}): {:?}", reason, delta);
+        enqueue_rule_proposal(sm, PendingRuleProposal {
+            delta: delta.clone(),
+            reason: reason.to_string(),
+            created_at: crate::core::now(),
+            base,
+            applied_directly: false,
+        });
+        return;
+    }
+    apply_rule_delta(sm, delta);
+    if sm.mode == CognitiveMode::Autonomous {
+        enqueue_rule_proposal(sm, PendingRuleProposal {
+            delta: delta.clone(),
+            reason: reason.to_string(),
+            created_at: crate::core::now(),
+            base,
+            applied_directly: true,
+        });
+    }
+}
+
+/// Pure replay of one walk's metacognitive decision under a rule config: the same draft,
+/// phase loop and critique logic as metacognitive_loop, with the self-model context frozen at
+/// walk time. No self-model mutation, no metrics, no RNG.
+pub fn replay_decide(entry: &ReplayEntry, cfg: &RuleConfigSnapshot, metric: AgreementMetric, max_attempts: u32) -> bool {
+    let ctx = entry.context();
+    let walker_agreement = select_walker_agreement(metric, entry.agreement_score, entry.domain_agreement_score);
+    let mut prior_critiques: Vec<String> = Vec::new();
+    for attempt in 1..=max_attempts {
+        let mut proposed = draft_proposal(
+            &entry.recommended_action,
+            &entry.primary_domain,
+            entry.agreement_score,
+            entry.novelty_score,
+            entry.walker_count,
+            walker_agreement,
+            attempt,
+            &prior_critiques,
+        );
+        let evaluation = run_phases(&mut proposed, &cfg.phase_order, |p| critique_with(p, &ctx, &cfg.critic_rules));
+        if evaluation.approved {
+            return true;
+        }
+        prior_critiques.push(evaluation.critique);
+    }
+    false
+}
+
+/// Calibration of a rule config over the replay buffer. Placeholder formula [GAP]: split the
+/// buffer at the median fitness (stable sort, low half = first n/2); score = approve rate on
+/// the high half + abort rate on the low half − lambda·max(0, overall abort rate − abort_cap).
+/// Uniform weights (recency weighting unspecified [GAP]). Deterministic: same buffer, no RNG.
+pub fn replay_calibration(
+    cfg: &RuleConfigSnapshot,
+    buffer: &VecDeque<ReplayEntry>,
+    metric: AgreementMetric,
+    tc: &RuleTrialConfig,
+) -> f32 {
+    let n = buffer.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let approved: Vec<bool> = buffer
+        .iter()
+        .map(|e| replay_decide(e, cfg, metric, tc.replay_max_attempts))
+        .collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| buffer[a].fitness.total_cmp(&buffer[b].fitness).then(a.cmp(&b)));
+    let (low, high) = order.split_at(n / 2);
+    let rate = |set: &[usize], want: bool| -> f32 {
+        if set.is_empty() {
+            0.0
+        } else {
+            set.iter().filter(|&&i| approved[i] == want).count() as f32 / set.len() as f32
+        }
+    };
+    let abort_all = approved.iter().filter(|a| !**a).count() as f32 / n as f32;
+    rate(high, true) + rate(low, false) - tc.lambda * (abort_all - tc.abort_cap).max(0.0)
+}
+
+fn push_trial_record(sm: &mut SelfModel, record: RuleTrialRecord) {
+    sm.rule_trial_history.push_back(record);
+    while sm.rule_trial_history.len() > TRIAL_HISTORY_CAP {
+        sm.rule_trial_history.pop_front();
+    }
+}
+
+/// Mean intrinsic fitness over profiles that have walked (the Stage 0/1 pool). This is the
+/// placeholder for the doc's "live fitness EWMA" [GAP]. None when no profile has walked.
+pub fn live_pool_fitness(sm: &SelfModel) -> Option<f32> {
+    let walked: Vec<f32> = sm
+        .learned_biases
+        .iter()
+        .filter(|b| b.scorecard.walks >= 1)
+        .map(|b| b.scorecard.fitness)
+        .collect();
+    (!walked.is_empty()).then(|| walked.iter().sum::<f32>() / walked.len() as f32)
+}
+
+/// Offline trial of the oldest pending proposal — at most one per dream cycle.
+/// Shadow (anything below trials_live, or a delta already applied directly): compare
+/// calibration(base) vs calibration(base + delta), log would-accept/reject, commit nothing
+/// else. Live: accept iff calib(current + delta) > calib(current) + margin; on accept push
+/// current to the rollback ring, apply, and arm the regression watch.
+pub fn trial_pending_rules(sm: &mut SelfModel) {
+    let tc = RULE_TRIAL_CONFIG;
+    if sm.mode != CognitiveMode::Autonomous {
+        tracing::info!("[selection] rule trial skipped: not Autonomous");
+        return;
+    }
+    if sm.pending_rule_proposals.is_empty() {
+        tracing::debug!("[selection] rule trial skipped: no pending proposals");
+        return;
+    }
+    if sm.recent_walk_fitness.len() < REPLAY_M {
+        tracing::info!(
+            "[selection] rule trial skipped: replay buffer {}/{} ({} pending)",
+            sm.recent_walk_fitness.len(), REPLAY_M, sm.pending_rule_proposals.len()
+        );
+        return;
+    }
+    let Some(proposal) = sm.pending_rule_proposals.pop_front() else { return };
+    let shadow = proposal.applied_directly || !trials_live(sm);
+
+    // Never re-trial an identical delta that was already rejected (exact equality only).
+    if sm
+        .rule_trial_history
+        .iter()
+        .any(|r| !r.accepted && r.shadow == shadow && r.delta == proposal.delta)
+    {
+        tracing::info!(
+            "[selection] rule trial skipped: identical delta already rejected ({})",
+            proposal.reason
+        );
+        return;
+    }
+
+    let current = if shadow { proposal.base.clone() } else { RuleConfigSnapshot::of(sm) };
+    let proposed = current.with_delta(&proposal.delta);
+    let metric = sm.agreement_metric;
+    let calib_current = replay_calibration(&current, &sm.recent_walk_fitness, metric, &tc);
+    let calib_proposed = replay_calibration(&proposed, &sm.recent_walk_fitness, metric, &tc);
+    let accepted = calib_proposed > calib_current + tc.margin;
+
+    push_trial_record(sm, RuleTrialRecord {
+        ts: crate::core::now(),
+        delta: proposal.delta.clone(),
+        calib_current,
+        calib_proposed,
+        margin: tc.margin,
+        accepted,
+        shadow,
+    });
+
+    if shadow {
+        tracing::info!(
+            "[selection] SHADOW would-{} rule delta ({}): calib {:.3} -> {:.3} (margin {:.2}); nothing applied",
+            if accepted { "accept" } else { "reject" },
+            proposal.reason, calib_current, calib_proposed, tc.margin
+        );
+        return;
+    }
+
+    if accepted {
+        push_rollback(sm, current);
+        proposed.restore_into(sm);
+        sm.rule_regression_watch = live_pool_fitness(sm).map(|baseline_fitness| RegressionWatch {
+            baseline_fitness,
+            cycles_below: 0,
+            cycles_observed: 0,
+        });
+        tracing::warn!(
+            "[selection] ACCEPTED rule delta ({}): calib {:.3} -> {:.3} (margin {:.2}); rollback depth {}; delta {:?}",
+            proposal.reason, calib_current, calib_proposed, tc.margin,
+            sm.rule_rollback_ring.len(), proposal.delta
+        );
+    } else {
+        tracing::info!(
+            "[selection] rejected rule delta ({}): calib {:.3} -> {:.3} (margin {:.2})",
+            proposal.reason, calib_current, calib_proposed, tc.margin
+        );
+    }
+}
+
+fn push_rollback(sm: &mut SelfModel, snap: RuleConfigSnapshot) {
+    sm.rule_rollback_ring.push_back(snap);
+    while sm.rule_rollback_ring.len() > ROLLBACK_N {
+        sm.rule_rollback_ring.pop_front();
+    }
+}
+
+/// Pop the newest rollback snapshot and restore it exactly. Clears any regression watch.
+pub fn rollback_last_rule(sm: &mut SelfModel) -> Option<RuleConfigSnapshot> {
+    let snap = sm.rule_rollback_ring.pop_back()?;
+    snap.restore_into(sm);
+    sm.rule_regression_watch = None;
+    Some(snap)
+}
+
+/// Live-regression guard (trigger 2): once per dream cycle, only when trials_live. If live
+/// pool fitness stays below the accept-time baseline for T consecutive cycles, revert the last
+/// accepted delta; if it holds for T cycles, disarm. Until metacognitive_loop is wired into a
+/// live path, rules cannot move live fitness, so this guard measures noise.
+pub fn check_rule_regression(sm: &mut SelfModel) {
+    if !trials_live(sm) {
+        return;
+    }
+    let Some(mut watch) = sm.rule_regression_watch.clone() else { return };
+    let Some(live) = live_pool_fitness(sm) else { return };
+    let t = RULE_TRIAL_CONFIG.regression_cycles;
+    watch.cycles_observed += 1;
+    if live < watch.baseline_fitness {
+        watch.cycles_below += 1;
+    } else {
+        watch.cycles_below = 0;
+    }
+    if watch.cycles_below >= t {
+        match rollback_last_rule(sm) {
+            Some(_) => tracing::warn!(
+                "[selection] ROLLBACK: live fitness {:.3} below baseline {:.3} for {} cycles; restored previous rule config (depth now {})",
+                live, watch.baseline_fitness, t, sm.rule_rollback_ring.len()
+            ),
+            None => {
+                sm.rule_regression_watch = None;
+                tracing::warn!("[selection] regression detected but rollback ring is empty; watch cleared");
+            }
+        }
+    } else if watch.cycles_observed >= t {
+        sm.rule_regression_watch = None;
+        tracing::info!(
+            "[selection] accepted rule held for {} cycles (live {:.3} vs baseline {:.3}); watch cleared",
+            t, live, watch.baseline_fitness
+        );
+    } else {
+        sm.rule_regression_watch = Some(watch);
     }
 }
 
@@ -2062,5 +2568,370 @@ mod tests {
         let mut unknown = base.clone();
         unknown.agreement_metric = crate::core::AgreementMetric::Unknown;
         assert!(metacognitive_loop(&walk, &mut unknown, 2).is_none(), "Unknown behaves as Legacy");
+    }
+
+    // ── Stage 2: rule trials, replay, rollback (PROTOCOL-self-selection §#2, §Compliance) ──
+
+    use crate::core::{AgreementMetric, SelfModStage};
+
+    fn replay_entry(fitness: f32, domain_agree: f32) -> ReplayEntry {
+        ReplayEntry {
+            recommended_action: "explore".into(),
+            primary_domain: "markets".into(),
+            agreement_score: 0.0,
+            domain_agreement_score: domain_agree,
+            novelty_score: 0.3,
+            walker_count: 6,
+            mode: CognitiveMode::Autonomous,
+            energy: 0.9,
+            attention_share: None,
+            wound: None,
+            fitness,
+        }
+    }
+
+    /// REPLAY_M walks: high-fitness walks have high domain agreement, low-fitness walks low.
+    /// Under Domain + default threshold 0.2 every walk is approved (calibration 1.0); raising
+    /// the threshold to 0.5 approves the good half and aborts the bad half (calibration 2.0).
+    fn separable_buffer() -> VecDeque<ReplayEntry> {
+        (0..REPLAY_M)
+            .map(|i| if i % 2 == 0 { replay_entry(0.8, 0.9) } else { replay_entry(0.1, 0.25) })
+            .collect()
+    }
+
+    fn delta_threshold(v: f32) -> CriticRuleDelta {
+        CriticRuleDelta { agreement_threshold_autonomous: Some(v), ..Default::default() }
+    }
+
+    fn stage2_sm(stage: SelfModStage, metric: AgreementMetric) -> SelfModel {
+        let mut sm = SelfModel::new();
+        sm.mode = CognitiveMode::Autonomous;
+        sm.self_mod_stage = stage;
+        sm.agreement_metric = metric;
+        sm.recent_walk_fitness = separable_buffer();
+        if let Some(b) = sm.learned_biases.get_mut(0) {
+            b.scorecard.walks = 1;
+            b.scorecard.fitness = 0.3;
+        }
+        sm
+    }
+
+    /// Whole model minus the Stage-2 rings, for commit-nothing comparisons.
+    fn model_minus_stage2_rings(m: &SelfModel) -> String {
+        let mut c = m.clone();
+        c.pending_rule_proposals.clear();
+        c.rule_trial_history.clear();
+        serde_json::to_string(&c).unwrap()
+    }
+
+    #[test]
+    fn stage2_flag_off_route_is_exactly_legacy_apply_plus_one_shadow_proposal() {
+        let delta = CriticRuleDelta {
+            min_energy: Some(0.3),
+            phase_order: Some(vec![MetacogPhase::Draft, MetacogPhase::ReflectivePause, MetacogPhase::Critique]),
+            ..Default::default()
+        };
+        let base = stage2_sm(SelfModStage::Observability, AgreementMetric::Legacy);
+
+        let mut routed = base.clone();
+        route_rule_delta(&mut routed, &delta, "test");
+        let mut legacy = base.clone();
+        apply_rule_delta(&mut legacy, &delta);
+
+        assert_eq!(model_minus_stage2_rings(&routed), model_minus_stage2_rings(&legacy),
+            "flag-off: identical to the pre-Stage-2 direct apply");
+        assert_eq!(routed.pending_rule_proposals.len(), 1, "the only new state: one shadow proposal");
+        assert!(routed.pending_rule_proposals[0].applied_directly);
+        assert_eq!(routed.pending_rule_proposals[0].base, RuleConfigSnapshot::of(&base));
+
+        // Through the real entry point: critic_rules change exactly as on base.
+        let mut via_adj = base.clone();
+        let adj = CriticAdjustment { critic_rule_delta: delta.clone(), ..Default::default() };
+        apply_critic_adjustments(&mut via_adj, &adj);
+        assert_eq!(RuleConfigSnapshot::of(&via_adj), RuleConfigSnapshot::of(&base).with_delta(&delta));
+
+        // An empty delta is a pure no-op (no proposal).
+        let mut empty = base.clone();
+        route_rule_delta(&mut empty, &CriticRuleDelta::default(), "test");
+        assert!(empty.pending_rule_proposals.is_empty());
+    }
+
+    #[test]
+    fn stage2_shadow_trial_commits_nothing_at_stage0_and_stage1() {
+        for stage in [SelfModStage::Observability, SelfModStage::SelectionLive] {
+            let mut sm = stage2_sm(stage, AgreementMetric::Domain);
+            route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+            // route applied directly (legacy path); the shadow trial must change nothing else.
+            let before = model_minus_stage2_rings(&sm);
+            trial_pending_rules(&mut sm);
+            assert_eq!(model_minus_stage2_rings(&sm), before, "{stage:?}: shadow trial must commit nothing");
+            assert_eq!(sm.rule_trial_history.len(), 1);
+            assert!(sm.rule_trial_history[0].shadow);
+            assert!(sm.rule_rollback_ring.is_empty());
+            assert!(sm.rule_regression_watch.is_none());
+        }
+    }
+
+    #[test]
+    fn stage2_no_silent_apply_at_rule_trials_live() {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        assert!(trials_live(&sm));
+        let before = RuleConfigSnapshot::of(&sm);
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        assert_eq!(RuleConfigSnapshot::of(&sm), before, "Stage 2: enqueue only, never apply directly");
+        assert_eq!(sm.pending_rule_proposals.len(), 1);
+        assert!(!sm.pending_rule_proposals[0].applied_directly);
+
+        // Same through apply_critic_adjustments.
+        let mut sm2 = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        let adj = CriticAdjustment { critic_rule_delta: delta_threshold(0.5), ..Default::default() };
+        apply_critic_adjustments(&mut sm2, &adj);
+        assert_eq!(RuleConfigSnapshot::of(&sm2), before);
+    }
+
+    #[test]
+    fn stage2_agreement_gate_refuses_to_apply_at_rule_trials_live_with_legacy_metric() {
+        for metric in [AgreementMetric::Legacy, AgreementMetric::Unknown] {
+            let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, metric);
+            assert!(!trials_live(&sm), "{metric:?}: gate closed");
+            route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+            assert!(sm.pending_rule_proposals[0].applied_directly, "legacy direct path, not a live trial");
+            trial_pending_rules(&mut sm);
+            assert!(sm.rule_trial_history.back().unwrap().shadow, "{metric:?}: trial is shadow only");
+            assert!(sm.rule_rollback_ring.is_empty(), "{metric:?}: nothing accepted");
+            assert!(sm.rule_regression_watch.is_none());
+        }
+    }
+
+    #[test]
+    fn stage2_frozen_in_compliant() {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        sm.mode = CognitiveMode::Compliant;
+        assert!(!trials_live(&sm));
+
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        assert!(sm.pending_rule_proposals.is_empty(), "Compliant: no enqueue");
+
+        let n = sm.recent_walk_fitness.len();
+        record_replay_entry(&mut sm, replay_entry(0.5, 0.5));
+        assert_eq!(sm.recent_walk_fitness.len(), n, "Compliant: no replay recording");
+
+        // Even with a proposal, a watch and a snapshot present: no trial, accept or rollback.
+        sm.pending_rule_proposals.push_back(PendingRuleProposal {
+            delta: delta_threshold(0.5),
+            reason: "test".into(),
+            created_at: 0.0,
+            base: RuleConfigSnapshot::of(&sm),
+            applied_directly: false,
+        });
+        sm.rule_rollback_ring.push_back(RuleConfigSnapshot::of(&SelfModel::new()));
+        sm.rule_regression_watch = Some(RegressionWatch { baseline_fitness: 10.0, cycles_below: 0, cycles_observed: 0 });
+        let before = serde_json::to_string(&sm).unwrap();
+        for _ in 0..(RULE_TRIAL_CONFIG.regression_cycles * 2) {
+            trial_pending_rules(&mut sm);
+            check_rule_regression(&mut sm);
+        }
+        assert_eq!(serde_json::to_string(&sm).unwrap(), before, "Compliant: nothing moves");
+    }
+
+    #[test]
+    fn stage2_accept_path_applies_and_grows_rollback_ring() {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        let original = RuleConfigSnapshot::of(&sm);
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut sm);
+
+        let rec = sm.rule_trial_history.back().unwrap();
+        assert!(rec.accepted && !rec.shadow);
+        assert!(rec.calib_proposed > rec.calib_current + RULE_TRIAL_CONFIG.margin);
+        assert_eq!(sm.critic_rules.agreement_threshold_autonomous, 0.5, "accepted delta is live");
+        assert_eq!(sm.rule_rollback_ring.len(), 1);
+        assert_eq!(sm.rule_rollback_ring[0], original);
+        let w = sm.rule_regression_watch.as_ref().expect("watch armed");
+        assert_eq!(w.baseline_fitness, 0.3);
+    }
+
+    #[test]
+    fn stage2_reject_path_not_applied_recorded_and_not_retrialled() {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        let original = RuleConfigSnapshot::of(&sm);
+        let worse = delta_threshold(0.95); // clamps to 0.9 → aborts everything
+        route_rule_delta(&mut sm, &worse, "test");
+        trial_pending_rules(&mut sm);
+
+        assert_eq!(RuleConfigSnapshot::of(&sm), original, "rejected delta never goes live");
+        assert_eq!(sm.rule_trial_history.len(), 1);
+        assert!(!sm.rule_trial_history[0].accepted);
+        assert!(sm.rule_rollback_ring.is_empty());
+
+        route_rule_delta(&mut sm, &worse, "test-again");
+        trial_pending_rules(&mut sm);
+        assert_eq!(sm.rule_trial_history.len(), 1, "identical rejected delta is not re-trialled");
+        assert!(sm.pending_rule_proposals.is_empty(), "the duplicate is consumed, not re-queued");
+        assert_eq!(RuleConfigSnapshot::of(&sm), original);
+    }
+
+    #[test]
+    fn stage2_rollback_is_exact() {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        sm.metacog_phase_order = vec![MetacogPhase::Draft, MetacogPhase::ReflectivePause, MetacogPhase::Critique];
+        let original = RuleConfigSnapshot::of(&sm);
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut sm);
+        assert_ne!(RuleConfigSnapshot::of(&sm), original);
+
+        let restored = rollback_last_rule(&mut sm).expect("ring has one entry");
+        assert_eq!(restored, original);
+        assert_eq!(RuleConfigSnapshot::of(&sm), original, "field-for-field restore");
+        assert!(sm.rule_regression_watch.is_none());
+        assert!(rollback_last_rule(&mut sm).is_none(), "empty ring → None (API returns 409)");
+    }
+
+    #[test]
+    fn stage2_regression_guard_reverts_after_t_cycles_not_before() {
+        let t = RULE_TRIAL_CONFIG.regression_cycles;
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        let original = RuleConfigSnapshot::of(&sm);
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut sm);
+        let accepted = RuleConfigSnapshot::of(&sm);
+
+        sm.learned_biases[0].scorecard.fitness = 0.1; // live fitness drops below baseline 0.3
+        for i in 1..t {
+            check_rule_regression(&mut sm);
+            assert_eq!(RuleConfigSnapshot::of(&sm), accepted, "not reverted after {i} < T cycles");
+        }
+        check_rule_regression(&mut sm);
+        assert_eq!(RuleConfigSnapshot::of(&sm), original, "reverted at T cycles");
+        assert!(sm.rule_regression_watch.is_none());
+
+        // Holding at/above baseline for T cycles disarms the watch without reverting.
+        let mut held = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        route_rule_delta(&mut held, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut held);
+        let kept = RuleConfigSnapshot::of(&held);
+        for _ in 0..t {
+            check_rule_regression(&mut held);
+        }
+        assert!(held.rule_regression_watch.is_none(), "watch cleared after holding T cycles");
+        assert_eq!(RuleConfigSnapshot::of(&held), kept, "no revert when fitness holds");
+    }
+
+    #[test]
+    fn stage2_calibration_is_acyclic_approval_has_no_input() {
+        // Compile-level: exhaustive destructure (no `..`) — adding any field, e.g. an approval
+        // input, breaks this test and forces a review of acyclicity.
+        let ReplayEntry {
+            recommended_action: _, primary_domain: _, agreement_score: _, domain_agreement_score: _,
+            novelty_score: _, walker_count: _, mode: _, energy: _, attention_share: _, wound: _,
+            fitness: _,
+        } = replay_entry(0.5, 0.5);
+
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        let cfg = RuleConfigSnapshot::of(&sm);
+        let tc = RULE_TRIAL_CONFIG;
+        let before = replay_calibration(&cfg, &sm.recent_walk_fitness, sm.agreement_metric, &tc);
+        // Move every approval signal there is: global metacog approval and per-profile approval.
+        for _ in 0..200 {
+            crate::metrics::record_metacog_decision(true);
+        }
+        for b in sm.learned_biases.iter_mut() {
+            b.scorecard.approval = 1.0;
+        }
+        let after = replay_calibration(&cfg, &sm.recent_walk_fitness, sm.agreement_metric, &tc);
+        assert_eq!(before, after, "approval must not influence the trial score");
+    }
+
+    #[test]
+    fn stage2_every_ring_is_bounded() {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        for i in 0..(PENDING_CAP * 10) {
+            route_rule_delta(&mut sm, &delta_threshold(0.3 + (i % 5) as f32 * 0.01), "bound");
+        }
+        assert!(sm.pending_rule_proposals.len() <= PENDING_CAP);
+
+        for _ in 0..(REPLAY_M * 10) {
+            record_replay_entry(&mut sm, replay_entry(0.5, 0.5));
+        }
+        assert!(sm.recent_walk_fitness.len() <= REPLAY_M);
+
+        for _ in 0..(TRIAL_HISTORY_CAP * 10) {
+            push_trial_record(&mut sm, RuleTrialRecord {
+                ts: 0.0, delta: CriticRuleDelta::default(), calib_current: 0.0, calib_proposed: 0.0,
+                margin: 0.0, accepted: false, shadow: true,
+            });
+        }
+        assert!(sm.rule_trial_history.len() <= TRIAL_HISTORY_CAP);
+
+        for _ in 0..(ROLLBACK_N * 10) {
+            let snap = RuleConfigSnapshot::of(&sm);
+            push_rollback(&mut sm, snap);
+        }
+        assert!(sm.rule_rollback_ring.len() <= ROLLBACK_N);
+
+        // And at most one trial per dream cycle.
+        let mut one = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        route_rule_delta(&mut one, &delta_threshold(0.5), "a");
+        route_rule_delta(&mut one, &delta_threshold(0.6), "b");
+        trial_pending_rules(&mut one);
+        assert_eq!(one.rule_trial_history.len(), 1);
+        assert_eq!(one.pending_rule_proposals.len(), 1);
+    }
+
+    #[test]
+    fn stage2_replay_decide_matches_metacognitive_loop() {
+        // Deterministic LCG over contexts, rules, phase orders, metric, mode and attempts.
+        let mut seed: u64 = 0x5eed_2026;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) / ((1u64 << 31) as f32)
+        };
+        let phase_orders = [
+            vec![MetacogPhase::Draft, MetacogPhase::Critique],
+            vec![MetacogPhase::Draft, MetacogPhase::ReflectivePause, MetacogPhase::Critique],
+            vec![MetacogPhase::Critique, MetacogPhase::ReflectivePause],
+            vec![MetacogPhase::Draft], // no critique → safety fallback
+        ];
+        let (mut approved_n, mut rejected_n) = (0, 0);
+        for case in 0..500 {
+            let mut sm = SelfModel::new();
+            sm.mode = if next() < 0.8 { CognitiveMode::Autonomous } else { CognitiveMode::Compliant };
+            sm.energy = next();
+            sm.agreement_metric = if next() < 0.5 { AgreementMetric::Domain } else { AgreementMetric::Legacy };
+            sm.attention_patterns.clear();
+            if next() < 0.7 {
+                sm.attention_patterns.insert("markets".into(), next() * 10.0);
+                sm.attention_patterns.insert("other".into(), next() * 10.0);
+            }
+            sm.wounds.clear();
+            if next() < 0.5 {
+                sm.wounds.insert("markets".into(), next());
+            }
+            sm.critic_rules = CriticRuleProfile {
+                min_energy: 0.05 + next() * 0.5,
+                agreement_threshold_autonomous: 0.05 + next() * 0.8,
+                agreement_threshold_compliant: 0.05 + next() * 0.8,
+                max_attention_saturation: 0.3 + next() * 0.6,
+                wound_guard_threshold: 0.1 + next() * 0.8,
+                wound_confidence_floor: 0.1 + next() * 0.8,
+            };
+            sm.metacog_phase_order = phase_orders[(next() * 4.0) as usize % 4].clone();
+            let walk = WalkOutput {
+                primary_domain: "markets".into(),
+                agreement_score: next(),
+                domain_agreement_score: next(),
+                ..test_walk_output()
+            };
+            let max_attempts = 1 + (next() * 3.0) as u32 % 3;
+
+            let entry = ReplayEntry::from_walk(&walk, &sm, 0.0);
+            let cfg = RuleConfigSnapshot::of(&sm);
+            let replay = replay_decide(&entry, &cfg, sm.agreement_metric, max_attempts);
+            let live = metacognitive_loop(&walk, &mut sm.clone(), max_attempts).is_some();
+            assert_eq!(replay, live, "case {case}: replay_decide diverged from metacognitive_loop");
+            if live { approved_n += 1 } else { rejected_n += 1 }
+        }
+        assert!(approved_n >= 50 && rejected_n >= 50,
+            "both outcomes must be exercised (approved {approved_n}, rejected {rejected_n})");
     }
 }

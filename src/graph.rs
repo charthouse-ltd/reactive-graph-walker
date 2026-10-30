@@ -430,6 +430,16 @@ impl ProfileFitness {
     }
 }
 
+/// Per-walk intrinsic fitness scalar — the same formula as `f_walk` inside
+/// [`ProfileFitness::record`] (approval excluded; deferred_stuck has no per-walk input).
+/// Used by the Stage-2 replay buffer; `record` itself is unchanged.
+pub fn walk_intrinsic(w: &SelectionWeights, novelty: f32, surprise_kept: f32,
+                      dead_end_rate: f32, repetition: f32) -> f32 {
+    w.novelty * novelty + w.surprise_kept * surprise_kept
+        - w.dead_end_rate * dead_end_rate
+        - w.repetition * repetition
+}
+
 /// Coarse realized-behaviour niche key — (novelty-breadth bin, surprise-leap bin) — using
 /// fixed absolute cutpoints (<0.15, <0.40). None for unwalked profiles (no niche; never an
 /// incumbent or cull candidate). Stable: a profile's niche moves only when its OWN EWMA
@@ -888,5 +898,17 @@ mod tests {
         assert_eq!(behavioural_niche(&sc), Some((1, 0)), "0.30 in [0.15,0.40)→1 ; 0.05<0.15→0");
         sc.walks = 0;
         assert_eq!(behavioural_niche(&sc), None, "walks==0 → no niche");
+    }
+
+    #[test]
+    fn walk_intrinsic_matches_record_per_walk_formula() {
+        // Stage-2 replay fitness must be the same scalar ProfileFitness::record folds into
+        // its Welford mean (after one walk, fitness_mean == f_walk). Approval has no effect.
+        let w = SelectionWeights::default();
+        for &(n, s, d, r, appr) in &[(0.4, 0.2, 0.1, 0.25, 0.0), (0.9, 0.7, 0.0, 1.0, 1.0), (0.0, 0.0, 1.0, 0.0, 0.5)] {
+            let mut pf = ProfileFitness::default();
+            pf.record(n, s, d, r, appr, &w);
+            assert!((pf.fitness_mean - walk_intrinsic(&w, n, s, d, r)).abs() < 1e-6);
+        }
     }
 }

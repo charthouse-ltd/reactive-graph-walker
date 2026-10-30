@@ -142,6 +142,8 @@ pub async fn serve(
         .route("/self", get(self_state))
         .route("/metacog/config", get(get_metacog_config).post(set_metacog_config))
         .route("/selection/stage", post(set_selection_stage))
+        .route("/selection/stats", get(selection_stats))
+        .route("/selection/rollback", post(selection_rollback))
         .route("/tools", get(list_tools))
         .route("/music", get(music_endpoint))
         .route("/music/midi", get(music_midi_endpoint))
@@ -469,6 +471,7 @@ async fn set_metacog_config(
     Json(req): Json<MetacogConfigPatch>,
 ) -> Json<serde_json::Value> {
     let mut sm = state.self_model.lock().await;
+    let rules_before = crate::metacog::RuleConfigSnapshot::of(&sm);
 
     if let Some(metric) = req.agreement_metric {
         if metric == crate::core::AgreementMetric::Unknown {
@@ -524,10 +527,78 @@ async fn set_metacog_config(
         spawn_bias_variants_api(&mut sm, spawn);
     }
 
+    // Operator rule edits bypass Stage-2 trials by design (explicit human action); log them.
+    let after = crate::metacog::RuleConfigSnapshot::of(&sm);
+    if after != rules_before {
+        tracing::warn!(
+            "[selection] operator changed rule config via /metacog/config: {:?} -> {:?}",
+            rules_before, after
+        );
+    }
+
     Json(serde_json::json!({
         "status": "ok",
         "config": metacog_config_json(&sm),
     }))
+}
+
+/// GET /selection/stats — Stage 0-2 self-selection state (read-only). Auth-protected.
+async fn selection_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let sm = state.self_model.lock().await;
+    Json(selection_stats_json(&sm))
+}
+
+fn selection_stats_json(sm: &SelfModel) -> serde_json::Value {
+    const HISTORY_SHOWN: usize = 20;
+    let pool: Vec<serde_json::Value> = sm
+        .learned_biases
+        .iter()
+        .enumerate()
+        .map(|(i, b)| serde_json::json!({
+            "index": i,
+            "walks": b.scorecard.walks,
+            "fitness": b.scorecard.fitness,
+            "niche": crate::graph::behavioural_niche(&b.scorecard),
+        }))
+        .collect();
+    let history: Vec<&crate::metacog::RuleTrialRecord> =
+        sm.rule_trial_history.iter().rev().take(HISTORY_SHOWN).collect();
+    serde_json::json!({
+        "self_mod_stage": sm.self_mod_stage,
+        "agreement_metric": sm.agreement_metric,
+        "trials_live": crate::metacog::trials_live(sm),
+        "pool": pool,
+        "live_pool_fitness": crate::metacog::live_pool_fitness(sm),
+        "pending_rule_proposals": sm.pending_rule_proposals,
+        "rule_trial_history_latest_first": history,
+        "rollback_depth": sm.rule_rollback_ring.len(),
+        "regression_watch": sm.rule_regression_watch,
+        "replay_buffer": {"len": sm.recent_walk_fitness.len(), "required": crate::metacog::REPLAY_M},
+        "trial_config": crate::metacog::RULE_TRIAL_CONFIG,
+    })
+}
+
+/// POST /selection/rollback — restore the rule config replaced by the last accepted trial.
+/// 409 when the rollback ring is empty. Auth-protected, operator action, WARN-logged.
+async fn selection_rollback(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    let mut sm = state.self_model.lock().await;
+    match crate::metacog::rollback_last_rule(&mut sm) {
+        Some(restored) => {
+            tracing::warn!(
+                "[selection] ROLLBACK by operator via /selection/rollback; restored {:?} (depth now {})",
+                restored, sm.rule_rollback_ring.len()
+            );
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "ok",
+                "restored": restored,
+                "rollback_depth": sm.rule_rollback_ring.len(),
+            })))
+        }
+        None => (StatusCode::CONFLICT, Json(serde_json::json!({
+            "status": "error",
+            "error": "rollback ring is empty",
+        }))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1411,5 +1482,17 @@ mod tests {
         server.abort();
         capture.abort();
         drop(guard);
+    }
+
+    #[test]
+    fn selection_stats_json_reports_stage2_state() {
+        let sm = SelfModel::new();
+        let v = selection_stats_json(&sm);
+        assert_eq!(v["self_mod_stage"], "observability");
+        assert_eq!(v["agreement_metric"], "legacy");
+        assert_eq!(v["trials_live"], false);
+        assert_eq!(v["rollback_depth"], 0);
+        assert_eq!(v["replay_buffer"]["required"], crate::metacog::REPLAY_M);
+        assert!(v["regression_watch"].is_null());
     }
 }

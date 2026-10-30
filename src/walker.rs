@@ -376,6 +376,9 @@ pub async fn walk_parallel(
     // ── Flush edge cache writes to DB ──
     let _ = cache.flush().await;
 
+    // Stage 2 replay buffer: session-mean intrinsic fitness (Autonomous only; set below).
+    let mut session_fitness: Option<f32> = None;
+
     // Merge per-walker self-models back into the shared self-model
     // Each walker saw different things — integrate all perspectives
     {
@@ -490,6 +493,19 @@ pub async fn walk_parallel(
                 }
             }
         }
+        // Stage 2: per-walker intrinsic f_walk (same formula as ProfileFitness::record),
+        // averaged over the session for the replay buffer. Approval is NOT an input.
+        // Independent of pool_stable: it does not credit any profile.
+        if accumulate_fitness && !results.is_empty() {
+            let total: f32 = results
+                .iter()
+                .map(|(result, _)| {
+                    let (nov, surprise_kept, dead_end_rate) = crate::graph::fitness_inputs(result);
+                    crate::graph::walk_intrinsic(&selection_weights, nov, surprise_kept, dead_end_rate, session_repetition)
+                })
+                .sum();
+            session_fitness = Some(total / results.len() as f32);
+        }
         sm.learned_bias_rotation = sm.learned_bias_rotation.wrapping_add(1);
     }
 
@@ -498,6 +514,15 @@ pub async fn walk_parallel(
 
     // Aggregate results (borrows walker_results, doesn't consume)
     let output = aggregate(pool, &walker_results, walk_ms, start, agreement_metric).await;
+
+    // Stage 2: record this walk for offline rule-trial replay (Autonomous only, bounded).
+    if let Some(fitness) = session_fitness {
+        let mut sm = self_model.lock().await;
+        if sm.mode == core::CognitiveMode::Autonomous {
+            let entry = crate::metacog::ReplayEntry::from_walk(&output, &sm, fitness);
+            crate::metacog::record_replay_entry(&mut sm, entry);
+        }
+    }
 
     // Behavioral integration metric: track novelty and repetition tendency.
     let repeated = {

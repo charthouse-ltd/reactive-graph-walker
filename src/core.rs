@@ -106,7 +106,7 @@ pub struct Noticing {
 
 /// Runtime-tunable thresholds for the Tier-1 metacognitive critic.
 /// Stored in self-state so critique behavior can adapt without code edits.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct CriticRuleProfile {
     pub min_energy: f32,
     pub agreement_threshold_autonomous: f32,
@@ -330,6 +330,22 @@ pub struct SelfModel {
     /// Which agreement signal drives decisions (default Legacy). See AgreementMetric.
     #[serde(default)]
     pub agreement_metric: AgreementMetric,
+    // ── Stage 2 rule trials (PROTOCOL-self-selection §#2). All bounded; see metacog caps. ──
+    /// FIFO of critic rule deltas awaiting an offline trial (cap metacog::PENDING_CAP).
+    #[serde(default)]
+    pub pending_rule_proposals: VecDeque<crate::metacog::PendingRuleProposal>,
+    /// Configs replaced by accepted trials, newest last (cap metacog::ROLLBACK_N).
+    #[serde(default)]
+    pub rule_rollback_ring: VecDeque<crate::metacog::RuleConfigSnapshot>,
+    /// Replay buffer of recent Autonomous walks + intrinsic fitness (cap metacog::REPLAY_M).
+    #[serde(default)]
+    pub recent_walk_fitness: VecDeque<crate::metacog::ReplayEntry>,
+    /// Outcomes of rule trials, shadow and live (cap metacog::TRIAL_HISTORY_CAP).
+    #[serde(default)]
+    pub rule_trial_history: VecDeque<crate::metacog::RuleTrialRecord>,
+    /// Live-regression guard armed by the last accepted trial.
+    #[serde(default)]
+    pub rule_regression_watch: Option<crate::metacog::RegressionWatch>,
 
     // ── Meta ──
     pub total_signals_processed: u64,
@@ -534,6 +550,11 @@ impl SelfModel {
             selection_cycle_counter: 0,
             pool_generation: 0,
             agreement_metric: AgreementMetric::default(),
+            pending_rule_proposals: VecDeque::new(),
+            rule_rollback_ring: VecDeque::new(),
+            recent_walk_fitness: VecDeque::new(),
+            rule_trial_history: VecDeque::new(),
+            rule_regression_watch: None,
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,
@@ -1329,6 +1350,11 @@ mod tests {
         o.remove("self_mod_stage");
         o.remove("selection_cycle_counter");
         o.remove("agreement_metric");
+        o.remove("pending_rule_proposals");
+        o.remove("rule_rollback_ring");
+        o.remove("recent_walk_fitness");
+        o.remove("rule_trial_history");
+        o.remove("rule_regression_watch");
         let s = serde_json::to_string(&v).unwrap();
         let loaded: Option<SelfModel> = serde_json::from_str(&s).ok();
         assert!(
@@ -1338,6 +1364,9 @@ mod tests {
         let m = loaded.unwrap();
         assert_eq!(m.selection_history.len(), 0, "missing selection_history → empty ring");
         assert_eq!(m.agreement_metric, AgreementMetric::Legacy, "missing agreement_metric → Legacy");
+        assert!(m.pending_rule_proposals.is_empty() && m.rule_rollback_ring.is_empty());
+        assert!(m.recent_walk_fitness.is_empty() && m.rule_trial_history.is_empty());
+        assert!(m.rule_regression_watch.is_none(), "missing Stage-2 fields → empty/None");
         assert_eq!(
             m.self_mod_stage,
             SelfModStage::Observability,
