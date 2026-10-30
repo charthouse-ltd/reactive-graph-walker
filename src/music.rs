@@ -121,13 +121,12 @@ from audiocraft.data.audio import audio_write
 model = MusicGen.get_pretrained('facebook/musicgen-large')
 model.set_generation_params(duration={duration})
 
-descriptions = ['{prompt}']
+descriptions = [sys.argv[1]]  # prompt arrives as argv (data), never interpolated into source
 wav = model.generate(descriptions)
 audio_write('{output}', wav[0].cpu(), model.sample_rate, strategy='loudness')
 print('OK:' + '{output}.wav')
 "#,
         duration = duration_secs,
-        prompt = prompt.replace('\'', "\\'").replace('\n', " "),
         output = output_path.replace(".wav", ""),
     );
 
@@ -135,9 +134,12 @@ print('OK:' + '{output}.wav')
     let python = std::env::var("MUSICGEN_PYTHON")
         .unwrap_or_else(|_| format!("{}/.venvs/musicgen/bin/python", std::env::var("HOME").unwrap_or_default()));
 
+    // SECURITY: the untrusted prompt is passed as a process argument (sys.argv[1]),
+    // not interpolated into the Python source. Escaping quotes is bypassable.
     let result = tokio::process::Command::new(&python)
         .arg("-c")
         .arg(&python_code)
+        .arg(prompt)
         .output()
         .await
         .map_err(|e| format!("MusicGen spawn failed: {}", e))?;

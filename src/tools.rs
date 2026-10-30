@@ -5,7 +5,7 @@
 //!   - web_fetch: scrape a URL, content becomes a graph node
 //!   - memory_store: create a new memory node in the graph
 //!   - edge_create: connect two nodes
-//!   - code_exec: execute code in a sandbox (future)
+//!   - code_exec: REMOVED — was an unauthenticated RCE (python3 -c). Needs a real sandbox before it can return.
 //!   - speech_say: speak text via TTS (future)
 //!   - llm_express: self-model expresses its state through an LLM
 //!
@@ -400,12 +400,43 @@ async fn web_fetch(params: serde_json::Value) -> ToolResult {
         };
     }
 
+    // Block SSRF: only http/https to publicly-routable hosts.
+    if let Err(reason) = validate_public_url(url).await {
+        return ToolResult {
+            tool: "web_fetch".into(),
+            success: false,
+            content: format!("Blocked URL: {}", reason),
+            metadata: serde_json::json!({"url": url, "blocked": true}),
+        };
+    }
+
     // Build the client without unwrap(): a builder failure must not panic the
-    // request handler. Fall back to a default client if the builder errors.
-    let client = reqwest::Client::builder()
+    // request handler. No fallback to Client::new(): a default client follows
+    // redirects unguarded, so every redirect hop is checked here instead.
+    let client = match reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; RGW/1.0)")
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many redirects");
+            }
+            if redirect_target_blocked(attempt.url()) {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ToolResult {
+                tool: "web_fetch".into(),
+                success: false,
+                content: format!("HTTP client build failed: {}", e),
+                metadata: serde_json::json!({"url": url}),
+            };
+        }
+    };
 
     match client
         .get(url)
@@ -445,6 +476,80 @@ async fn web_fetch(params: serde_json::Value) -> ToolResult {
             content: format!("Fetch failed: {}", e),
             metadata: serde_json::json!({"url": url}),
         },
+    }
+}
+
+/// SSRF guard for outbound fetches: require http/https and reject any URL whose
+/// host resolves to a loopback/private/link-local address (blocks internal
+/// services and cloud metadata endpoints like 169.254.169.254).
+/// Note: validates at request time; this is not full DNS-rebinding protection.
+async fn validate_public_url(raw: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(raw).map_err(|e| format!("invalid URL ({})", e))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("scheme '{}' not allowed", other)),
+    }
+    let host = parsed.host_str().ok_or_else(|| "URL has no host".to_string())?;
+    let host_l = host.to_ascii_lowercase();
+    if host_l == "localhost" || host_l.ends_with(".localhost") || host_l.ends_with(".internal") {
+        return Err("internal host blocked".into());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS resolution failed ({})", e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("host did not resolve".into());
+    }
+    for addr in &addrs {
+        if ip_is_internal(addr.ip()) {
+            return Err("resolves to a private/loopback address".into());
+        }
+    }
+    Ok(())
+}
+
+/// True if the IP is loopback/private/link-local/unspecified (not publicly routable).
+fn ip_is_internal(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // CGNAT 100.64/10
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_internal(IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
+/// Sync check for redirect hops (no DNS here): blocks non-http(s) schemes,
+/// localhost/.internal names and literal internal IPs. A public name that
+/// resolves internally on a redirect hop is NOT caught (documented residual).
+fn redirect_target_blocked(u: &reqwest::Url) -> bool {
+    if !matches!(u.scheme(), "http" | "https") {
+        return true;
+    }
+    let Some(host) = u.host_str() else { return true };
+    let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".internal") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip_is_internal(ip),
+        Err(_) => false,
     }
 }
 
@@ -588,3 +693,46 @@ mod urlencoding {
 }
 
 use sqlx::Row;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C1 regression: the RCE primitive must never be advertised via GET /tools.
+    #[test]
+    fn code_exec_is_not_advertised() {
+        assert!(available_tools().iter().all(|t| t.name != "code_exec"));
+    }
+
+    #[test]
+    fn ssrf_ip_classification() {
+        use std::net::IpAddr;
+        for s in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "172.16.0.1",
+                  "169.254.169.254", "0.0.0.0", "100.64.0.1", "::1",
+                  "fd00::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254"] {
+            assert!(ip_is_internal(s.parse::<IpAddr>().unwrap()), "{s} should be internal");
+        }
+        for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+            assert!(!ip_is_internal(s.parse::<IpAddr>().unwrap()), "{s} should be public");
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_public_url_rejects_bad_targets_without_network() {
+        for u in ["file:///etc/passwd", "ftp://example.com/", "http://localhost/",
+                  "http://x.localhost/", "http://metadata.google.internal/",
+                  "http://127.0.0.1:11435/self", "http://169.254.169.254/latest/meta-data/",
+                  "http://[::1]/", "not a url"] {
+            assert!(validate_public_url(u).await.is_err(), "{u} should be blocked");
+        }
+    }
+
+    #[test]
+    fn redirect_hops_to_internal_are_blocked() {
+        for u in ["http://127.0.0.1/", "http://169.254.169.254/", "http://[::1]/",
+                  "http://localhost/", "http://db.internal/", "file:///etc/passwd"] {
+            assert!(redirect_target_blocked(&reqwest::Url::parse(u).unwrap()), "{u}");
+        }
+        assert!(!redirect_target_blocked(&reqwest::Url::parse("https://example.com/").unwrap()));
+    }
+}
