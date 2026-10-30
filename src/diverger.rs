@@ -451,7 +451,7 @@ impl Diverger {
                                         params: None,
                                         audience_id: audience_id_for_walk.clone(),
                                     };
-                                    crate::motor::execute(&julian_url, cmd).await;
+                                    crate::motor::gate().dispatch("diverger", &julian_url, cmd).await;
                                 }
                             }
                         }

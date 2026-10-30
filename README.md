@@ -69,6 +69,7 @@ Walkers leave trails (visited nodes, dead ends, surprise domains). Other walkers
 # Prerequisites: PostgreSQL 16+, pgvector extension
 # Set environment
 export DATABASE_URL=postgresql:///rgw_test?host=/tmp
+export RGW_API_KEY="$(openssl rand -hex 32)"   # REQUIRED: rgw refuses to start without it
 export DEEPSEEK_API_KEY=sk-...
 export RUST_LOG=info,rgw=debug
 
@@ -86,6 +87,9 @@ cargo build --release --example digester
   --ollama-url http://localhost:11434 \
   --julian-url http://localhost:8000 \
   --port 11435
+
+# Every endpoint except /health requires the X-RGW-Key header
+curl -H "X-RGW-Key: $RGW_API_KEY" http://localhost:11435/self
 ```
 
 ## Cascade Demo Output
@@ -122,17 +126,40 @@ Insight → integration → exploration → re-integration. The loop closes."
 | `/prune` | POST | Synaptic pruning |
 | `/stats` | GET | Graph topology |
 | `/benchmark` | GET | Performance test |
-| `/health` | GET | Status check |
+| `/health` | GET | Status check (includes `motor_mode`) |
+| `/motor/proposals` | GET | Motor gate: mode, counters, pending/decided proposals, shadow ring |
+| `/motor/proposals/{id}/approve` | POST | Approve and send one proposal (body `{"confirm":"yes"}`) |
+| `/motor/proposals/{id}/reject` | POST | Reject one proposal (optional body `{"note":"..."}`) |
+
+## Motor gate
+
+Every outbound motor action (diverger commands to `JULIAN_URL`, and the `image_generate` /
+`post_social` / `blog_publish` tools via `RGW_MOTOR_URL`) passes through one gate. The mode is
+read once at startup from `RGW_MOTOR_MODE`:
+
+| Mode | Behaviour |
+|------|-----------|
+| `off` | Drop the action (debug log, counted). |
+| `shadow` | **Default.** Nothing is sent. Logged at INFO as `[motor] SHADOW` and kept in a small ring for inspection. |
+| `propose` | Nothing is sent. The action is queued as a proposal (max 100, expires after 24 h) for a human to approve or reject. |
+| `live` | Send immediately (the pre-gate behaviour). |
+
+Unset, empty or unrecognised values fall back to `shadow`, never `live`. Approving a proposal is a
+human action: `POST /motor/proposals/{id}/approve` with the body `{"confirm":"yes"}` (exact,
+case-sensitive) and the `X-RGW-Key` header. It sends exactly once. Held tool calls return
+`success: false` with `metadata.held = true`.
 
 ## Configuration
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
 | `DATABASE_URL` | required | PostgreSQL connection string |
+| `RGW_API_KEY` | **required** | Shared secret. RGW refuses to start if unset/empty. Callers send it as `X-RGW-Key` (all endpoints except `/health`). Generate with `openssl rand -hex 32`. |
 | `DEEPSEEK_API_KEY` | — | DeepSeek API key for LLM expression |
 | `DEEPSEEK_MODEL` | deepseek-chat | Model name (also: deepseek-reasoner) |
 | `RUST_LOG` | info | Log level (rgw=debug for detail) |
 | `WALKER_PORT` | 11435 | HTTP server port |
+| `RGW_MOTOR_MODE` | shadow | Motor gate: `off`, `shadow`, `propose` or `live` (see [Motor gate](#motor-gate)) |
 
 ## Performance
 

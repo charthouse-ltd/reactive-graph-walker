@@ -155,18 +155,11 @@ pub async fn dream(
 
     for result in &dream_results {
         // Look for cross-domain paths that don't normally exist
-        for window in result.domains_path.windows(2) {
-            if window.len() == 2 && window[0] != window[1] && !window[0].is_empty() && !window[1].is_empty() {
-                connections.push(DreamConnection {
-                    source_node: result.node_path[result.domains_path.iter().position(|d| d == &window[0]).unwrap_or(0)],
-                    target_node: result.node_path[result.domains_path.iter().position(|d| d == &window[1]).unwrap_or(0)],
-                    source_domain: window[0].clone(),
-                    target_domain: window[1].clone(),
-                    walk_weight: result.total_weight,
-                    via_noise: true,
-                });
-            }
-        }
+        connections.extend(cross_domain_connections(
+            &result.node_path,
+            &result.domains_path,
+            result.total_weight,
+        ));
     }
 
     // Phase 4: Filter for coherence — only keep connections that make semantic sense
@@ -277,6 +270,38 @@ struct DreamWalkResult {
     knowledge_anchors: usize,
 }
 
+/// Find cross-domain hops in one dream walk.
+///
+/// `node_path` starts with the seed; `domains_path[i]` is the domain of
+/// `node_path[i + 1]` (invariant: `domains_path.len() == node_path.len() - 1`).
+/// A hop from `node_path[i + 1]` to `node_path[i + 2]` is cross-domain when both
+/// domains are known (non-empty) and differ.
+fn cross_domain_connections(
+    node_path: &[i32],
+    domains_path: &[String],
+    walk_weight: f32,
+) -> Vec<DreamConnection> {
+    let mut out = Vec::new();
+    for i in 0..domains_path.len().saturating_sub(1) {
+        let (src, tgt) = (&domains_path[i], &domains_path[i + 1]);
+        if src.is_empty() || tgt.is_empty() || src == tgt {
+            continue;
+        }
+        let (Some(&source_node), Some(&target_node)) = (node_path.get(i + 1), node_path.get(i + 2)) else {
+            continue;
+        };
+        out.push(DreamConnection {
+            source_node,
+            target_node,
+            source_domain: src.clone(),
+            target_domain: tgt.clone(),
+            walk_weight,
+            via_noise: true,
+        });
+    }
+    out
+}
+
 /// Single dream walk with noise perturbation
 fn dream_walk_single(
     pool: &PgPool,
@@ -348,7 +373,8 @@ fn dream_walk_single(
         result.node_path.push(next_id);
         result.total_weight += edge.weight;
 
-        // Track domains
+        // Track domains. Exactly one entry per hop, so domains_path[i] always
+        // belongs to node_path[i + 1]; a failed lookup records "" (no domain).
         if let Ok(Some(node)) = rt.block_on(db::get_node(pool, next_id)) {
             result.domains_path.push(node.domain.clone());
 
@@ -363,6 +389,8 @@ fn dream_walk_single(
             // Note: we do NOT modify edges during dreams
             // Dreams observe but don't change the real graph
             // Only the kept insights create permanent edges (Phase 5)
+        } else {
+            result.domains_path.push(String::new());
         }
 
         current_id = next_id;
@@ -613,6 +641,62 @@ pub fn start_dream_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doms(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn pairs(c: &[DreamConnection]) -> Vec<(i32, i32, String, String)> {
+        c.iter()
+            .map(|c| (c.source_node, c.target_node, c.source_domain.clone(), c.target_domain.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn cross_domain_uses_hop_aligned_nodes() {
+        // Old code joined 10->20 (index one short); the a->b hop is 20->30.
+        let c = cross_domain_connections(&[10, 20, 30, 40], &doms(&["a", "b", "b"]), 0.3);
+        assert_eq!(pairs(&c), vec![(20, 30, "a".into(), "b".into())]);
+    }
+
+    #[test]
+    fn cross_domain_repeated_domains_map_to_each_hop() {
+        let c = cross_domain_connections(&[1, 2, 3, 4, 5], &doms(&["a", "b", "a", "b"]), 0.3);
+        assert_eq!(
+            pairs(&c),
+            vec![
+                (2, 3, "a".into(), "b".into()),
+                (3, 4, "b".into(), "a".into()),
+                (4, 5, "a".into(), "b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_domain_skips_failed_lookup_gap() {
+        let c = cross_domain_connections(&[1, 2, 3, 4], &doms(&["a", "", "b"]), 0.3);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn cross_domain_seed_only_is_empty() {
+        assert!(cross_domain_connections(&[7], &[], 0.3).is_empty());
+    }
+
+    #[test]
+    fn cross_domain_edges_join_adjacent_nodes() {
+        let path = [5, 9, 2, 8, 4, 6];
+        let c = cross_domain_connections(&path, &doms(&["x", "y", "x", "z", "z"]), 0.3);
+        assert!(!c.is_empty());
+        for conn in &c {
+            assert!(
+                path.windows(2).any(|w| w[0] == conn.source_node && w[1] == conn.target_node),
+                "edge {}->{} is not a hop in the walk",
+                conn.source_node,
+                conn.target_node
+            );
+        }
+    }
 
     #[test]
     fn spearman_monotonic_anti_and_flat() {

@@ -74,6 +74,12 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Fail closed: refuse to start without RGW_API_KEY (before embeddings / DB).
+    if let Err(msg) = api::validate_api_key(std::env::var("RGW_API_KEY").ok().as_deref()) {
+        tracing::error!("[rgw] {}", msg);
+        anyhow::bail!(msg);
+    }
+
     // Configure rayon thread pool
     let threads = if args.threads == 0 {
         rayon::current_num_threads()
