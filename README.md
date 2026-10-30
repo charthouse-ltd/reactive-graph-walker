@@ -122,7 +122,28 @@ Insight → integration → exploration → re-integration. The loop closes."
 | `/prune` | POST | Synaptic pruning |
 | `/stats` | GET | Graph topology |
 | `/benchmark` | GET | Performance test |
-| `/health` | GET | Status check |
+| `/health` | GET | Status check (includes `motor_mode`) |
+| `/motor/proposals` | GET | Motor gate: mode, counters, pending/decided proposals, shadow ring |
+| `/motor/proposals/{id}/approve` | POST | Approve and send one proposal (body `{"confirm":"yes"}`) |
+| `/motor/proposals/{id}/reject` | POST | Reject one proposal (optional body `{"note":"..."}`) |
+
+## Motor gate
+
+Every outbound motor action (diverger commands to `JULIAN_URL`, and the `image_generate` /
+`post_social` / `blog_publish` tools via `RGW_MOTOR_URL`) passes through one gate. The mode is
+read once at startup from `RGW_MOTOR_MODE`:
+
+| Mode | Behaviour |
+|------|-----------|
+| `off` | Drop the action (debug log, counted). |
+| `shadow` | **Default.** Nothing is sent. Logged at INFO as `[motor] SHADOW` and kept in a small ring for inspection. |
+| `propose` | Nothing is sent. The action is queued as a proposal (max 100, expires after 24 h) for a human to approve or reject. |
+| `live` | Send immediately (the pre-gate behaviour). |
+
+Unset, empty or unrecognised values fall back to `shadow`, never `live`. Approving a proposal is a
+human action: `POST /motor/proposals/{id}/approve` with the body `{"confirm":"yes"}` (exact,
+case-sensitive) and the `X-RGW-Key` header. It sends exactly once. Held tool calls return
+`success: false` with `metadata.held = true`.
 
 ## Configuration
 
@@ -133,6 +154,7 @@ Insight → integration → exploration → re-integration. The loop closes."
 | `DEEPSEEK_MODEL` | deepseek-chat | Model name (also: deepseek-reasoner) |
 | `RUST_LOG` | info | Log level (rgw=debug for detail) |
 | `WALKER_PORT` | 11435 | HTTP server port |
+| `RGW_MOTOR_MODE` | shadow | Motor gate: `off`, `shadow`, `propose` or `live` (see [Motor gate](#motor-gate)) |
 
 ## Performance
 
