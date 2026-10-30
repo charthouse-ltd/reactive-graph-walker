@@ -1249,6 +1249,18 @@ pub struct RuleTrialRecord {
     /// Live: applied. Shadow: would-accept (nothing applied).
     pub accepted: bool,
     pub shadow: bool,
+    /// Metric the decision pair (calib_current/calib_proposed) was scored under. Shadow trials
+    /// always score under Domain (Stage 2.1); live trials under the live metric (Domain).
+    /// Default Legacy: records written before Stage 2.1 were scored under the live metric,
+    /// which was Legacy everywhere.
+    #[serde(default)]
+    pub scored_with: AgreementMetric,
+    /// Shadow trials only, when the live metric is not Domain: the same pair scored under the
+    /// live metric (informational; not used for the decision).
+    #[serde(default)]
+    pub calib_current_live: Option<f32>,
+    #[serde(default)]
+    pub calib_proposed_live: Option<f32>,
 }
 
 /// Live-regression guard armed by an accepted trial (doc §"Rollback has two triggers").
@@ -1424,11 +1436,18 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
     let Some(proposal) = sm.pending_rule_proposals.pop_front() else { return };
     let shadow = proposal.applied_directly || !trials_live(sm);
 
-    // Never re-trial an identical delta that was already rejected (exact equality only).
+    // Shadow trials score under Domain whatever the live metric is, so would-accept is
+    // informative at the defaults (the replay is pure — no live effect). Live trials require
+    // Domain via trials_live, so they score under the live metric, which is Domain.
+    let live_metric = sm.agreement_metric;
+    let scored_with = if shadow { AgreementMetric::Domain } else { live_metric };
+
+    // Never re-trial an identical delta that was already rejected under the same scoring
+    // (exact equality only). A Legacy-scored rejection does not block a Domain-scored trial.
     if sm
         .rule_trial_history
         .iter()
-        .any(|r| !r.accepted && r.shadow == shadow && r.delta == proposal.delta)
+        .any(|r| !r.accepted && r.shadow == shadow && r.scored_with == scored_with && r.delta == proposal.delta)
     {
         tracing::info!(
             "[selection] rule trial skipped: identical delta already rejected ({})",
@@ -1439,10 +1458,18 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
 
     let current = if shadow { proposal.base.clone() } else { RuleConfigSnapshot::of(sm) };
     let proposed = current.with_delta(&proposal.delta);
-    let metric = sm.agreement_metric;
-    let calib_current = replay_calibration(&current, &sm.recent_walk_fitness, metric, &tc);
-    let calib_proposed = replay_calibration(&proposed, &sm.recent_walk_fitness, metric, &tc);
+    let calib_current = replay_calibration(&current, &sm.recent_walk_fitness, scored_with, &tc);
+    let calib_proposed = replay_calibration(&proposed, &sm.recent_walk_fitness, scored_with, &tc);
     let accepted = calib_proposed > calib_current + tc.margin;
+    // Shadow + non-Domain live metric: also record the pair under the live metric.
+    let (calib_current_live, calib_proposed_live) = if shadow && live_metric != scored_with {
+        (
+            Some(replay_calibration(&current, &sm.recent_walk_fitness, live_metric, &tc)),
+            Some(replay_calibration(&proposed, &sm.recent_walk_fitness, live_metric, &tc)),
+        )
+    } else {
+        (None, None)
+    };
 
     push_trial_record(sm, RuleTrialRecord {
         ts: crate::core::now(),
@@ -1452,13 +1479,20 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
         margin: tc.margin,
         accepted,
         shadow,
+        scored_with,
+        calib_current_live,
+        calib_proposed_live,
     });
 
     if shadow {
+        let live_pair = match (calib_current_live, calib_proposed_live) {
+            (Some(c), Some(p)) => format!("; live({:?}) calib {:.3} -> {:.3}", live_metric, c, p),
+            _ => String::new(),
+        };
         tracing::info!(
-            "[selection] SHADOW would-{} rule delta ({}): calib {:.3} -> {:.3} (margin {:.2}); nothing applied",
+            "[selection] SHADOW would-{} rule delta ({}): decision(Domain) calib {:.3} -> {:.3} (margin {:.2}){}; nothing applied",
             if accepted { "accept" } else { "reject" },
-            proposal.reason, calib_current, calib_proposed, tc.margin
+            proposal.reason, calib_current, calib_proposed, tc.margin, live_pair
         );
         return;
     }
@@ -2859,6 +2893,7 @@ mod tests {
             push_trial_record(&mut sm, RuleTrialRecord {
                 ts: 0.0, delta: CriticRuleDelta::default(), calib_current: 0.0, calib_proposed: 0.0,
                 margin: 0.0, accepted: false, shadow: true,
+                scored_with: AgreementMetric::Domain, calib_current_live: None, calib_proposed_live: None,
             });
         }
         assert!(sm.rule_trial_history.len() <= TRIAL_HISTORY_CAP);
@@ -2933,5 +2968,73 @@ mod tests {
         }
         assert!(approved_n >= 50 && rejected_n >= 50,
             "both outcomes must be exercised (approved {approved_n}, rejected {rejected_n})");
+    }
+
+    // ── Stage 2.1 Fix 1: shadow trials scored under Domain ──
+
+    #[test]
+    fn stage2_shadow_trial_scores_under_domain_at_observability_legacy() {
+        let mut sm = stage2_sm(SelfModStage::Observability, AgreementMetric::Legacy);
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        let before = model_minus_stage2_rings(&sm);
+        trial_pending_rules(&mut sm);
+
+        let r = sm.rule_trial_history.back().expect("shadow trial recorded");
+        assert!(r.shadow);
+        assert_eq!(r.scored_with, AgreementMetric::Domain, "decision pair scored under Domain");
+        assert!(r.calib_proposed > r.calib_current + RULE_TRIAL_CONFIG.margin, "would-accept is informative");
+        let (c, p) = (r.calib_current_live.expect("live pair recorded"), r.calib_proposed_live.expect("live pair recorded"));
+        assert_eq!(c, p, "the degenerate legacy pair is still recorded");
+        assert_eq!(model_minus_stage2_rings(&sm), before, "shadow trial commits nothing else");
+        assert!(sm.rule_rollback_ring.is_empty() && sm.rule_regression_watch.is_none());
+    }
+
+    #[test]
+    fn stage2_shadow_trial_under_domain_live_metric_records_no_live_pair() {
+        let mut sm = stage2_sm(SelfModStage::Observability, AgreementMetric::Domain);
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut sm);
+        let r = sm.rule_trial_history.back().unwrap();
+        assert_eq!(r.scored_with, AgreementMetric::Domain);
+        assert!(r.calib_current_live.is_none() && r.calib_proposed_live.is_none());
+    }
+
+    #[test]
+    fn stage2_old_trial_record_without_scored_with_loads_as_legacy() {
+        let rec = RuleTrialRecord {
+            ts: 1.0, delta: delta_threshold(0.5), calib_current: 0.5, calib_proposed: 0.5,
+            margin: 0.05, accepted: false, shadow: true,
+            scored_with: AgreementMetric::Domain, calib_current_live: Some(0.5), calib_proposed_live: Some(0.5),
+        };
+        let mut v = serde_json::to_value(&rec).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("scored_with");
+        o.remove("calib_current_live");
+        o.remove("calib_proposed_live");
+        let loaded: RuleTrialRecord = serde_json::from_value(v).expect("old record still loads");
+        assert_eq!(loaded.scored_with, AgreementMetric::Legacy);
+        assert!(loaded.calib_current_live.is_none() && loaded.calib_proposed_live.is_none());
+    }
+
+    #[test]
+    fn stage2_dedup_respects_scored_with() {
+        let rejected = |delta: CriticRuleDelta, scored_with: AgreementMetric| RuleTrialRecord {
+            ts: 0.0, delta, calib_current: 0.5, calib_proposed: 0.5, margin: 0.05,
+            accepted: false, shadow: true, scored_with, calib_current_live: None, calib_proposed_live: None,
+        };
+        // A Legacy-scored rejection does NOT block a Domain-scored shadow trial of the same delta.
+        let mut sm = stage2_sm(SelfModStage::Observability, AgreementMetric::Legacy);
+        sm.rule_trial_history.push_back(rejected(delta_threshold(0.5), AgreementMetric::Legacy));
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut sm);
+        assert_eq!(sm.rule_trial_history.len(), 2, "re-trialled under Domain scoring");
+
+        // A Domain-scored rejection of the same delta does block it.
+        let mut sm = stage2_sm(SelfModStage::Observability, AgreementMetric::Legacy);
+        sm.rule_trial_history.push_back(rejected(delta_threshold(0.5), AgreementMetric::Domain));
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut sm);
+        assert_eq!(sm.rule_trial_history.len(), 1, "same delta, same scoring → not re-trialled");
+        assert!(sm.pending_rule_proposals.is_empty());
     }
 }
