@@ -179,6 +179,17 @@ pub fn metacognitive_loop(
     self_model: &mut SelfModel,
     max_attempts: u32,
 ) -> Option<ValidatedAction> {
+    metacognitive_loop_inner(walk, self_model, max_attempts, crate::metrics::record_metacog_decision)
+}
+
+/// Body of [`metacognitive_loop`] with the approval-metric recorder injected, so tests can run
+/// the real loop without mutating process-global METRICS (which walker/dream read).
+fn metacognitive_loop_inner(
+    walk: &WalkOutput,
+    self_model: &mut SelfModel,
+    max_attempts: u32,
+    mut record_decision: impl FnMut(bool),
+) -> Option<ValidatedAction> {
     let mut attempt = 0;
     let mut prior_critiques: Vec<String> = Vec::new();
 
@@ -224,7 +235,7 @@ pub fn metacognitive_loop(
         ).with_domain(&proposed.domain)
          .with_intensity(if evaluation.approved { 0.3 } else { 0.5 });
         crate::core::process(signal, self_model);
-        crate::metrics::record_metacog_decision(evaluation.approved);
+        record_decision(evaluation.approved);
 
         if evaluation.approved {
             return Some(ValidatedAction {
@@ -1390,9 +1401,14 @@ pub fn record_replay_entry(sm: &mut SelfModel, entry: ReplayEntry) {
     if sm.mode != CognitiveMode::Autonomous {
         return;
     }
+    let was = sm.recent_walk_fitness.len();
     sm.recent_walk_fitness.push_back(entry);
     while sm.recent_walk_fitness.len() > REPLAY_M {
         sm.recent_walk_fitness.pop_front();
+    }
+    // One INFO line on the transition to a full buffer (per-cycle skips are DEBUG).
+    if was + 1 == REPLAY_M {
+        tracing::info!("[selection] replay buffer full ({} walks); rule trials can run", REPLAY_M);
     }
 }
 
@@ -1526,7 +1542,7 @@ pub fn live_pool_fitness(sm: &SelfModel) -> Option<f32> {
 pub fn trial_pending_rules(sm: &mut SelfModel) {
     let tc = RULE_TRIAL_CONFIG;
     if sm.mode != CognitiveMode::Autonomous {
-        tracing::info!("[selection] rule trial skipped: not Autonomous");
+        tracing::debug!("[selection] rule trial skipped: not Autonomous");
         return;
     }
     if sm.pending_rule_proposals.is_empty() {
@@ -1534,7 +1550,7 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
         return;
     }
     if sm.recent_walk_fitness.len() < REPLAY_M {
-        tracing::info!(
+        tracing::debug!(
             "[selection] rule trial skipped: replay buffer {}/{} ({} pending)",
             sm.recent_walk_fitness.len(), REPLAY_M, sm.pending_rule_proposals.len()
         );
@@ -2802,15 +2818,15 @@ mod tests {
 
         let mut legacy = base.clone();
         legacy.agreement_metric = crate::core::AgreementMetric::Legacy;
-        assert!(metacognitive_loop(&walk, &mut legacy, 2).is_none(), "Legacy reads 0.0 → rejected");
+        assert!(metacognitive_loop_inner(&walk, &mut legacy, 2, |_| {}).is_none(), "Legacy reads 0.0 → rejected");
 
         let mut domain = base.clone();
         domain.agreement_metric = crate::core::AgreementMetric::Domain;
-        assert!(metacognitive_loop(&walk, &mut domain, 2).is_some(), "Domain reads 0.9 → approved");
+        assert!(metacognitive_loop_inner(&walk, &mut domain, 2, |_| {}).is_some(), "Domain reads 0.9 → approved");
 
         let mut unknown = base.clone();
         unknown.agreement_metric = crate::core::AgreementMetric::Unknown;
-        assert!(metacognitive_loop(&walk, &mut unknown, 2).is_none(), "Unknown behaves as Legacy");
+        assert!(metacognitive_loop_inner(&walk, &mut unknown, 2, |_| {}).is_none(), "Unknown behaves as Legacy");
     }
 
     // ── Stage 2: rule trials, replay, rollback (PROTOCOL-self-selection §#2, §Compliance) ──
@@ -3083,10 +3099,11 @@ mod tests {
         let cfg = RuleConfigSnapshot::of(&sm);
         let tc = RULE_TRIAL_CONFIG;
         let before = replay_calibration(&cfg, &sm.recent_walk_fitness, sm.agreement_metric, &tc);
-        // Move every approval signal there is: global metacog approval and per-profile approval.
-        for _ in 0..200 {
-            crate::metrics::record_metacog_decision(true);
-        }
+        // Move the per-profile approval signal. Global METRICS is deliberately not mutated
+        // (process-global, read by walker/dream under parallel tests); it cannot reach the
+        // score structurally: replay_calibration's inputs are the RuleConfigSnapshot, the
+        // ReplayEntry buffer (exhaustively destructured above), the metric and RuleTrialConfig,
+        // none of which carries an approval value.
         for b in sm.learned_biases.iter_mut() {
             b.scorecard.approval = 1.0;
         }
@@ -3180,7 +3197,9 @@ mod tests {
             let entry = ReplayEntry::from_walk(&walk, &sm, 0.0);
             let cfg = RuleConfigSnapshot::of(&sm);
             let replay = replay_decide(&entry, &cfg, sm.agreement_metric, max_attempts);
-            let live = metacognitive_loop(&walk, &mut sm.clone(), max_attempts).is_some();
+            // The real loop (same body as metacognitive_loop) with a no-op approval recorder,
+            // so this test does not mutate process-global METRICS.
+            let live = metacognitive_loop_inner(&walk, &mut sm.clone(), max_attempts, |_| {}).is_some();
             assert_eq!(replay, live, "case {case}: replay_decide diverged from metacognitive_loop");
             if live { approved_n += 1 } else { rejected_n += 1 }
         }
