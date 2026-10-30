@@ -458,6 +458,8 @@ struct MetacogConfigPatch {
     learned_bias_rotation: Option<u64>,
     /// Spawn additional learned-bias profiles (bounded).
     spawn_bias_variants: Option<u8>,
+    /// "legacy" | "domain" — which agreement signal drives decisions (default legacy).
+    agreement_metric: Option<crate::core::AgreementMetric>,
 }
 
 /// POST /metacog/config — mutate metacognitive runtime config.
@@ -467,6 +469,21 @@ async fn set_metacog_config(
     Json(req): Json<MetacogConfigPatch>,
 ) -> Json<serde_json::Value> {
     let mut sm = state.self_model.lock().await;
+
+    if let Some(metric) = req.agreement_metric {
+        if metric == crate::core::AgreementMetric::Unknown {
+            return Json(serde_json::json!({
+                "status": "error",
+                "error": "agreement_metric must be 'legacy' or 'domain'"
+            }));
+        }
+        let prev = sm.agreement_metric;
+        sm.agreement_metric = metric;
+        tracing::warn!(
+            "[selection] agreement_metric {:?} -> {:?} (operator via /metacog/config)",
+            prev, sm.agreement_metric
+        );
+    }
 
     if let Some(v) = req.min_energy {
         sm.critic_rules.min_energy = v.clamp(0.05, 0.6);
@@ -570,6 +587,7 @@ fn metacog_config_json(sm: &SelfModel) -> serde_json::Value {
             "wound_confidence_floor": sm.critic_rules.wound_confidence_floor,
         },
         "phase_order": sm.metacog_phase_order,
+        "agreement_metric": sm.agreement_metric,
         "learned_bias_count": sm.learned_biases.len(),
         "learned_bias_rotation": sm.learned_bias_rotation,
         "active_goal_domain": sm.active_goal_domain,

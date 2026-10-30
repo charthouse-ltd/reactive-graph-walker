@@ -171,6 +171,30 @@ impl SelfModStage {
     }
 }
 
+/// Which walker-agreement signal drives `recommend_action` and the metacog hallucination check.
+/// Legacy = node-overlap `agreement` (≈0 by construction with dispersed seeds); Domain =
+/// `domain_agreement` (do walkers converge on a dominant domain?). Default Legacy, so behaviour
+/// is unchanged until an operator switches it via POST /metacog/config. Stage-2 rule trials
+/// refuse to apply anything unless this is Domain (PROTOCOL-self-selection §#2 prerequisite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgreementMetric {
+    #[default]
+    Legacy,
+    Domain,
+    /// Catch-all for an unknown string (downgrade-load). Behaves as Legacy. Without it an
+    /// unknown variant would error the whole deserialize and wipe the model.
+    #[serde(other)]
+    Unknown,
+}
+
+impl AgreementMetric {
+    /// True only for Domain; Legacy and Unknown both mean the legacy node-overlap metric.
+    pub fn is_domain(&self) -> bool {
+        matches!(self, AgreementMetric::Domain)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SelfModel {
     // ── How I operate ──
@@ -303,6 +327,9 @@ pub struct SelfModel {
     /// detect a mid-walk pool change and skip now-stale bias-credit attribution.
     #[serde(default)]
     pub pool_generation: u64,
+    /// Which agreement signal drives decisions (default Legacy). See AgreementMetric.
+    #[serde(default)]
+    pub agreement_metric: AgreementMetric,
 
     // ── Meta ──
     pub total_signals_processed: u64,
@@ -506,6 +533,7 @@ impl SelfModel {
             self_mod_stage: SelfModStage::default(),
             selection_cycle_counter: 0,
             pool_generation: 0,
+            agreement_metric: AgreementMetric::default(),
             total_signals_processed: 0,
             total_noticings: 0,
             uptime: 0.0,
@@ -1300,6 +1328,7 @@ mod tests {
         o.remove("selection_history");
         o.remove("self_mod_stage");
         o.remove("selection_cycle_counter");
+        o.remove("agreement_metric");
         let s = serde_json::to_string(&v).unwrap();
         let loaded: Option<SelfModel> = serde_json::from_str(&s).ok();
         assert!(
@@ -1308,6 +1337,7 @@ mod tests {
         );
         let m = loaded.unwrap();
         assert_eq!(m.selection_history.len(), 0, "missing selection_history → empty ring");
+        assert_eq!(m.agreement_metric, AgreementMetric::Legacy, "missing agreement_metric → Legacy");
         assert_eq!(
             m.self_mod_stage,
             SelfModStage::Observability,
@@ -1342,5 +1372,25 @@ mod tests {
             !loaded.unwrap().self_mod_stage.allows_selection(),
             "unknown variant degrades to an inert stage"
         );
+    }
+
+    #[test]
+    fn agreement_metric_defaults_legacy_and_unknown_loads_as_legacy_not_wipe() {
+        assert_eq!(AgreementMetric::default(), AgreementMetric::Legacy);
+        assert_eq!(SelfModel::new().agreement_metric, AgreementMetric::Legacy, "ships legacy");
+        assert!(AgreementMetric::Domain.is_domain());
+        assert!(!AgreementMetric::Legacy.is_domain());
+        assert!(!AgreementMetric::Unknown.is_domain(), "Unknown behaves as Legacy");
+
+        let mut v = serde_json::to_value(SelfModel::new()).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("agreement_metric".into(), serde_json::json!("path_cosine_FUTURE"));
+        let s = serde_json::to_string(&v).unwrap();
+        let loaded: Option<SelfModel> = serde_json::from_str(&s).ok();
+        assert!(loaded.is_some(), "unknown agreement_metric must NOT wipe the model");
+        let m = loaded.unwrap();
+        assert_eq!(m.agreement_metric, AgreementMetric::Unknown);
+        assert!(!m.agreement_metric.is_domain(), "Unknown degrades to legacy behaviour");
     }
 }

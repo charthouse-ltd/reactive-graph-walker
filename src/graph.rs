@@ -678,6 +678,9 @@ pub struct WalkOutput {
     pub primary_domain: String,
     pub domain_distribution: std::collections::HashMap<String, usize>,
     pub agreement_score: f32,
+    /// Domain-level agreement (fraction of walkers sharing the modal dominant domain).
+    /// Always reported; drives decisions only when SelfModel.agreement_metric == Domain.
+    pub domain_agreement_score: f32,
     pub novelty_score: f32,
     pub emotional_resonance: f32,
     pub search_query: Option<String>,

@@ -202,7 +202,13 @@ pub fn metacognitive_loop(
                 walk.walker_count,
             ),
             confidence: walk.agreement_score,
-            walker_agreement: walk.agreement_score,
+            // Hallucination check reads the operator-selected agreement signal; confidence
+            // (and the wound floor that reads it) stays on the legacy score.
+            walker_agreement: if self_model.agreement_metric.is_domain() {
+                walk.domain_agreement_score
+            } else {
+                walk.agreement_score
+            },
             walker_novelty: walk.novelty_score,
             walker_context: String::new(), // Filled by caller
             attempt,
@@ -1184,6 +1190,7 @@ mod tests {
                 m
             },
             agreement_score: 0.72,
+            domain_agreement_score: 0.5,
             novelty_score: 0.34,
             emotional_resonance: 0.5,
             search_query: None,
@@ -2030,5 +2037,30 @@ mod tests {
         let gen_before = sm.pool_generation;
         select_biases(&mut sm);
         assert_eq!(sm.pool_generation, gen_before, "Observability commits nothing → no generation bump");
+    }
+
+    // ── Stage 2 Step 1: flag-gated domain agreement in the hallucination check ──
+
+    #[test]
+    fn metacognitive_loop_reads_domain_agreement_only_under_domain_metric() {
+        // Legacy agreement 0 (fails the 0.2 threshold), domain agreement 0.9 (passes).
+        let walk = WalkOutput { agreement_score: 0.0, domain_agreement_score: 0.9, ..test_walk_output() };
+        let mut base = SelfModel::new();
+        base.mode = CognitiveMode::Autonomous;
+        base.energy = 0.9;
+        base.attention_patterns.clear();
+        base.wounds.clear();
+
+        let mut legacy = base.clone();
+        legacy.agreement_metric = crate::core::AgreementMetric::Legacy;
+        assert!(metacognitive_loop(&walk, &mut legacy, 2).is_none(), "Legacy reads 0.0 → rejected");
+
+        let mut domain = base.clone();
+        domain.agreement_metric = crate::core::AgreementMetric::Domain;
+        assert!(metacognitive_loop(&walk, &mut domain, 2).is_some(), "Domain reads 0.9 → approved");
+
+        let mut unknown = base.clone();
+        unknown.agreement_metric = crate::core::AgreementMetric::Unknown;
+        assert!(metacognitive_loop(&walk, &mut unknown, 2).is_none(), "Unknown behaves as Legacy");
     }
 }
