@@ -171,7 +171,9 @@ pub async fn serve(
     let app = public
         .merge(protected)
         .with_state(state.clone())
-        .layer(CorsLayer::permissive());
+        // Closed CORS. Callers are server-side and do not send Origin.
+        // A permissive layer echoed any Origin.
+        .layer(CorsLayer::new());
 
     // Auto-save self-model every 60 seconds (consciousness persistence)
     {
