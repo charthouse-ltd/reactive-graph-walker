@@ -469,17 +469,16 @@ struct MetacogConfigPatch {
 async fn set_metacog_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MetacogConfigPatch>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Validate before taking the lock or mutating anything: an invalid patch applies nothing.
+    if let Err((status, body)) = validate_agreement_metric(req.agreement_metric) {
+        return (status, Json(body));
+    }
+
     let mut sm = state.self_model.lock().await;
     let rules_before = crate::metacog::RuleConfigSnapshot::of(&sm);
 
     if let Some(metric) = req.agreement_metric {
-        if metric == crate::core::AgreementMetric::Unknown {
-            return Json(serde_json::json!({
-                "status": "error",
-                "error": "agreement_metric must be 'legacy' or 'domain'"
-            }));
-        }
         let prev = sm.agreement_metric;
         sm.agreement_metric = metric;
         tracing::warn!(
@@ -512,10 +511,10 @@ async fn set_metacog_config(
         let has_draft = phases.iter().any(|p| p == &MetacogPhase::Draft);
         let has_critique = phases.iter().any(|p| p == &MetacogPhase::Critique);
         if !has_draft || !has_critique {
-            return Json(serde_json::json!({
+            return (StatusCode::OK, Json(serde_json::json!({
                 "status": "error",
                 "error": "phase_order must include both 'draft' and 'critique'"
-            }));
+            })));
         }
         sm.metacog_phase_order = phases;
     }
@@ -532,10 +531,27 @@ async fn set_metacog_config(
     // them and clear any regression watch (its baseline no longer belongs to the accept).
     crate::metacog::note_operator_rule_edit(&mut sm, &rules_before);
 
-    Json(serde_json::json!({
+    (StatusCode::OK, Json(serde_json::json!({
         "status": "ok",
         "config": metacog_config_json(&sm),
-    }))
+    })))
+}
+
+/// Validate the agreement_metric field of a /metacog/config patch. Only "legacy" and "domain"
+/// are settable; anything else (deserialized as Unknown) is a 400 with the error body.
+fn validate_agreement_metric(
+    metric: Option<crate::core::AgreementMetric>,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    match metric {
+        Some(crate::core::AgreementMetric::Unknown) => Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "status": "error",
+                "error": "agreement_metric must be 'legacy' or 'domain'"
+            }),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// GET /selection/stats — Stage 0-2 self-selection state (read-only). Auth-protected.
@@ -1494,5 +1510,22 @@ mod tests {
         assert_eq!(v["rollback_depth"], 0);
         assert_eq!(v["replay_buffer"]["required"], crate::metacog::REPLAY_M);
         assert!(v["regression_watch"].is_null());
+    }
+
+    #[test]
+    fn validate_agreement_metric_accepts_legacy_domain_rejects_unknown_with_400() {
+        use crate::core::AgreementMetric;
+        assert!(validate_agreement_metric(None).is_ok(), "field absent: nothing to validate");
+        assert!(validate_agreement_metric(Some(AgreementMetric::Legacy)).is_ok());
+        assert!(validate_agreement_metric(Some(AgreementMetric::Domain)).is_ok());
+        let (status, body) = validate_agreement_metric(Some(AgreementMetric::Unknown)).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], "error");
+
+        // The patch's own deserialization maps an unknown string to Unknown (→ 400), not a 422.
+        let patch: MetacogConfigPatch = serde_json::from_str(r#"{"agreement_metric":"domian"}"#).unwrap();
+        assert!(validate_agreement_metric(patch.agreement_metric).is_err());
+        let ok: MetacogConfigPatch = serde_json::from_str(r#"{"agreement_metric":"domain"}"#).unwrap();
+        assert!(validate_agreement_metric(ok.agreement_metric).is_ok());
     }
 }
