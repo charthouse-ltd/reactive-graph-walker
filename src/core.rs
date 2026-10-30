@@ -334,9 +334,11 @@ pub struct SelfModel {
     /// FIFO of critic rule deltas awaiting an offline trial (cap metacog::PENDING_CAP).
     #[serde(default)]
     pub pending_rule_proposals: VecDeque<crate::metacog::PendingRuleProposal>,
-    /// Configs replaced by accepted trials, newest last (cap metacog::ROLLBACK_N).
+    /// Accepted trials as before/after configs, newest last (cap metacog::ROLLBACK_N). Replaces
+    /// the pre-2.1 `rule_rollback_ring` (whole-snapshot elements); an old snapshot carrying that
+    /// field still loads (unknown fields are ignored) and starts with no entries.
     #[serde(default)]
-    pub rule_rollback_ring: VecDeque<crate::metacog::RuleConfigSnapshot>,
+    pub rule_rollback_entries: VecDeque<crate::metacog::RollbackEntry>,
     /// Replay buffer of recent Autonomous walks + intrinsic fitness (cap metacog::REPLAY_M).
     #[serde(default)]
     pub recent_walk_fitness: VecDeque<crate::metacog::ReplayEntry>,
@@ -551,7 +553,7 @@ impl SelfModel {
             pool_generation: 0,
             agreement_metric: AgreementMetric::default(),
             pending_rule_proposals: VecDeque::new(),
-            rule_rollback_ring: VecDeque::new(),
+            rule_rollback_entries: VecDeque::new(),
             recent_walk_fitness: VecDeque::new(),
             rule_trial_history: VecDeque::new(),
             rule_regression_watch: None,
@@ -1351,7 +1353,7 @@ mod tests {
         o.remove("selection_cycle_counter");
         o.remove("agreement_metric");
         o.remove("pending_rule_proposals");
-        o.remove("rule_rollback_ring");
+        o.remove("rule_rollback_entries");
         o.remove("recent_walk_fitness");
         o.remove("rule_trial_history");
         o.remove("rule_regression_watch");
@@ -1364,7 +1366,7 @@ mod tests {
         let m = loaded.unwrap();
         assert_eq!(m.selection_history.len(), 0, "missing selection_history → empty ring");
         assert_eq!(m.agreement_metric, AgreementMetric::Legacy, "missing agreement_metric → Legacy");
-        assert!(m.pending_rule_proposals.is_empty() && m.rule_rollback_ring.is_empty());
+        assert!(m.pending_rule_proposals.is_empty() && m.rule_rollback_entries.is_empty());
         assert!(m.recent_walk_fitness.is_empty() && m.rule_trial_history.is_empty());
         assert!(m.rule_regression_watch.is_none(), "missing Stage-2 fields → empty/None");
         assert_eq!(
@@ -1421,5 +1423,20 @@ mod tests {
         let m = loaded.unwrap();
         assert_eq!(m.agreement_metric, AgreementMetric::Unknown);
         assert!(!m.agreement_metric.is_domain(), "Unknown degrades to legacy behaviour");
+    }
+
+    #[test]
+    fn self_model_loads_with_pre_2_1_rule_rollback_ring() {
+        // Stage 2.1 replaced rule_rollback_ring (RuleConfigSnapshot elements) with
+        // rule_rollback_entries. An old snapshot still carrying a non-empty ring must load
+        // (unknown fields are ignored), not fail and wipe the model.
+        let mut v = serde_json::to_value(SelfModel::new()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("rule_rollback_entries");
+        let old_elem = serde_json::to_value(crate::metacog::RuleConfigSnapshot::of(&SelfModel::new())).unwrap();
+        o.insert("rule_rollback_ring".into(), serde_json::json!([old_elem]));
+        let loaded: Option<SelfModel> = serde_json::from_str(&serde_json::to_string(&v).unwrap()).ok();
+        assert!(loaded.is_some(), "old-format ring must not wipe the model");
+        assert!(loaded.unwrap().rule_rollback_entries.is_empty());
     }
 }

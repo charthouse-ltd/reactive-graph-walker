@@ -1163,6 +1163,113 @@ impl RuleConfigSnapshot {
     }
 }
 
+/// One of the seven rule-config fields (the six CriticRuleProfile thresholds + phase order).
+/// Field-level rollback works per field so operator edits made after an accept survive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleField {
+    MinEnergy,
+    AgreementThresholdAutonomous,
+    AgreementThresholdCompliant,
+    MaxAttentionSaturation,
+    WoundGuardThreshold,
+    WoundConfidenceFloor,
+    PhaseOrder,
+}
+
+impl RuleField {
+    const ALL: [RuleField; 7] = [
+        RuleField::MinEnergy,
+        RuleField::AgreementThresholdAutonomous,
+        RuleField::AgreementThresholdCompliant,
+        RuleField::MaxAttentionSaturation,
+        RuleField::WoundGuardThreshold,
+        RuleField::WoundConfidenceFloor,
+        RuleField::PhaseOrder,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            RuleField::MinEnergy => "min_energy",
+            RuleField::AgreementThresholdAutonomous => "agreement_threshold_autonomous",
+            RuleField::AgreementThresholdCompliant => "agreement_threshold_compliant",
+            RuleField::MaxAttentionSaturation => "max_attention_saturation",
+            RuleField::WoundGuardThreshold => "wound_guard_threshold",
+            RuleField::WoundConfidenceFloor => "wound_confidence_floor",
+            RuleField::PhaseOrder => "phase_order",
+        }
+    }
+
+    /// The f32 threshold this field names; None for PhaseOrder.
+    fn threshold(self, r: &CriticRuleProfile) -> Option<f32> {
+        match self {
+            RuleField::MinEnergy => Some(r.min_energy),
+            RuleField::AgreementThresholdAutonomous => Some(r.agreement_threshold_autonomous),
+            RuleField::AgreementThresholdCompliant => Some(r.agreement_threshold_compliant),
+            RuleField::MaxAttentionSaturation => Some(r.max_attention_saturation),
+            RuleField::WoundGuardThreshold => Some(r.wound_guard_threshold),
+            RuleField::WoundConfidenceFloor => Some(r.wound_confidence_floor),
+            RuleField::PhaseOrder => None,
+        }
+    }
+
+    /// Is this field equal in the two configs?
+    fn same(self, a_rules: &CriticRuleProfile, a_phases: &[MetacogPhase], b_rules: &CriticRuleProfile, b_phases: &[MetacogPhase]) -> bool {
+        match self {
+            RuleField::PhaseOrder => a_phases == b_phases,
+            _ => self.threshold(a_rules) == self.threshold(b_rules),
+        }
+    }
+
+    /// Copy this field from a snapshot into the live config.
+    fn copy_into(self, from: &RuleConfigSnapshot, sm: &mut SelfModel) {
+        let (src, dst) = (&from.critic_rules, &mut sm.critic_rules);
+        match self {
+            RuleField::MinEnergy => dst.min_energy = src.min_energy,
+            RuleField::AgreementThresholdAutonomous => dst.agreement_threshold_autonomous = src.agreement_threshold_autonomous,
+            RuleField::AgreementThresholdCompliant => dst.agreement_threshold_compliant = src.agreement_threshold_compliant,
+            RuleField::MaxAttentionSaturation => dst.max_attention_saturation = src.max_attention_saturation,
+            RuleField::WoundGuardThreshold => dst.wound_guard_threshold = src.wound_guard_threshold,
+            RuleField::WoundConfidenceFloor => dst.wound_confidence_floor = src.wound_confidence_floor,
+            RuleField::PhaseOrder => sm.metacog_phase_order = from.phase_order.clone(),
+        }
+    }
+}
+
+/// One accepted trial, as a rollback record: the config just before and just after the accept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RollbackEntry {
+    pub before: RuleConfigSnapshot,
+    pub after: RuleConfigSnapshot,
+    pub ts: f64,
+    pub reason: String,
+}
+
+impl RollbackEntry {
+    /// Fields that differ between before and after — computed by comparing the snapshots, NOT
+    /// from which delta fields were Some (a Some field can be a no-op: an invalid phase_order
+    /// is ignored, a clamp can land on the same value).
+    fn changed(&self) -> Vec<RuleField> {
+        RuleField::ALL
+            .into_iter()
+            .filter(|f| !f.same(&self.before.critic_rules, &self.before.phase_order, &self.after.critic_rules, &self.after.phase_order))
+            .collect()
+    }
+
+    pub fn changed_field_names(&self) -> Vec<&'static str> {
+        self.changed().into_iter().map(RuleField::name).collect()
+    }
+}
+
+/// Result of a field-level rollback.
+#[derive(Debug, Clone, Serialize)]
+pub struct RollbackOutcome {
+    pub entry: RollbackEntry,
+    /// Changed fields whose live value still equalled the accept's value → restored to before.
+    pub restored: Vec<&'static str>,
+    /// Changed fields edited since the accept (operator or otherwise) → left alone.
+    pub skipped: Vec<&'static str>,
+}
+
 impl CriticRuleDelta {
     /// True when no field is set (nothing to apply or trial).
     pub fn is_empty(&self) -> bool {
@@ -1498,7 +1605,12 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
     }
 
     if accepted {
-        push_rollback(sm, current);
+        push_rollback(sm, RollbackEntry {
+            before: current,
+            after: proposed.clone(),
+            ts: crate::core::now(),
+            reason: proposal.reason.clone(),
+        });
         proposed.restore_into(sm);
         sm.rule_regression_watch = live_pool_fitness(sm).map(|baseline_fitness| RegressionWatch {
             baseline_fitness,
@@ -1508,7 +1620,7 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
         tracing::warn!(
             "[selection] ACCEPTED rule delta ({}): calib {:.3} -> {:.3} (margin {:.2}); rollback depth {}; delta {:?}",
             proposal.reason, calib_current, calib_proposed, tc.margin,
-            sm.rule_rollback_ring.len(), proposal.delta
+            sm.rule_rollback_entries.len(), proposal.delta
         );
     } else {
         tracing::info!(
@@ -1518,19 +1630,64 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
     }
 }
 
-fn push_rollback(sm: &mut SelfModel, snap: RuleConfigSnapshot) {
-    sm.rule_rollback_ring.push_back(snap);
-    while sm.rule_rollback_ring.len() > ROLLBACK_N {
-        sm.rule_rollback_ring.pop_front();
+fn push_rollback(sm: &mut SelfModel, entry: RollbackEntry) {
+    sm.rule_rollback_entries.push_back(entry);
+    while sm.rule_rollback_entries.len() > ROLLBACK_N {
+        sm.rule_rollback_entries.pop_front();
     }
 }
 
-/// Pop the newest rollback snapshot and restore it exactly. Clears any regression watch.
-pub fn rollback_last_rule(sm: &mut SelfModel) -> Option<RuleConfigSnapshot> {
-    let snap = sm.rule_rollback_ring.pop_back()?;
-    snap.restore_into(sm);
+/// Field-level rollback of the newest accepted trial. For each field the accept changed:
+/// restore the before value only if the live value still equals the accept's value; otherwise
+/// (an operator or anything else changed it since) leave it and report it skipped. Fields the
+/// accept did not change are never touched. Clears any regression watch. None when empty.
+pub fn rollback_last_rule(sm: &mut SelfModel) -> Option<RollbackOutcome> {
+    let entry = sm.rule_rollback_entries.pop_back()?;
+    let mut restored = Vec::new();
+    let mut skipped = Vec::new();
+    for field in entry.changed() {
+        if field.same(&sm.critic_rules, &sm.metacog_phase_order, &entry.after.critic_rules, &entry.after.phase_order) {
+            field.copy_into(&entry.before, sm);
+            restored.push(field.name());
+        } else {
+            skipped.push(field.name());
+        }
+    }
     sm.rule_regression_watch = None;
-    Some(snap)
+    if !skipped.is_empty() {
+        tracing::warn!(
+            "[selection] rollback left {:?} alone: edited since the accept ({})",
+            skipped, entry.reason
+        );
+    }
+    Some(RollbackOutcome { entry, restored, skipped })
+}
+
+/// Clear an armed regression watch, WARN-logging the cause. No-op when none is armed.
+pub fn clear_regression_watch(sm: &mut SelfModel, cause: &str) {
+    if let Some(w) = sm.rule_regression_watch.take() {
+        tracing::warn!(
+            "[selection] regression watch cleared ({}): baseline {:.3}, {} cycles observed",
+            cause, w.baseline_fitness, w.cycles_observed
+        );
+    }
+}
+
+/// Operator rule edit (POST /metacog/config): if the rule config differs from `before`, WARN-log
+/// the change and clear the regression watch — its baseline is no longer attributable to the
+/// accepted delta. Rollback entries are kept; field-level rollback protects the operator's
+/// values. Returns whether the config changed.
+pub fn note_operator_rule_edit(sm: &mut SelfModel, before: &RuleConfigSnapshot) -> bool {
+    let after = RuleConfigSnapshot::of(sm);
+    if &after == before {
+        return false;
+    }
+    tracing::warn!(
+        "[selection] operator changed rule config via /metacog/config: {:?} -> {:?}",
+        before, after
+    );
+    clear_regression_watch(sm, "operator rule edit");
+    true
 }
 
 /// Live-regression guard (trigger 2): once per dream cycle, only when trials_live. If live
@@ -1552,9 +1709,9 @@ pub fn check_rule_regression(sm: &mut SelfModel) {
     }
     if watch.cycles_below >= t {
         match rollback_last_rule(sm) {
-            Some(_) => tracing::warn!(
-                "[selection] ROLLBACK: live fitness {:.3} below baseline {:.3} for {} cycles; restored previous rule config (depth now {})",
-                live, watch.baseline_fitness, t, sm.rule_rollback_ring.len()
+            Some(out) => tracing::warn!(
+                "[selection] ROLLBACK: live fitness {:.3} below baseline {:.3} for {} cycles; restored {:?}, skipped {:?} (depth now {})",
+                live, watch.baseline_fitness, t, out.restored, out.skipped, sm.rule_rollback_entries.len()
             ),
             None => {
                 sm.rule_regression_watch = None;
@@ -2701,7 +2858,7 @@ mod tests {
             assert_eq!(model_minus_stage2_rings(&sm), before, "{stage:?}: shadow trial must commit nothing");
             assert_eq!(sm.rule_trial_history.len(), 1);
             assert!(sm.rule_trial_history[0].shadow);
-            assert!(sm.rule_rollback_ring.is_empty());
+            assert!(sm.rule_rollback_entries.is_empty());
             assert!(sm.rule_regression_watch.is_none());
         }
     }
@@ -2732,7 +2889,7 @@ mod tests {
             assert!(sm.pending_rule_proposals[0].applied_directly, "legacy direct path, not a live trial");
             trial_pending_rules(&mut sm);
             assert!(sm.rule_trial_history.back().unwrap().shadow, "{metric:?}: trial is shadow only");
-            assert!(sm.rule_rollback_ring.is_empty(), "{metric:?}: nothing accepted");
+            assert!(sm.rule_rollback_entries.is_empty(), "{metric:?}: nothing accepted");
             assert!(sm.rule_regression_watch.is_none());
         }
     }
@@ -2758,7 +2915,12 @@ mod tests {
             base: RuleConfigSnapshot::of(&sm),
             applied_directly: false,
         });
-        sm.rule_rollback_ring.push_back(RuleConfigSnapshot::of(&SelfModel::new()));
+        sm.rule_rollback_entries.push_back(RollbackEntry {
+            before: RuleConfigSnapshot::of(&SelfModel::new()),
+            after: RuleConfigSnapshot::of(&sm),
+            ts: 0.0,
+            reason: "test".into(),
+        });
         sm.rule_regression_watch = Some(RegressionWatch { baseline_fitness: 10.0, cycles_below: 0, cycles_observed: 0 });
         let before = serde_json::to_string(&sm).unwrap();
         for _ in 0..(RULE_TRIAL_CONFIG.regression_cycles * 2) {
@@ -2779,8 +2941,9 @@ mod tests {
         assert!(rec.accepted && !rec.shadow);
         assert!(rec.calib_proposed > rec.calib_current + RULE_TRIAL_CONFIG.margin);
         assert_eq!(sm.critic_rules.agreement_threshold_autonomous, 0.5, "accepted delta is live");
-        assert_eq!(sm.rule_rollback_ring.len(), 1);
-        assert_eq!(sm.rule_rollback_ring[0], original);
+        assert_eq!(sm.rule_rollback_entries.len(), 1);
+        assert_eq!(sm.rule_rollback_entries[0].before, original);
+        assert_eq!(sm.rule_rollback_entries[0].after, RuleConfigSnapshot::of(&sm));
         let w = sm.rule_regression_watch.as_ref().expect("watch armed");
         assert_eq!(w.baseline_fitness, 0.3);
     }
@@ -2796,7 +2959,7 @@ mod tests {
         assert_eq!(RuleConfigSnapshot::of(&sm), original, "rejected delta never goes live");
         assert_eq!(sm.rule_trial_history.len(), 1);
         assert!(!sm.rule_trial_history[0].accepted);
-        assert!(sm.rule_rollback_ring.is_empty());
+        assert!(sm.rule_rollback_entries.is_empty());
 
         route_rule_delta(&mut sm, &worse, "test-again");
         trial_pending_rules(&mut sm);
@@ -2814,9 +2977,12 @@ mod tests {
         trial_pending_rules(&mut sm);
         assert_ne!(RuleConfigSnapshot::of(&sm), original);
 
-        let restored = rollback_last_rule(&mut sm).expect("ring has one entry");
-        assert_eq!(restored, original);
+        let out = rollback_last_rule(&mut sm).expect("ring has one entry");
+        assert_eq!(out.entry.before, original);
         assert_eq!(RuleConfigSnapshot::of(&sm), original, "field-for-field restore");
+        assert_eq!(out.restored, out.entry.changed_field_names(), "every changed field restored");
+        assert_eq!(out.restored, vec!["agreement_threshold_autonomous"]);
+        assert!(out.skipped.is_empty());
         assert!(sm.rule_regression_watch.is_none());
         assert!(rollback_last_rule(&mut sm).is_none(), "empty ring → None (API returns 409)");
     }
@@ -2900,9 +3066,9 @@ mod tests {
 
         for _ in 0..(ROLLBACK_N * 10) {
             let snap = RuleConfigSnapshot::of(&sm);
-            push_rollback(&mut sm, snap);
+            push_rollback(&mut sm, RollbackEntry { before: snap.clone(), after: snap, ts: 0.0, reason: "bound".into() });
         }
-        assert!(sm.rule_rollback_ring.len() <= ROLLBACK_N);
+        assert!(sm.rule_rollback_entries.len() <= ROLLBACK_N);
 
         // And at most one trial per dream cycle.
         let mut one = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
@@ -2986,7 +3152,7 @@ mod tests {
         let (c, p) = (r.calib_current_live.expect("live pair recorded"), r.calib_proposed_live.expect("live pair recorded"));
         assert_eq!(c, p, "the degenerate legacy pair is still recorded");
         assert_eq!(model_minus_stage2_rings(&sm), before, "shadow trial commits nothing else");
-        assert!(sm.rule_rollback_ring.is_empty() && sm.rule_regression_watch.is_none());
+        assert!(sm.rule_rollback_entries.is_empty() && sm.rule_regression_watch.is_none());
     }
 
     #[test]
@@ -3036,5 +3202,84 @@ mod tests {
         trial_pending_rules(&mut sm);
         assert_eq!(sm.rule_trial_history.len(), 1, "same delta, same scoring → not re-trialled");
         assert!(sm.pending_rule_proposals.is_empty());
+    }
+
+    // ── Stage 2.1 Fix 2: field-level rollback preserves operator edits ──
+
+    /// Live sm with delta_threshold(0.5) accepted (threshold 0.2 → 0.5) and the watch armed.
+    fn accepted_sm() -> (SelfModel, RuleConfigSnapshot) {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        let original = RuleConfigSnapshot::of(&sm);
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut sm);
+        assert_eq!(sm.critic_rules.agreement_threshold_autonomous, 0.5, "precondition: accepted");
+        assert!(sm.rule_regression_watch.is_some(), "precondition: watch armed");
+        (sm, original)
+    }
+
+    #[test]
+    fn stage2_rollback_preserves_operator_edit_on_changed_field() {
+        let (mut sm, original) = accepted_sm();
+        sm.critic_rules.agreement_threshold_autonomous = 0.7; // operator edit after the accept
+        let out = rollback_last_rule(&mut sm).unwrap();
+        assert_eq!(sm.critic_rules.agreement_threshold_autonomous, 0.7, "operator value survives");
+        assert_eq!(out.skipped, vec!["agreement_threshold_autonomous"]);
+        assert!(out.restored.is_empty());
+        assert_eq!(sm.critic_rules.min_energy, original.critic_rules.min_energy);
+    }
+
+    #[test]
+    fn stage2_rollback_preserves_operator_edit_on_untouched_field() {
+        let (mut sm, original) = accepted_sm();
+        sm.critic_rules.min_energy = 0.4; // operator edit of a field the delta did not touch
+        let out = rollback_last_rule(&mut sm).unwrap();
+        assert_eq!(sm.critic_rules.agreement_threshold_autonomous,
+            original.critic_rules.agreement_threshold_autonomous, "accepted field restored");
+        assert_eq!(sm.critic_rules.min_energy, 0.4, "untouched field keeps the operator value");
+        assert_eq!(out.restored, vec!["agreement_threshold_autonomous"]);
+        assert!(out.skipped.is_empty(), "min_energy was never a changed field, so not 'skipped'");
+    }
+
+    #[test]
+    fn stage2_regression_rollback_preserves_operator_edit() {
+        let (mut sm, original) = accepted_sm();
+        sm.critic_rules.min_energy = 0.4; // simulated operator edit (direct, watch stays armed)
+        sm.learned_biases[0].scorecard.fitness = 0.1; // below baseline 0.3
+        for _ in 0..RULE_TRIAL_CONFIG.regression_cycles {
+            check_rule_regression(&mut sm);
+        }
+        assert_eq!(sm.critic_rules.agreement_threshold_autonomous,
+            original.critic_rules.agreement_threshold_autonomous, "regression reverted the accept");
+        assert_eq!(sm.critic_rules.min_energy, 0.4, "operator edit survives the automatic rollback");
+        assert!(sm.rule_regression_watch.is_none());
+        assert!(sm.rule_rollback_entries.is_empty());
+    }
+
+    #[test]
+    fn stage2_noop_delta_field_not_counted_as_changed() {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        let delta = CriticRuleDelta {
+            agreement_threshold_autonomous: Some(0.5),
+            phase_order: Some(vec![MetacogPhase::Draft]), // no Critique → ignored by the clamps
+            ..Default::default()
+        };
+        route_rule_delta(&mut sm, &delta, "test");
+        trial_pending_rules(&mut sm);
+        let entry = sm.rule_rollback_entries.back().expect("accepted");
+        assert_eq!(entry.changed_field_names(), vec!["agreement_threshold_autonomous"]);
+    }
+
+    #[test]
+    fn stage2_operator_edit_clears_regression_watch() {
+        let (mut sm, _) = accepted_sm();
+        let entries = sm.rule_rollback_entries.clone();
+        let before = RuleConfigSnapshot::of(&sm);
+        assert!(!note_operator_rule_edit(&mut sm, &before), "no change → nothing happens");
+        assert!(sm.rule_regression_watch.is_some());
+
+        sm.critic_rules.min_energy = 0.4;
+        assert!(note_operator_rule_edit(&mut sm, &before));
+        assert!(sm.rule_regression_watch.is_none(), "baseline no longer attributable → cleared");
+        assert_eq!(sm.rule_rollback_entries, entries, "rollback entries are kept");
     }
 }

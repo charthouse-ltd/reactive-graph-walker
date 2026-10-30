@@ -527,14 +527,9 @@ async fn set_metacog_config(
         spawn_bias_variants_api(&mut sm, spawn);
     }
 
-    // Operator rule edits bypass Stage-2 trials by design (explicit human action); log them.
-    let after = crate::metacog::RuleConfigSnapshot::of(&sm);
-    if after != rules_before {
-        tracing::warn!(
-            "[selection] operator changed rule config via /metacog/config: {:?} -> {:?}",
-            rules_before, after
-        );
-    }
+    // Operator rule edits bypass Stage-2 trials by design (explicit human action): WARN-log
+    // them and clear any regression watch (its baseline no longer belongs to the accept).
+    crate::metacog::note_operator_rule_edit(&mut sm, &rules_before);
 
     Json(serde_json::json!({
         "status": "ok",
@@ -571,7 +566,8 @@ fn selection_stats_json(sm: &SelfModel) -> serde_json::Value {
         "live_pool_fitness": crate::metacog::live_pool_fitness(sm),
         "pending_rule_proposals": sm.pending_rule_proposals,
         "rule_trial_history_latest_first": history,
-        "rollback_depth": sm.rule_rollback_ring.len(),
+        "rollback_depth": sm.rule_rollback_entries.len(),
+        "newest_rollback_changed_fields": sm.rule_rollback_entries.back().map(|e| e.changed_field_names()),
         "regression_watch": sm.rule_regression_watch,
         "replay_buffer": {"len": sm.recent_walk_fitness.len(), "required": crate::metacog::REPLAY_M},
         "trial_config": crate::metacog::RULE_TRIAL_CONFIG,
@@ -583,15 +579,17 @@ fn selection_stats_json(sm: &SelfModel) -> serde_json::Value {
 async fn selection_rollback(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
     let mut sm = state.self_model.lock().await;
     match crate::metacog::rollback_last_rule(&mut sm) {
-        Some(restored) => {
+        Some(out) => {
             tracing::warn!(
-                "[selection] ROLLBACK by operator via /selection/rollback; restored {:?} (depth now {})",
-                restored, sm.rule_rollback_ring.len()
+                "[selection] ROLLBACK by operator via /selection/rollback; restored {:?}, skipped {:?} (depth now {})",
+                out.restored, out.skipped, sm.rule_rollback_entries.len()
             );
             (StatusCode::OK, Json(serde_json::json!({
                 "status": "ok",
-                "restored": restored,
-                "rollback_depth": sm.rule_rollback_ring.len(),
+                "restored_fields": out.restored,
+                "skipped_fields": out.skipped,
+                "entry": out.entry,
+                "rollback_depth": sm.rule_rollback_entries.len(),
             })))
         }
         None => (StatusCode::CONFLICT, Json(serde_json::json!({
