@@ -486,6 +486,7 @@ async fn set_metacog_config(
             "[selection] agreement_metric {:?} -> {:?} (operator via /metacog/config)",
             prev, sm.agreement_metric
         );
+        crate::metacog::on_metric_change(&mut sm, prev);
     }
 
     if let Some(v) = req.min_energy {
@@ -616,6 +617,7 @@ async fn set_selection_stage(
     let prev = sm.self_mod_stage;
     sm.self_mod_stage = req.stage;
     tracing::warn!("[selection] self_mod_stage {:?} -> {:?} (operator via /selection/stage)", prev, sm.self_mod_stage);
+    crate::metacog::on_stage_change(&mut sm, prev);
     Json(serde_json::json!({
         "status": "ok",
         "previous": format!("{:?}", prev),

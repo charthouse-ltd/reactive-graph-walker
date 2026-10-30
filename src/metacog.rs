@@ -1540,6 +1540,20 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
         );
         return;
     }
+    // A LIVE trial may only run when a regression baseline exists: never accept a delta that
+    // the live-regression guard could not watch. The proposal stays at the front; no record
+    // is written (so the duplicate-rejection check is not poisoned). Shadow trials need none.
+    if let Some(front) = sm.pending_rule_proposals.front()
+        && !front.applied_directly
+        && trials_live(sm)
+        && live_pool_fitness(sm).is_none()
+    {
+        tracing::debug!(
+            "[selection] rule trial skipped: no live fitness baseline ({} pending)",
+            sm.pending_rule_proposals.len()
+        );
+        return;
+    }
     let Some(proposal) = sm.pending_rule_proposals.pop_front() else { return };
     let shadow = proposal.applied_directly || !trials_live(sm);
 
@@ -1578,6 +1592,18 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
         (None, None)
     };
 
+    // Live accept requires a baseline. The guard above makes None unreachable here; if it ever
+    // happens, apply nothing, record nothing, and put the proposal back at the front.
+    let baseline = live_pool_fitness(sm);
+    if !shadow && accepted && baseline.is_none() {
+        tracing::warn!(
+            "[selection] accept withheld: no live fitness baseline; delta not applied ({})",
+            proposal.reason
+        );
+        sm.pending_rule_proposals.push_front(proposal);
+        return;
+    }
+
     push_trial_record(sm, RuleTrialRecord {
         ts: crate::core::now(),
         delta: proposal.delta.clone(),
@@ -1612,7 +1638,8 @@ pub fn trial_pending_rules(sm: &mut SelfModel) {
             reason: proposal.reason.clone(),
         });
         proposed.restore_into(sm);
-        sm.rule_regression_watch = live_pool_fitness(sm).map(|baseline_fitness| RegressionWatch {
+        // Always armed: `baseline` is Some here (a live accept without one returned above).
+        sm.rule_regression_watch = baseline.map(|baseline_fitness| RegressionWatch {
             baseline_fitness,
             cycles_below: 0,
             cycles_observed: 0,
@@ -1670,6 +1697,31 @@ pub fn clear_regression_watch(sm: &mut SelfModel, cause: &str) {
             "[selection] regression watch cleared ({}): baseline {:.3}, {} cycles observed",
             cause, w.baseline_fitness, w.cycles_observed
         );
+    }
+}
+
+/// Stage change (POST /selection/stage): leaving RuleTrialsLive freezes the guard, so a later
+/// re-promotion would resume it with a stale baseline; clear it on demotion. Entering
+/// RuleTrialsLive from another stage starts fresh, so clear any watch that somehow exists.
+/// Re-posting the same stage is a no-op. Demotion never reverts accepted rules (use
+/// /selection/rollback).
+pub fn on_stage_change(sm: &mut SelfModel, prev: SelfModStage) {
+    let now = sm.self_mod_stage;
+    if prev == now {
+        return;
+    }
+    if prev == SelfModStage::RuleTrialsLive {
+        clear_regression_watch(sm, "demoted from rule_trials_live");
+    } else if now == SelfModStage::RuleTrialsLive {
+        clear_regression_watch(sm, "promoted to rule_trials_live (fresh start)");
+    }
+}
+
+/// Metric change (POST /metacog/config): switching away from Domain closes the trials gate and
+/// freezes the guard; clear the watch so re-enabling does not resume a stale baseline.
+pub fn on_metric_change(sm: &mut SelfModel, prev: AgreementMetric) {
+    if prev.is_domain() && !sm.agreement_metric.is_domain() {
+        clear_regression_watch(sm, "agreement_metric switched away from domain");
     }
 }
 
@@ -3281,5 +3333,72 @@ mod tests {
         assert!(note_operator_rule_edit(&mut sm, &before));
         assert!(sm.rule_regression_watch.is_none(), "baseline no longer attributable → cleared");
         assert_eq!(sm.rule_rollback_entries, entries, "rollback entries are kept");
+    }
+
+    // ── Stage 2.1 Fixes 3+4: baseline guard, stale watch ──
+
+    #[test]
+    fn stage2_live_trial_skipped_without_baseline_keeps_proposal() {
+        let mut sm = stage2_sm(SelfModStage::RuleTrialsLive, AgreementMetric::Domain);
+        for b in sm.learned_biases.iter_mut() {
+            b.scorecard.walks = 0;
+        }
+        let rules = RuleConfigSnapshot::of(&sm);
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        let queued = sm.pending_rule_proposals.len();
+        trial_pending_rules(&mut sm);
+        assert_eq!(RuleConfigSnapshot::of(&sm), rules, "nothing applied");
+        assert_eq!(sm.pending_rule_proposals.len(), queued, "proposal kept at the front");
+        assert!(sm.rule_trial_history.is_empty(), "no record written");
+        assert!(sm.rule_rollback_entries.is_empty());
+        assert!(sm.rule_regression_watch.is_none());
+    }
+
+    #[test]
+    fn stage2_shadow_trial_runs_without_baseline() {
+        let mut sm = stage2_sm(SelfModStage::Observability, AgreementMetric::Legacy);
+        for b in sm.learned_biases.iter_mut() {
+            b.scorecard.walks = 0;
+        }
+        route_rule_delta(&mut sm, &delta_threshold(0.5), "test");
+        trial_pending_rules(&mut sm);
+        assert_eq!(sm.rule_trial_history.len(), 1, "shadow trials need no baseline");
+        assert!(sm.rule_trial_history[0].shadow);
+    }
+
+    #[test]
+    fn stage2_demotion_clears_watch() {
+        let (mut sm, _) = accepted_sm();
+        let rules = RuleConfigSnapshot::of(&sm);
+        sm.self_mod_stage = SelfModStage::SelectionLive;
+        on_stage_change(&mut sm, SelfModStage::RuleTrialsLive);
+        assert!(sm.rule_regression_watch.is_none(), "demotion clears the watch");
+        assert_eq!(RuleConfigSnapshot::of(&sm), rules, "demotion does not revert accepted rules");
+
+        // Re-posting the same stage leaves a legitimately armed watch alone.
+        let (mut same, _) = accepted_sm();
+        on_stage_change(&mut same, SelfModStage::RuleTrialsLive);
+        assert!(same.rule_regression_watch.is_some());
+
+        // Promotion into RuleTrialsLive clears a stale watch (fresh start).
+        let (mut stale, _) = accepted_sm();
+        stale.self_mod_stage = SelfModStage::RuleTrialsLive;
+        on_stage_change(&mut stale, SelfModStage::Observability);
+        assert!(stale.rule_regression_watch.is_none());
+    }
+
+    #[test]
+    fn stage2_metric_switch_from_domain_clears_watch() {
+        let (mut sm, _) = accepted_sm();
+        let rules = RuleConfigSnapshot::of(&sm);
+        sm.agreement_metric = AgreementMetric::Legacy;
+        on_metric_change(&mut sm, AgreementMetric::Domain);
+        assert!(sm.rule_regression_watch.is_none());
+        assert_eq!(RuleConfigSnapshot::of(&sm), rules);
+
+        // Domain → Domain (no switch) keeps it.
+        let (mut keep, _) = accepted_sm();
+        on_metric_change(&mut keep, AgreementMetric::Domain);
+        assert!(keep.rule_regression_watch.is_some());
     }
 }
