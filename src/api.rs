@@ -25,6 +25,8 @@ use crate::walker;
 
 /// Shared application state — one entity, one mind
 pub struct AppState {
+    /// Serializes temporary overrides with operator mode changes.
+    pub mode_session: tokio::sync::Mutex<()>,
     pub pool: PgPool,
     pub diverger: Diverger,
     pub self_model: std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
@@ -49,7 +51,7 @@ pub struct WalkRequest {
     #[serde(default = "default_steps")]
     pub steps: usize,
     /// Per-request cognitive mode override.
-    /// If set, temporarily switches mode for this walk only.
+    /// May lower autonomy for this walk, never exceed the configured global mode.
     #[serde(default)]
     pub rgw_mode: Option<String>,
 }
@@ -111,6 +113,7 @@ pub async fn serve(
     };
 
     let state = Arc::new(AppState {
+        mode_session: tokio::sync::Mutex::new(()),
         pool,
         diverger,
         self_model,
@@ -369,7 +372,8 @@ async fn motor_reject(
 async fn walk(
     State(state): State<Arc<AppState>>,
     Json(req): Json<WalkRequest>,
-) -> Result<Json<WalkOutput>, StatusCode> {
+) -> Result<Json<WalkOutput>, ModeError> {
+    let _mode_session = state.mode_session.lock().await;
     let n = if req.n_walkers == 0 {
         rayon::current_num_threads()
     } else {
@@ -377,7 +381,9 @@ async fn walk(
     };
 
     // Per-request mode override: temporarily switch, walk, restore
-    let mode_target = req.rgw_mode.as_ref().and_then(|m| parse_mode(m));
+    let mode_target = validate_request_mode(
+        req.rgw_mode.as_deref(), &state.self_model.lock().await.mode,
+    )?;
     let prev_mode = if let Some(target) = mode_target {
         let mut sm = state.self_model.lock().await;
         let prev = sm.mode.clone();
@@ -1176,6 +1182,24 @@ async fn ingest_signal_endpoint(
     }))
 }
 
+/// Fixed errors never echo caller-controlled values or request bodies.
+pub(crate) type ModeError = (StatusCode, &'static str);
+
+pub(crate) fn validate_request_mode(
+    requested: Option<&str>, configured: &CognitiveMode,
+) -> Result<Option<CognitiveMode>, ModeError> {
+    let Some(requested) = requested else { return Ok(None); };
+    let Some(target) = parse_mode(requested) else {
+        tracing::warn!("[rgw] rejected invalid rgw_mode");
+        return Err((StatusCode::BAD_REQUEST, "rgw_mode must be autonomous or compliant"));
+    };
+    if *configured == CognitiveMode::Compliant && target == CognitiveMode::Autonomous {
+        tracing::warn!("[rgw] rejected rgw_mode autonomy escalation");
+        return Err((StatusCode::FORBIDDEN, "rgw_mode exceeds the configured instance mode"));
+    }
+    Ok(Some(target))
+}
+
 /// Parse a mode string ("autonomous", "compliant") into CognitiveMode
 fn parse_mode(s: &str) -> Option<CognitiveMode> {
     match s.to_lowercase().as_str() {
@@ -1195,6 +1219,7 @@ async fn set_mode_endpoint(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetModeRequest>,
 ) -> Json<serde_json::Value> {
+    let _mode_session = state.mode_session.lock().await;
     match parse_mode(&req.mode) {
         Some(mode) => {
             let prev = {
@@ -1530,5 +1555,120 @@ mod tests {
         assert!(validate_agreement_metric(patch.agreement_metric).is_err());
         let ok: MetacogConfigPatch = serde_json::from_str(r#"{"agreement_metric":"domain"}"#).unwrap();
         assert!(validate_agreement_metric(ok.agreement_metric).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod mode_ceiling_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    async fn state(mode: CognitiveMode) -> Arc<AppState> {
+        // Closed pool proves rejection requires no database or running services.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/unused").unwrap();
+        pool.close().await;
+        let mut sm = SelfModel::new();
+        sm.mode = mode;
+        let self_model = Arc::new(tokio::sync::Mutex::new(sm));
+        Arc::new(AppState {
+            mode_session: tokio::sync::Mutex::new(()),
+            motor_gate: Arc::new(crate::motor::MotorGate::new(crate::motor::MotorMode::Propose)),
+            diverger: Diverger::new(pool.clone(), self_model.clone(), ""),
+            pool, self_model, ollama_url: String::new(),
+            expression_model: String::new(), julian_url: String::new(), provider: None,
+        })
+    }
+
+    #[test]
+    fn mode_matrix() {
+        for configured in [CognitiveMode::Compliant, CognitiveMode::Autonomous] {
+            assert_eq!(validate_request_mode(None, &configured), Ok(None));
+            for input in ["compliant", "COMPLIANT", "Compliant"] {
+                assert_eq!(validate_request_mode(Some(input), &configured), Ok(Some(CognitiveMode::Compliant)));
+            }
+            for input in ["autonomous", "AUTONOMOUS", "Autonomous", "AuToNoMoUs"] {
+                let result = validate_request_mode(Some(input), &configured);
+                if configured == CognitiveMode::Compliant {
+                    assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
+                } else {
+                    assert_eq!(result, Ok(Some(CognitiveMode::Autonomous)));
+                }
+            }
+            for input in ["", "unknown", " autonomous ", "autonomous\n", "compliant\0autonomous"] {
+                assert_eq!(validate_request_mode(Some(input), &configured).unwrap_err().0, StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn both_routes_reject_before_execution_including_bypass_and_bad_types() {
+        let state = state(CognitiveMode::Compliant).await;
+        let app = Router::new()
+            .route("/walk", post(walk))
+            .route("/v1/chat/completions", post(openai::chat_completions))
+            .with_state(state.clone());
+        let before = serde_json::to_value(&*state.self_model.lock().await).unwrap();
+        for path in ["/walk", "/v1/chat/completions"] {
+            for bypass in [false, true] {
+                for (value, expected) in [
+                    (serde_json::json!("autonomous"), StatusCode::FORBIDDEN),
+                    (serde_json::json!("AuToNoMoUs"), StatusCode::FORBIDDEN),
+                    (serde_json::json!("unknown"), StatusCode::BAD_REQUEST),
+                    (serde_json::json!(["autonomous"]), StatusCode::UNPROCESSABLE_ENTITY),
+                    (serde_json::json!({"mode": "autonomous"}), StatusCode::UNPROCESSABLE_ENTITY),
+                    (serde_json::json!(true), StatusCode::UNPROCESSABLE_ENTITY),
+                    (serde_json::json!(1), StatusCode::UNPROCESSABLE_ENTITY),
+                ] {
+                    let body = serde_json::json!({"messages": [], "rgw_mode": value, "rgw_bypass": bypass});
+                    let response = app.clone().oneshot(Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                    assert_eq!(response.status(), expected, "{path}: {body}");
+                    assert_eq!(serde_json::to_value(&*state.self_model.lock().await).unwrap(), before);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn both_handlers_preserve_absent_same_and_lower_mode_and_restore() {
+        for configured in [CognitiveMode::Compliant, CognitiveMode::Autonomous] {
+            for requested in [None, Some("compliant"), Some(match configured {
+                CognitiveMode::Compliant => "compliant", CognitiveMode::Autonomous => "autonomous",
+            })] {
+                for chat in [false, true] {
+                    let state = state(configured.clone()).await;
+                    let mut body = serde_json::json!({"messages": []});
+                    if let Some(requested) = requested {
+                        body["rgw_mode"] = serde_json::json!(requested);
+                    }
+                    if chat {
+                        let req = serde_json::from_value(body).unwrap();
+                        assert!(openai::chat_completions(State(state.clone()), Json(req)).await.is_ok());
+                    } else {
+                        let req = serde_json::from_value(body).unwrap();
+                        assert!(walk(State(state.clone()), Json(req)).await.is_ok());
+                    }
+                    assert_eq!(state.self_model.lock().await.mode, configured);
+                    assert!(state.self_model.lock().await.total_signals_processed > 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_mode_change_waits_for_temporary_override() {
+        let state = state(CognitiveMode::Autonomous).await;
+        let session = state.mode_session.lock().await;
+        state.self_model.lock().await.mode = CognitiveMode::Compliant;
+        let change = set_mode_endpoint(State(state.clone()), Json(SetModeRequest { mode: "compliant".into() }));
+        tokio::pin!(change);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut change).await.is_err());
+        state.self_model.lock().await.mode = CognitiveMode::Autonomous;
+        drop(session);
+        let _ = change.await;
+        assert_eq!(state.self_model.lock().await.mode, CognitiveMode::Compliant);
     }
 }
