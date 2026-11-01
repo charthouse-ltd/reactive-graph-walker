@@ -25,8 +25,6 @@ use crate::walker;
 
 /// Shared application state — one entity, one mind
 pub struct AppState {
-    /// Serializes temporary overrides with operator mode changes.
-    pub mode_session: tokio::sync::Mutex<()>,
     pub pool: PgPool,
     pub diverger: Diverger,
     pub self_model: std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
@@ -113,7 +111,6 @@ pub async fn serve(
     };
 
     let state = Arc::new(AppState {
-        mode_session: tokio::sync::Mutex::new(()),
         pool,
         diverger,
         self_model,
@@ -245,7 +242,7 @@ async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> 
         .and_then(|v| v.to_str().ok());
 
     match presented {
-        Some(key) if constant_time_eq(key.as_bytes(), expected.as_bytes()) => Ok(next.run(req).await),
+        Some(key) if constant_time_eq(key.as_bytes(), expected.trim().as_bytes()) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
@@ -373,39 +370,29 @@ async fn walk(
     State(state): State<Arc<AppState>>,
     Json(req): Json<WalkRequest>,
 ) -> Result<Json<WalkOutput>, ModeError> {
-    let _mode_session = state.mode_session.lock().await;
     let n = if req.n_walkers == 0 {
         rayon::current_num_threads()
     } else {
         req.n_walkers
     };
 
-    // Per-request mode override: temporarily switch, walk, restore
-    let mode_target = validate_request_mode(
-        req.rgw_mode.as_deref(), &state.self_model.lock().await.mode,
-    )?;
-    let prev_mode = if let Some(target) = mode_target {
-        let mut sm = state.self_model.lock().await;
-        let prev = sm.mode.clone();
-        sm.mode = target;
-        Some(prev)
-    } else {
-        None
-    };
+    // A lowered mode belongs to this request, including its critic updates. It is
+    // never exposed to concurrent walks, the diverger or the dream loop.
+    let self_model = request_self_model(&state.self_model, req.rgw_mode.as_deref()).await?;
 
     let (output, walker_results) = walker::walk_parallel(
         &state.pool,
         &req.emotional_state,
         n,
         req.steps,
-        &state.self_model,
+        &self_model,
     )
     .await;
 
     // ── Metacognitive Critic: run after walk session ──
     // Algorithmic diagnosis always runs. LLM escalates only when warranted.
     {
-        let mut sm = state.self_model.lock().await;
+        let mut sm = self_model.lock().await;
         let diagnosis = crate::metacog::run_critic(&output, &walker_results, &mut sm);
 
         // Escalate to the LLM critic only when it earns its cost:
@@ -428,12 +415,6 @@ async fn walk(
                 let result = provider.generate(&system, &user, 0.5, escalate, Some(256), 0.3).await;
                 crate::metacog::run_llm_critic(&diagnosis, &summary, &mut sm, &result.text).await;
             }
-    }
-
-    // Restore previous mode if we overrode it
-    if let Some(prev) = prev_mode {
-        let mut sm = state.self_model.lock().await;
-        sm.mode = prev;
     }
 
     Ok(Json(output))
@@ -1200,6 +1181,25 @@ pub(crate) fn validate_request_mode(
     Ok(Some(target))
 }
 
+/// The self-model a request walks against. No mode, or the instance's own mode,
+/// uses the shared model so the walk's learning persists. A lower mode runs on a
+/// request-local snapshot that nothing else can observe; nothing is restored
+/// afterwards, so a cancelled request or a concurrent operator change cannot be
+/// overwritten. Raising autonomy is rejected by `validate_request_mode`.
+pub(crate) async fn request_self_model(
+    shared: &Arc<tokio::sync::Mutex<SelfModel>>, requested: Option<&str>,
+) -> Result<Arc<tokio::sync::Mutex<SelfModel>>, ModeError> {
+    let sm = shared.lock().await;
+    match validate_request_mode(requested, &sm.mode)? {
+        Some(target) if target != sm.mode => {
+            let mut snapshot = sm.clone();
+            snapshot.mode = target;
+            Ok(Arc::new(tokio::sync::Mutex::new(snapshot)))
+        }
+        _ => Ok(Arc::clone(shared)),
+    }
+}
+
 /// Parse a mode string ("autonomous", "compliant") into CognitiveMode
 fn parse_mode(s: &str) -> Option<CognitiveMode> {
     match s.to_lowercase().as_str() {
@@ -1219,7 +1219,6 @@ async fn set_mode_endpoint(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetModeRequest>,
 ) -> Json<serde_json::Value> {
-    let _mode_session = state.mode_session.lock().await;
     match parse_mode(&req.mode) {
         Some(mode) => {
             let prev = {
@@ -1357,6 +1356,20 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn auth_normalizes_configured_key_like_backend_sender() {
+        let _guard = ApiKeyGuard::set(Some("  test-key  "));
+        let (base, server) = spawn_auth_test_app().await;
+        let client = reqwest::Client::new();
+        let response = client.get(format!("{base}/metacog/config"))
+            .header("X-RGW-Key", "test-key").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let wrong = client.get(format!("{base}/metacog/config"))
+            .header("X-RGW-Key", "wrong-key").send().await.unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1573,7 +1586,6 @@ mod mode_ceiling_tests {
         sm.mode = mode;
         let self_model = Arc::new(tokio::sync::Mutex::new(sm));
         Arc::new(AppState {
-            mode_session: tokio::sync::Mutex::new(()),
             motor_gate: Arc::new(crate::motor::MotorGate::new(crate::motor::MotorMode::Propose)),
             diverger: Diverger::new(pool.clone(), self_model.clone(), ""),
             pool, self_model, ollama_url: String::new(),
@@ -1633,7 +1645,7 @@ mod mode_ceiling_tests {
     }
 
     #[tokio::test]
-    async fn both_handlers_preserve_absent_same_and_lower_mode_and_restore() {
+    async fn both_handlers_keep_shared_mode_and_learn_only_at_the_instance_mode() {
         for configured in [CognitiveMode::Compliant, CognitiveMode::Autonomous] {
             for requested in [None, Some("compliant"), Some(match configured {
                 CognitiveMode::Compliant => "compliant", CognitiveMode::Autonomous => "autonomous",
@@ -1651,24 +1663,49 @@ mod mode_ceiling_tests {
                         let req = serde_json::from_value(body).unwrap();
                         assert!(walk(State(state.clone()), Json(req)).await.is_ok());
                     }
-                    assert_eq!(state.self_model.lock().await.mode, configured);
-                    assert!(state.self_model.lock().await.total_signals_processed > 0);
+                    let sm = state.self_model.lock().await;
+                    assert_eq!(sm.mode, configured);
+                    // A lowered mode walks a request-local snapshot; the shared mind learns
+                    // only from walks at its own mode (absent or same, e.g. Renu's walks).
+                    let lowered = requested == Some("compliant") && configured == CognitiveMode::Autonomous;
+                    assert_eq!(sm.total_signals_processed > 0, !lowered, "{configured:?} {requested:?} chat={chat}");
                 }
             }
         }
     }
 
     #[tokio::test]
-    async fn operator_mode_change_waits_for_temporary_override() {
-        let state = state(CognitiveMode::Autonomous).await;
-        let session = state.mode_session.lock().await;
-        state.self_model.lock().await.mode = CognitiveMode::Compliant;
-        let change = set_mode_endpoint(State(state.clone()), Json(SetModeRequest { mode: "compliant".into() }));
-        tokio::pin!(change);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut change).await.is_err());
-        state.self_model.lock().await.mode = CognitiveMode::Autonomous;
-        drop(session);
-        let _ = change.await;
-        assert_eq!(state.self_model.lock().await.mode, CognitiveMode::Compliant);
+    async fn lowered_overrides_are_request_local_and_never_restored() {
+        let shared = Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
+        let (first, second) = tokio::join!(
+            request_self_model(&shared, Some("compliant")),
+            request_self_model(&shared, Some("compliant")),
+        );
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(!Arc::ptr_eq(&first, &shared) && !Arc::ptr_eq(&first, &second));
+        assert_eq!(first.lock().await.mode, CognitiveMode::Compliant);
+        assert_eq!(shared.lock().await.mode, CognitiveMode::Autonomous);
+        // An operator change while the override is in flight survives the request.
+        shared.lock().await.mode = CognitiveMode::Compliant;
+        drop((first, second)); // cancellation: there is no stale mode to restore
+        assert_eq!(shared.lock().await.mode, CognitiveMode::Compliant);
+    }
+
+    #[tokio::test]
+    async fn absent_or_same_mode_walks_the_shared_model() {
+        let shared = Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
+        for requested in [None, Some("autonomous"), Some("AUTONOMOUS")] {
+            assert!(Arc::ptr_eq(&request_self_model(&shared, requested).await.unwrap(), &shared));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_overrides_leave_the_shared_model_untouched() {
+        let shared = Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
+        shared.lock().await.mode = CognitiveMode::Compliant;
+        let before = serde_json::to_value(&*shared.lock().await).unwrap();
+        assert_eq!(request_self_model(&shared, Some("autonomous")).await.unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(request_self_model(&shared, Some("unknown")).await.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(serde_json::to_value(&*shared.lock().await).unwrap(), before);
     }
 }
