@@ -16,7 +16,7 @@ use std::time::Instant;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{AppState, ModeError, validate_request_mode};
+use crate::api::{AppState, ModeError, request_self_model};
 use crate::graph::EmotionalState;
 use crate::walker::{self, format_walk_context};
 
@@ -141,10 +141,7 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, ModeError> {
-    let mode_session = state.mode_session.lock().await;
-    let mode_target = validate_request_mode(
-        req.rgw_mode.as_deref(), &state.self_model.lock().await.mode,
-    )?;
+    let self_model = request_self_model(&state.self_model, req.rgw_mode.as_deref()).await?;
     let start = Instant::now();
 
     // 1. Extract stimulus from the last user message
@@ -170,7 +167,6 @@ pub async fn chat_completions(
     // memory store; the honest baseline the full path must beat on identical
     // inputs. Lets a harness flip arms per request.
     if req.rgw_bypass {
-        drop(mode_session);
         return bypass_completion(&state, &req, &stimulus, &system_prompt, start)
             .await.map_err(|status| (status, "Completion failed"));
     }
@@ -179,18 +175,11 @@ pub async fn chat_completions(
     let emotion = req.rgw_emotion.unwrap_or_default();
     let walk_start = Instant::now();
 
-    let prev_mode = if let Some(target) = mode_target {
-        let mut sm = state.self_model.lock().await;
-        let prev = sm.mode.clone();
-        sm.mode = target;
-        Some(prev)
-    } else {
-        None
-    };
-
     if let Some(ref aid) = req.rgw_audience {
-        let mut sm = state.self_model.lock().await;
-        sm.active_audience_id = Some(aid.clone());
+        // The shared model keeps the foregrounded audience for the diverger.
+        for sm in [&state.self_model, &self_model] {
+            sm.lock().await.active_audience_id = Some(aid.clone());
+        }
     }
 
     let (walk_output, _walker_results) = walker::walk_parallel(
@@ -198,17 +187,9 @@ pub async fn chat_completions(
         &emotion,
         req.rgw_walkers,
         req.rgw_steps,
-        &state.self_model,
+        &self_model,
     )
     .await;
-
-    // Restore mode after walk
-    if let Some(prev) = prev_mode {
-        let mut sm = state.self_model.lock().await;
-        sm.mode = prev;
-    }
-
-    drop(mode_session);
 
     let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
 
