@@ -16,7 +16,7 @@ use std::time::Instant;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::api::AppState;
+use crate::api::{AppState, ModeError, validate_request_mode};
 use crate::graph::EmotionalState;
 use crate::walker::{self, format_walk_context};
 
@@ -140,7 +140,11 @@ pub async fn list_models() -> Json<ModelList> {
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, StatusCode> {
+) -> Result<Json<ChatResponse>, ModeError> {
+    let mode_session = state.mode_session.lock().await;
+    let mode_target = validate_request_mode(
+        req.rgw_mode.as_deref(), &state.self_model.lock().await.mode,
+    )?;
     let start = Instant::now();
 
     // 1. Extract stimulus from the last user message
@@ -166,19 +170,15 @@ pub async fn chat_completions(
     // memory store; the honest baseline the full path must beat on identical
     // inputs. Lets a harness flip arms per request.
     if req.rgw_bypass {
-        return bypass_completion(&state, &req, &stimulus, &system_prompt, start).await;
+        drop(mode_session);
+        return bypass_completion(&state, &req, &stimulus, &system_prompt, start)
+            .await.map_err(|status| (status, "Completion failed"));
     }
 
     // 2. Graph walk — RGW thinks
     let emotion = req.rgw_emotion.unwrap_or_default();
     let walk_start = Instant::now();
 
-    // Per-request mode override (extract first, lock later)
-    let mode_target = req.rgw_mode.as_ref().and_then(|m| match m.to_lowercase().as_str() {
-        "autonomous" => Some(crate::core::CognitiveMode::Autonomous),
-        "compliant" => Some(crate::core::CognitiveMode::Compliant),
-        _ => None,
-    });
     let prev_mode = if let Some(target) = mode_target {
         let mut sm = state.self_model.lock().await;
         let prev = sm.mode.clone();
@@ -207,6 +207,8 @@ pub async fn chat_completions(
         let mut sm = state.self_model.lock().await;
         sm.mode = prev;
     }
+
+    drop(mode_session);
 
     let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
 
