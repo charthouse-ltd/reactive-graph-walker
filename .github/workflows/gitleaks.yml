@@ -31,25 +31,27 @@ jobs:
           gitleaks version
       - name: Refuse PR-controlled scanner policy
         # A PR must not be able to weaken the scan it is subject to: no new or
-        # changed .gitleaks.toml / .gitleaksignore, and no newly added inline
-        # allow-markers (the marker string is assembled at runtime so this file
-        # never contains it). Maintainers change policy on main directly.
+        # changed gitleaks config / ignore files, and no .gitattributes changes
+        # (a `binary` or `-diff` attribute would hide content from the patch
+        # stream). Inline allow-markers are neutralised by --ignore-gitleaks-allow
+        # below, so they need no guard. Maintainers change policy on main.
         if: github.event_name == 'pull_request'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if git diff --name-only "$BASE" "$HEAD" | grep -Ex '(\.gitleaks\.toml|\.gitleaksignore|.*/\.gitleaks\.toml|.*/\.gitleaksignore)'; then
-            echo "::error::this PR adds or changes gitleaks policy files; do that on main with maintainer review"; exit 1
-          fi
-          MARK="gitleaks:"; MARK="${MARK}allow"
-          if git diff "$BASE" "$HEAD" | grep -E "^\+.*${MARK}"; then
-            echo "::error::this PR adds inline ${MARK} markers; remove them or justify on main"; exit 1
+          if git diff --name-only "$BASE" "$HEAD" | LC_ALL=C grep -aEx '(.*/)?(\.gitleaks\.toml|\.gitleaksignore|\.gitattributes)'; then
+            echo "::error::this PR adds or changes scanner policy / git attribute files; do that on main with maintainer review"; exit 1
           fi
           echo "scanner policy untouched by this PR"
-      - name: Scan full history
-        # Default built-in rules only: no repo-provided config is honoured.
+      - name: Scan full history and the checked-out tree
+        # Built-in rules only; repo-local config, .gitleaksignore and inline
+        # allow-markers are all ignored. Two passes: the git history (every
+        # commit's patch) and the working tree (independent of git attributes).
         run: |
-          test ! -e .gitleaks.toml || { echo "::error::.gitleaks.toml present on this branch; the scan does not accept repo-local policy"; exit 1; }
-          gitleaks detect --source . --redact --no-banner --exit-code 1 -v
+          set -euo pipefail
+          test ! -e .gitleaks.toml || { echo "::error::.gitleaks.toml present; the scan does not accept repo-local policy"; exit 1; }
+          COMMON="--redact --no-banner --exit-code 1 --ignore-gitleaks-allow --gitleaks-ignore-path /nonexistent"
+          gitleaks detect --source . $COMMON -v
+          gitleaks dir . $COMMON
