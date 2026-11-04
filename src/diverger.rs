@@ -27,6 +27,7 @@ struct NodeEnergy {
     energy: f32,
     last_fired: f64,   // unix timestamp of last spontaneous fire (refractory clock)
     last_update: f64,  // unix timestamp of last energy update (decay clock)
+    fatigue: f32,      // rises on fire, decays with rest; raises this node's threshold
 }
 
 /// The Diverger engine — a self-propagating reactive graph.
@@ -47,7 +48,7 @@ pub struct Diverger {
     /// Channel for edge change notifications
     /// Any system that modifies edges pushes to this channel.
     /// The Diverger reacts — no polling needed.
-    edge_tx: mpsc::Sender<EdgeChange>,
+    edge_tx: mpsc::Sender<Stimulus>,
     /// Edge changes dropped because the reactor queue was full (M6 backpressure).
     edges_dropped: Arc<AtomicU64>,
 
@@ -71,6 +72,82 @@ pub struct EdgeChange {
     pub target_id: i32,
     pub delta: f32,        // how much the weight changed
     pub edge_type: String,
+}
+
+/// Which stimulus started a cascade, how deep it is, and what it may still
+/// spend. API callers always start at depth 0 with the full budget; feedback
+/// hops (spec §6.2) carry `origin` forward and spend `HOP_COST` per hop.
+#[derive(Debug, Clone)]
+pub struct Stimulus {
+    pub kind: StimulusKind,
+    pub origin: crate::tension::Origin,
+    pub depth: u32,
+    pub budget: f32,
+}
+
+#[derive(Debug, Clone)]
+pub enum StimulusKind {
+    Edge(EdgeChange),
+    Tension(crate::tension::TensionPulse),
+}
+
+impl Stimulus {
+    /// An externally reported edge change: origin Edge, depth 0, full budget.
+    pub fn external_edge(c: EdgeChange) -> Self {
+        Stimulus {
+            kind: StimulusKind::Edge(c),
+            origin: crate::tension::Origin::Edge,
+            depth: 0,
+            budget: crate::tension::CASCADE_BUDGET,
+        }
+    }
+}
+
+/// What to do with a completed spontaneous walk's feedback hop, by mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Feedback {
+    /// `off`: no feedback at all (today's single-hop behaviour).
+    None,
+    /// `observe`: a hop would have been enqueued; count it, enqueue nothing.
+    WouldEnqueue,
+    /// `observe`: a brake would have stopped the hop; count which one.
+    WouldDrop(crate::tension::WouldHave),
+    /// `brakes`/`live`: enqueue the next hop with this depth and budget.
+    Enqueue(u32, f32),
+    /// `brakes`/`live`: the cascade ends here (budget/depth, or pool empty).
+    End { by_budget: bool },
+}
+
+/// Pure decision: `next` is `next_hop(...)` (None = budget or depth exhausted),
+/// `pool_ok` whether the global pool can cover `HOP_COST`.
+pub fn decide_feedback(mode: crate::tension::TensionMode, next: Option<(u32, f32)>, pool_ok: bool) -> Feedback {
+    use crate::tension::{TensionMode, WouldHave};
+    match mode {
+        TensionMode::Off => Feedback::None,
+        TensionMode::Observe => match next {
+            None => Feedback::WouldDrop(WouldHave::Budget),
+            Some(_) if !pool_ok => Feedback::WouldDrop(WouldHave::Pool),
+            Some(_) => Feedback::WouldEnqueue,
+        },
+        TensionMode::Brakes | TensionMode::Live => match next {
+            None => Feedback::End { by_budget: true },
+            Some(_) if !pool_ok => Feedback::End { by_budget: false },
+            Some((d, b)) => Feedback::Enqueue(d, b),
+        },
+    }
+}
+
+/// The next hop of a cascade, if it may continue: depth + 1 and the budget
+/// after paying `HOP_COST` plus the energy this hop injects. `None` when the
+/// budget would be exhausted or `max_depth` reached — so every cascade ends.
+pub fn next_hop(s: &Stimulus, injected: f32, max_depth: u32) -> Option<(u32, f32)> {
+    let depth = s.depth + 1;
+    let budget = s.budget - crate::tension::HOP_COST - injected;
+    if budget > 0.0 && depth < max_depth {
+        Some((depth, budget))
+    } else {
+        None
+    }
 }
 
 /// Diverger configuration
@@ -165,7 +242,7 @@ impl Diverger {
     /// async channel receiver, not a timer. It only runs when edges change.
     fn start_reactor(
         &self,
-        mut edge_rx: mpsc::Receiver<EdgeChange>,
+        mut edge_rx: mpsc::Receiver<Stimulus>,
         config: DivergerConfig,
         self_model: std::sync::Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
     ) {
@@ -177,6 +254,8 @@ impl Diverger {
         let cascades_total = self.cascades_total.clone();
         let edges_changed = self.edges_changed.clone();
         let julian_url_outer = self.julian_url.clone();
+        let feedback_tx_outer = self.edge_tx.clone();
+        let max_cascade_depth = config.max_cascade_depth;
 
         alive.store(true, Ordering::SeqCst);
 
@@ -199,8 +278,10 @@ impl Diverger {
             // This is NOT a polling loop.
             // It awaits on the channel — zero CPU when nothing changes.
             // Each edge change cascades to neighbors, potentially firing walks.
-            while let Some(change) = edge_rx.recv().await {
-                edges_changed.fetch_add(1, Ordering::Relaxed);
+            while let Some(stim) = edge_rx.recv().await {
+                if matches!(stim.kind, StimulusKind::Edge(_)) {
+                    edges_changed.fetch_add(1, Ordering::Relaxed);
+                }
 
                 // ── Circuit breaker: rate limiting ──
                 let now_instant = std::time::Instant::now();
@@ -247,9 +328,22 @@ impl Diverger {
                     * (1.0 - emo.arousal * 0.3)  // High arousal lowers threshold
                     * (1.0 + (1.0 - emo.energy) * 0.3);  // Low energy raises threshold
 
-                // Propagate energy to both nodes of the changed edge
-                let node_ids = [change.source_id, change.target_id];
-                let energy_delta = change.delta.abs() * config.propagation_strength;
+                // Energy to inject: an edge change feeds both endpoints; a tension
+                // pulse feeds its one target node with the pulse's own energy.
+                let (node_ids, energy_delta): (Vec<i32>, f32) = match &stim.kind {
+                    StimulusKind::Edge(change) => {
+                        tracing::trace!(
+                            "[diverger] edge stimulus #{} ({}) depth={} budget={:.2}",
+                            change.edge_id, change.edge_type, stim.depth, stim.budget
+                        );
+                        (
+                            vec![change.source_id, change.target_id],
+                            change.delta.abs() * config.propagation_strength,
+                        )
+                    }
+                    StimulusKind::Tension(p) => (vec![p.target_node], p.energy),
+                };
+                let enforce_brakes = crate::tension::mode().enforces_brakes();
 
                 let mut nodes_to_fire: Vec<i32> = Vec::new();
 
@@ -265,6 +359,7 @@ impl Diverger {
                             energy: 0.0,
                             last_fired: 0.0,
                             last_update: now,
+                            fatigue: 0.0,
                         });
 
                         // Apply energy decay since this node was last updated.
@@ -273,18 +368,29 @@ impl Diverger {
                         // injected energy wiped before it can accumulate to threshold.
                         let dt = (now - node.last_update).max(0.0) as f32;
                         node.energy = (node.energy - config.energy_decay_rate * dt).max(0.0);
+                        node.fatigue = crate::tension::decay_fatigue(node.fatigue, dt as f64);
                         node.last_update = now;
 
-                        // Add new energy from the edge change
+                        // Add new energy from the stimulus
                         node.energy += energy_delta;
 
-                        // Check threshold crossing
-                        if node.energy >= threshold {
+                        // Threshold crossing. Fatigue raises the bar only when the
+                        // tension mode enforces brakes; otherwise it is computed and
+                        // the block it would have caused is counted (spec §7).
+                        let fatigued = crate::tension::effective_threshold(threshold, node.fatigue);
+                        let crosses_plain = node.energy >= threshold;
+                        let crosses_fatigued = node.energy >= fatigued;
+                        let crosses = if enforce_brakes { crosses_fatigued } else { crosses_plain };
+                        if !enforce_brakes && crosses_plain && !crosses_fatigued {
+                            crate::tension::would_have(crate::tension::WouldHave::Fatigue);
+                        }
+                        if crosses {
                             // Refractory period check
                             if now - node.last_fired >= config.refractory_period {
                                 nodes_to_fire.push(nid);
                                 node.energy = 0.0;  // Reset after firing
                                 node.last_fired = now;
+                                node.fatigue += crate::tension::FATIGUE_PER_FIRE;
                             }
                         }
                     }
@@ -305,6 +411,7 @@ impl Diverger {
                                 energy: 0.0,
                                 last_fired: 0.0,
                                 last_update: now,
+                                fatigue: 0.0,
                             });
                             node.energy += 0.08;
                             node.last_update = now;
@@ -371,6 +478,8 @@ impl Diverger {
                     let julian_url = julian_url_outer.clone();
                     let audience_id_for_walk = active_audience_id.clone();
                         let kd = knowledge_domains.clone();
+                        let stim_meta = stim.clone();
+                        let feedback_tx = feedback_tx_outer.clone();
                         tokio::spawn(async move {
                         // Preload the seed's neighborhood (radius 1) before walking:
                         // walk_single is cache-only with NO DB fallback, so without a
@@ -414,6 +523,85 @@ impl Diverger {
                             // Hebbian: reinforce the edges this walk traversed.
                             if !result.edges_traversed.is_empty() {
                                 cache.strengthen_edges(&result.edges_traversed, 0.02);
+                            }
+
+                            // Tension release after this spontaneous walk (spec §5.1):
+                            // activity feeds activity, no clock.
+                            let _ = crate::tension::spawn_after_walk(pool.clone(), sm_walk.clone());
+
+                            // Feedback hop (spec §6.2): the last traversed edge re-enters
+                            // as the next stimulus of this cascade, under the per-cascade
+                            // budget, the depth limit and the global pool. Enforced in
+                            // brakes/live; computed and counted in observe; absent in off.
+                            {
+                                use crate::tension::{engine, mode, would_have, HOP_COST};
+                                let injected = 0.02 * result.edges_traversed.len() as f32;
+                                let next = next_hop(&stim_meta, injected, max_cascade_depth);
+                                let m = mode();
+                                let n = result.path.len();
+                                let can_hop = n >= 2 && !result.edges_traversed.is_empty();
+                                let pool_ok = match engine() {
+                                    Some(e) if next.is_some() && can_hop && m.enforces_brakes() => e.try_spend(HOP_COST).await,
+                                    Some(e) if next.is_some() => e.can_spend(HOP_COST).await,
+                                    _ => true,
+                                };
+                                // In observe nothing feeds back, so every observed cascade
+                                // is exactly one hop; record that so avg_edge_cascade_hops
+                                // reflects reality rather than the default.
+                                if !m.enforces_brakes() && m != crate::tension::TensionMode::Off
+                                    && stim_meta.origin == crate::tension::Origin::Edge
+                                    && let Some(e) = engine()
+                                {
+                                    e.record_edge_cascade_hops(1).await;
+                                }
+                                match decide_feedback(m, next, pool_ok) {
+                                    Feedback::None | Feedback::WouldEnqueue => {}
+                                    Feedback::WouldDrop(w) => would_have(w),
+                                    Feedback::Enqueue(depth, budget) => {
+                                        if can_hop && let Some(&edge_id) = result.edges_traversed.last() {
+                                            let hop = Stimulus {
+                                                kind: StimulusKind::Edge(EdgeChange {
+                                                    edge_id,
+                                                    source_id: result.path[n - 2],
+                                                    target_id: result.path[n - 1],
+                                                    delta: 0.02,
+                                                    edge_type: "feedback".into(),
+                                                }),
+                                                origin: stim_meta.origin,
+                                                depth,
+                                                budget,
+                                            };
+                                            if feedback_tx.try_send(hop).is_err()
+                                                && let Some(e) = engine()
+                                            {
+                                                // Hop lost: the chain ends here. Count the real cause.
+                                                e.record_inbox_full().await;
+                                                e.record_cascade_end(stim_meta.origin, false).await;
+                                                if stim_meta.origin == crate::tension::Origin::Edge {
+                                                    e.record_edge_cascade_hops(stim_meta.depth + 1).await;
+                                                }
+                                            }
+                                        } else if let Some(e) = engine() {
+                                            // Too short to hop (nothing was spent): the chain ends naturally.
+                                            e.record_cascade_end(stim_meta.origin, false).await;
+                                            if stim_meta.origin == crate::tension::Origin::Edge {
+                                                e.record_edge_cascade_hops(stim_meta.depth + 1).await;
+                                            }
+                                        }
+                                    }
+                                    Feedback::End { by_budget } => {
+                                        if let Some(e) = engine() {
+                                            if !by_budget && next.is_some() {
+                                                // Ended because the pool could not pay for the hop.
+                                                e.record_hop_pool_drop().await;
+                                            }
+                                            e.record_cascade_end(stim_meta.origin, by_budget).await;
+                                            if stim_meta.origin == crate::tension::Origin::Edge {
+                                                e.record_edge_cascade_hops(stim_meta.depth + 1).await;
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             let hops = result.path.len();
@@ -485,7 +673,17 @@ impl Diverger {
     /// This is the ONLY input the Diverger needs.
     /// Call this from: walker traversal, unconscious tax, memory storage, outcome learning.
     pub fn notify_edge_change(&self, change: EdgeChange) {
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.edge_tx.try_send(change) {
+        self.notify_stimulus(Stimulus::external_edge(change));
+    }
+
+    /// Clone of the inbox sender, for the tension engine to emit pulses into.
+    pub fn stimulus_sender(&self) -> mpsc::Sender<Stimulus> {
+        self.edge_tx.clone()
+    }
+
+    /// Queue any stimulus (edge change, tension pulse, or feedback hop).
+    pub fn notify_stimulus(&self, s: Stimulus) {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.edge_tx.try_send(s) {
             let n = self.edges_dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 || n.is_multiple_of(1000) {
                 tracing::warn!("[diverger] edge queue full ({} capacity); dropped {} changes so far", EDGE_QUEUE_CAPACITY, n);
@@ -530,8 +728,48 @@ impl Diverger {
                 energy: initial_energy,
                 last_fired: 0.0,
                 last_update: now,
+                fatigue: 0.0,
             });
         }
         tracing::info!("[diverger] Seeded {} nodes with {:.2} energy", nodes.len(), initial_energy);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feedback_decision_matches_mode() {
+        use crate::tension::TensionMode::*;
+        assert!(matches!(decide_feedback(Off, Some((1, 0.7)), true), Feedback::None));
+        assert!(matches!(decide_feedback(Observe, Some((1, 0.7)), true), Feedback::WouldEnqueue));
+        assert!(matches!(decide_feedback(Observe, Some((1, 0.7)), false), Feedback::WouldDrop(crate::tension::WouldHave::Pool)));
+        assert!(matches!(decide_feedback(Observe, None, true), Feedback::WouldDrop(crate::tension::WouldHave::Budget)));
+        assert!(matches!(decide_feedback(Brakes, Some((1, 0.7)), true), Feedback::Enqueue(1, _)));
+        assert!(matches!(decide_feedback(Live, Some((1, 0.7)), false), Feedback::End { by_budget: false }));
+        assert!(matches!(decide_feedback(Live, None, true), Feedback::End { by_budget: true }));
+    }
+
+    #[test]
+    fn next_hop_ends_by_budget_then_by_depth() {
+        let s = Stimulus::external_edge(EdgeChange {
+            edge_id: 1,
+            source_id: 1,
+            target_id: 2,
+            delta: 0.1,
+            edge_type: "t".into(),
+        });
+        let (d1, b1) = next_hop(&s, 0.1, 3).unwrap();
+        assert_eq!(d1, 1);
+        assert!((b1 - 0.7).abs() < 1e-6);
+        let s2 = Stimulus { depth: d1, budget: b1, ..s.clone() };
+        let (d2, b2) = next_hop(&s2, 0.1, 3).unwrap();
+        assert_eq!(d2, 2);
+        assert!((b2 - 0.4).abs() < 1e-6);
+        let s3 = Stimulus { depth: d2, budget: b2, ..s.clone() };
+        assert!(next_hop(&s3, 0.1, 3).is_none(), "depth 3 reached");
+        let s4 = Stimulus { depth: 0, budget: 0.25, ..s.clone() };
+        assert!(next_hop(&s4, 0.1, 10).is_none(), "budget exhausted first");
     }
 }

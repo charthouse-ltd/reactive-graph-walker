@@ -287,6 +287,18 @@ pub struct SelfModel {
     pub predictions: HashMap<String, ExpectedOutcome>,
     /// Last time a prediction error occurred (drives plasticity)
     pub last_prediction_error: f64,
+    /// Tension metrics (spec §7/§9): how many predictions were ever made and
+    /// how many were resolved by a matching signal. Persisted so the resolution
+    /// rate survives restarts. serde-default so old snapshots load.
+    #[serde(default)]
+    pub predictions_made_total: u64,
+    #[serde(default)]
+    pub predictions_resolved_total: u64,
+    /// FNV-1a 64 hashes of open questions the tension engine gave up on, in
+    /// insertion order, deduplicated, capped at `tension::ABANDONED_HASHES_MAX`.
+    /// Persisted so a container recreate does not resurrect abandoned questions.
+    #[serde(default)]
+    pub abandoned_question_hashes: Vec<u64>,
 
     // ── Working Memory (PFC-equivalent, ~4±1 slots) ──
     /// Actively maintained concepts, fed by walkers, read by LLM
@@ -534,6 +546,9 @@ impl SelfModel {
             last_belief_formed: 0.0,
             predictions: HashMap::new(),
             last_prediction_error: 0.0,
+            predictions_made_total: 0,
+            predictions_resolved_total: 0,
+            abandoned_question_hashes: Vec::new(),
             working_memory: VecDeque::new(),
             plasticity_gate: 0.5,
             learned_biases: vec![crate::graph::LearnedBias::default(); 6],
@@ -568,12 +583,42 @@ impl SelfModel {
     /// When the next signal in this domain arrives, it will be compared
     /// to this prediction. Mismatch = prediction error = learning signal.
     pub fn predict(&mut self, domain: &str, predicted: &str, confidence: f32) {
+        self.predictions_made_total += 1;
         self.predictions.insert(domain.to_string(), ExpectedOutcome {
             domain: domain.to_string(),
             predicted: predicted.to_string(),
             predicted_at: now(),
             confidence,
         });
+    }
+
+    /// Record that the tension engine abandoned an open question (by hash).
+    /// Deduplicated, insertion-ordered, oldest dropped past the cap.
+    pub fn note_question_abandoned(&mut self, hash: u64) {
+        if self.abandoned_question_hashes.contains(&hash) {
+            return;
+        }
+        self.abandoned_question_hashes.push(hash);
+        let max = crate::tension::ABANDONED_HASHES_MAX;
+        if self.abandoned_question_hashes.len() > max {
+            let excess = self.abandoned_question_hashes.len() - max;
+            self.abandoned_question_hashes.drain(0..excess);
+        }
+    }
+
+    pub fn is_question_abandoned(&self, hash: u64) -> bool {
+        self.abandoned_question_hashes.contains(&hash)
+    }
+
+    /// Drop abandoned hashes whose question is no longer open, so the set only
+    /// ever tracks questions that could otherwise pulse again.
+    pub fn prune_abandoned_hashes(&mut self) {
+        let open: std::collections::HashSet<u64> = self
+            .open_questions
+            .iter()
+            .map(|q| crate::tension::fnv1a64(q))
+            .collect();
+        self.abandoned_question_hashes.retain(|h| open.contains(h));
     }
 
     /// Format working memory as a string suitable for LLM context injection.
@@ -653,6 +698,7 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
             self_model.open_questions.push(q);
             if self_model.open_questions.len() > 10 {
                 self_model.open_questions.remove(0);
+                self_model.prune_abandoned_hashes();
             }
         }
     }
@@ -708,6 +754,8 @@ pub fn process(signal: Signal, self_model: &mut SelfModel) -> (Signal, Option<No
     // ── Predictive Coding: compare signal to expectations ──
     if !signal.domain.is_empty()
         && let Some(prediction) = self_model.predictions.remove(&signal.domain) {
+            // Removal is the resolution, whatever the outcome below (tension §7).
+            self_model.predictions_resolved_total += 1;
             let age = now - prediction.predicted_at;
             // Prediction was recent enough to matter
             if age < 60.0
@@ -1308,6 +1356,50 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_model_loads_without_tension_fields() {
+        let mut v = serde_json::to_value(SelfModel::new()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("predictions_made_total");
+        o.remove("predictions_resolved_total");
+        o.remove("abandoned_question_hashes");
+        let sm: SelfModel = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            (sm.predictions_made_total, sm.predictions_resolved_total, sm.abandoned_question_hashes.len()),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn predict_counts_made_and_resolution_counts_resolved() {
+        let mut sm = SelfModel::new();
+        sm.predict("markets", "up", 0.6);
+        assert_eq!(sm.predictions_made_total, 1);
+        let mut sig = Signal::new("walk_end", "went down");
+        sig.domain = "markets".into();
+        let _ = process(sig, &mut sm);
+        assert_eq!(sm.predictions_resolved_total, 1);
+        assert!(sm.predictions.is_empty());
+    }
+
+    #[test]
+    fn abandoned_hashes_dedupe_cap_and_prune() {
+        let mut sm = SelfModel::new();
+        sm.note_question_abandoned(7);
+        sm.note_question_abandoned(7);
+        assert_eq!(sm.abandoned_question_hashes, vec![7]);
+        for i in 0..(crate::tension::ABANDONED_HASHES_MAX as u64 + 5) {
+            sm.note_question_abandoned(1000 + i);
+        }
+        assert_eq!(sm.abandoned_question_hashes.len(), crate::tension::ABANDONED_HASHES_MAX);
+        assert!(!sm.abandoned_question_hashes.contains(&7), "oldest dropped first");
+        sm.open_questions = vec!["keep me".into()];
+        let keep = crate::tension::fnv1a64("keep me");
+        sm.note_question_abandoned(keep);
+        sm.prune_abandoned_hashes();
+        assert_eq!(sm.abandoned_question_hashes, vec![keep]);
+    }
 
     // Regression: valence (core mood) had no runtime driver because the
     // emitted feeling-kinds ("friction"/"tool_success") didn't match the

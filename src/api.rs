@@ -83,10 +83,18 @@ pub async fn serve(
     // Motor gate FIRST: every outbound action goes through it. Default shadow.
     let motor_mode = crate::motor::MotorMode::from_env_value(std::env::var("RGW_MOTOR_MODE").ok().as_deref());
     let motor_gate = crate::motor::install_gate(motor_mode);
+    // Tension-driven background activity (spec: docs/superpowers/specs/2026-11-04-…).
+    // Default observe: compute + log, change nothing. See /diverger "tension".
+    let tension_engine = crate::tension::install(crate::tension::TensionMode::from_env_value(
+        std::env::var("RGW_TENSION_MODE").ok().as_deref(),
+    ));
     tracing::info!("[motor] Motor gate mode: {}", motor_gate.mode().as_str());
 
     // Create the Diverger with shared self-model + Julian URL for motor commands
     let diverger = Diverger::new(pool.clone(), self_model.clone(), julian_url);
+    if let Some(e) = &tension_engine {
+        e.attach_inbox(diverger.stimulus_sender());
+    }
 
     // ── Start concurrent dream loop (always-on, motor-disconnected) ──
     crate::dream::start_dream_loop(pool.clone(), self_model.clone());
@@ -1004,7 +1012,15 @@ async fn diverger_stats(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let stats = state.diverger.stats().await;
+    let tension = match crate::tension::engine() {
+        Some(e) => {
+            let sm = state.self_model.lock().await.clone();
+            serde_json::to_value(e.stats(&sm).await).unwrap_or_default()
+        }
+        None => serde_json::json!({ "mode": "off" }),
+    };
     Json(serde_json::json!({
+        "tension": tension,
         "status": if stats.alive { "alive" } else { "stopped" },
         "active_nodes": stats.active_nodes,
         "total_energy": stats.total_energy,

@@ -26,6 +26,7 @@ mod music;
 mod tools;
 mod speech;
 mod api;
+mod tension;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;

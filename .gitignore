@@ -18,3 +18,6 @@ ab_results.json
 
 # local tooling pins
 .gbrain-source
+
+# superpowers plan workspaces (scratch)
+.superpowers/

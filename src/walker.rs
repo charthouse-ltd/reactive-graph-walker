@@ -531,6 +531,10 @@ pub async fn walk_parallel(
     // Aggregate results (borrows walker_results, doesn't consume)
     let output = aggregate(pool, &walker_results, walk_ms, start, agreement_metric).await;
 
+    // Tension release: unresolved predictions / open questions may pulse into the
+    // diverger now (no-op unless RGW_TENSION_MODE=live; observe only logs).
+    let _ = crate::tension::spawn_after_walk(pool.clone(), self_model.clone());
+
     // Stage 2: record this walk for offline rule-trial replay (Autonomous only, bounded).
     if let Some(fitness) = session_fitness {
         let mut sm = self_model.lock().await;

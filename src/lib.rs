@@ -21,3 +21,4 @@ pub mod music;
 pub mod tools;
 pub mod speech;
 pub mod api;
+pub mod tension;
