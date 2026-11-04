@@ -199,9 +199,509 @@ impl QuestionState {
     }
 }
 
+// ── Engine types ─────────────────────────────────────────────────────────────
+
+use std::collections::{HashMap, VecDeque};
+
+/// Where a pulse comes from. Questions are identified by hash only.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TensionSource {
+    Prediction { domain: String },
+    Question { id: String },
+}
+
+impl std::fmt::Display for TensionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TensionSource::Prediction { domain } => write!(f, "prediction:{domain}"),
+            TensionSource::Question { id } => write!(f, "{id}"),
+        }
+    }
+}
+
+/// A pulse ready to enter the diverger: energy aimed at one node.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TensionPulse {
+    pub source: TensionSource,
+    pub target_node: i32,
+    pub energy: f32,
+}
+
+/// A planned release before its targets are known. `key` is the domain for a
+/// prediction or the 16-hex hash for a question (state lookup).
+#[derive(Debug, Clone)]
+pub struct PendingPulse {
+    pub source: TensionSource,
+    pub key: String,
+    pub energy: f32,
+}
+
+/// Which stimulus started a cascade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    Edge,
+    Tension,
+}
+
+/// What a brake would have done in a mode that does not enforce it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WouldHave {
+    Fatigue,
+    Budget,
+    Pool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecentEvent {
+    pub t: u64,
+    pub source: TensionSource,
+    pub target: i32,
+    pub energy: f32,
+    pub fired: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CascadeStats {
+    pub tension_origin: u64,
+    pub edge_origin: u64,
+    pub ended_by_budget: u64,
+    pub ended_naturally: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BrakesWouldHave {
+    pub fatigue_blocks: u64,
+    pub budget_cuts: u64,
+    pub pool_drops: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PoolStats {
+    pub tokens: f32,
+    pub capacity: f32,
+    pub empty_fraction_1h: f32,
+}
+
+/// The `tension` block of `GET /diverger` (spec §8).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TensionStats {
+    pub mode: String,
+    pub open_predictions: u64,
+    pub open_questions: u64,
+    pub abandoned_questions: u64,
+    pub unmapped: u64,
+    pub pulses_would_fire: u64,
+    pub pulses_fired: u64,
+    pub dropped_pool_empty: u64,
+    pub dropped_item_cooldown: u64,
+    pub dropped_inbox_full: u64,
+    pub dropped_compliant: u64,
+    pub cascades: CascadeStats,
+    pub brakes_would_have: BrakesWouldHave,
+    pub pool: PoolStats,
+    pub predictions_made_total: u64,
+    pub predictions_resolved_total: u64,
+    pub resolution_rate_1h: f32,
+    pub recent: Vec<RecentEvent>,
+}
+
+const WINDOW_SECS: f64 = 3600.0;
+const HOP_SAMPLES_MAX: usize = 100;
+const RECENT_MAX: usize = 50;
+
+/// All engine state. Fields are public so tests and the stats reader can see
+/// them; mutation goes through the functions below.
+#[derive(Debug)]
+pub struct EngineInner {
+    pub mode: TensionMode,
+    pub pool: TokenPool,
+    pub questions: HashMap<u64, QuestionState>,
+    /// domain → (cached targets, last release time)
+    pub prediction_targets: HashMap<String, (Vec<i32>, f64)>,
+    pub avg_edge_cascade_hops: f32,
+    pub hop_samples: VecDeque<u32>,
+    pub pool_samples: VecDeque<(f64, bool)>,
+    pub resolution_samples: VecDeque<(f64, u64, u64)>,
+    pub recent: VecDeque<RecentEvent>,
+    pub pulses_would_fire: u64,
+    pub pulses_fired: u64,
+    pub dropped_pool_empty: u64,
+    pub dropped_item_cooldown: u64,
+    pub dropped_inbox_full: u64,
+    pub dropped_compliant: u64,
+    pub unmapped: u64,
+    pub cascades_tension_origin: u64,
+    pub cascades_edge_origin: u64,
+    pub cascades_ended_by_budget: u64,
+    pub cascades_ended_naturally: u64,
+    pub would_fatigue_blocks: u64,
+    pub would_budget_cuts: u64,
+    pub would_pool_drops: u64,
+}
+
+impl EngineInner {
+    pub fn new(mode: TensionMode, now_secs: f64) -> Self {
+        EngineInner {
+            mode,
+            pool: TokenPool::new(now_secs),
+            questions: HashMap::new(),
+            prediction_targets: HashMap::new(),
+            avg_edge_cascade_hops: DEFAULT_EDGE_CASCADE_HOPS,
+            hop_samples: VecDeque::new(),
+            pool_samples: VecDeque::new(),
+            resolution_samples: VecDeque::new(),
+            recent: VecDeque::new(),
+            pulses_would_fire: 0,
+            pulses_fired: 0,
+            dropped_pool_empty: 0,
+            dropped_item_cooldown: 0,
+            dropped_inbox_full: 0,
+            dropped_compliant: 0,
+            unmapped: 0,
+            cascades_tension_origin: 0,
+            cascades_edge_origin: 0,
+            cascades_ended_by_budget: 0,
+            cascades_ended_naturally: 0,
+            would_fatigue_blocks: 0,
+            would_budget_cuts: 0,
+            would_pool_drops: 0,
+        }
+    }
+}
+
+fn trim_window<T>(q: &mut VecDeque<(f64, T)>, now: f64) {
+    while let Some((t, _)) = q.front() {
+        if now - *t > WINDOW_SECS {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+// ── Release planning (pure) ──────────────────────────────────────────────────
+
+/// Decide which tension items release energy now. Pure: no I/O. Applies the
+/// Compliant freeze, per-item cooldown, the prediction cap (freshest first)
+/// and half-life, question decay and abandonment (mirrored into `sm`).
+pub fn plan_release(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, now_secs: f64) -> Vec<PendingPulse> {
+    let mut out = Vec::new();
+    if sm.mode == crate::core::CognitiveMode::Compliant {
+        inner.dropped_compliant += 1;
+        return out;
+    }
+
+    // Predictions: freshest first, at most PREDICTION_MAX_ACTIVE.
+    let mut preds: Vec<(&String, f64)> = sm
+        .predictions
+        .iter()
+        .map(|(d, p)| (d, p.predicted_at))
+        .collect();
+    preds.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (domain, predicted_at) in preds.into_iter().take(PREDICTION_MAX_ACTIVE) {
+        let entry = inner
+            .prediction_targets
+            .entry(domain.clone())
+            .or_insert((Vec::new(), f64::NEG_INFINITY));
+        if now_secs - entry.1 < ITEM_COOLDOWN_SECS {
+            inner.dropped_item_cooldown += 1;
+            continue;
+        }
+        let energy = prediction_strength(now_secs - predicted_at);
+        if energy < MIN_PULSE_ENERGY {
+            continue;
+        }
+        entry.1 = now_secs;
+        out.push(PendingPulse {
+            source: TensionSource::Prediction { domain: domain.clone() },
+            key: domain.clone(),
+            energy,
+        });
+    }
+
+    // Open questions: decaying strength, attempt cap, persisted abandonment.
+    let questions: Vec<String> = sm.open_questions.clone();
+    for q in questions {
+        let hash = fnv1a64(&q);
+        if sm.is_question_abandoned(hash) {
+            continue;
+        }
+        let state = inner.questions.entry(hash).or_default();
+        if state.abandoned {
+            sm.note_question_abandoned(hash);
+            continue;
+        }
+        let released_before = state.attempts > 0 || state.unmapped;
+        if released_before && now_secs - state.last_release < ITEM_COOLDOWN_SECS {
+            inner.dropped_item_cooldown += 1;
+            continue;
+        }
+        state.unmapped = false; // cooldown passed: allow a retry of the mapping
+        let energy = state.strength;
+        if energy < MIN_PULSE_ENERGY {
+            state.abandoned = true;
+            sm.note_question_abandoned(hash);
+            continue;
+        }
+        out.push(PendingPulse {
+            source: TensionSource::Question { id: question_id(&q) },
+            key: format!("{hash:016x}"),
+            energy,
+        });
+        state.after_release(now_secs);
+        if state.abandoned {
+            sm.note_question_abandoned(hash);
+        }
+    }
+    out
+}
+
+// ── Charging against the pool ────────────────────────────────────────────────
+
+/// Charge each pulse to the global pool and record it. Returns the pulses to
+/// emit: empty unless the mode emits. In non-emitting modes a pulse is charged
+/// its energy plus the estimated cascade it would have started, so the pool's
+/// empty fraction forecasts `live` honestly.
+pub fn charge(inner: &mut EngineInner, pulses: Vec<TensionPulse>, now_secs: f64) -> Vec<TensionPulse> {
+    let mut out = Vec::new();
+    let emits = inner.mode.emits();
+    for p in pulses {
+        let cost = if emits { p.energy } else { p.energy + inner.avg_edge_cascade_hops * HOP_COST };
+        let ok = inner.pool.try_spend(cost, now_secs);
+        inner.pool_samples.push_back((now_secs, !ok));
+        trim_window(&mut inner.pool_samples, now_secs);
+        if !ok {
+            inner.dropped_pool_empty += 1;
+            continue;
+        }
+        inner.recent.push_back(RecentEvent {
+            t: now_secs as u64,
+            source: p.source.clone(),
+            target: p.target_node,
+            energy: p.energy,
+            fired: emits,
+        });
+        while inner.recent.len() > RECENT_MAX {
+            inner.recent.pop_front();
+        }
+        if emits {
+            inner.pulses_fired += 1;
+            tracing::info!("[tension] fire source={} target={} energy={:.3} pool={:.1}", p.source, p.target_node, p.energy, inner.pool.tokens);
+            out.push(p);
+        } else {
+            inner.pulses_would_fire += 1;
+            tracing::info!("[tension] would-fire source={} target={} energy={:.3} pool={:.1}", p.source, p.target_node, p.energy, inner.pool.tokens);
+        }
+    }
+    out
+}
+
+// ── Recording ────────────────────────────────────────────────────────────────
+
+pub fn record_edge_cascade_hops(inner: &mut EngineInner, hops: u32) {
+    inner.hop_samples.push_back(hops);
+    while inner.hop_samples.len() > HOP_SAMPLES_MAX {
+        inner.hop_samples.pop_front();
+    }
+    let n = inner.hop_samples.len() as f32;
+    inner.avg_edge_cascade_hops = inner.hop_samples.iter().map(|h| *h as f32).sum::<f32>() / n;
+}
+
+pub fn record_cascade_end(inner: &mut EngineInner, origin: Origin, by_budget: bool) {
+    match origin {
+        Origin::Edge => inner.cascades_edge_origin += 1,
+        Origin::Tension => inner.cascades_tension_origin += 1,
+    }
+    if by_budget {
+        inner.cascades_ended_by_budget += 1;
+    } else {
+        inner.cascades_ended_naturally += 1;
+    }
+}
+
+pub fn record_would_have(inner: &mut EngineInner, what: WouldHave) {
+    match what {
+        WouldHave::Fatigue => inner.would_fatigue_blocks += 1,
+        WouldHave::Budget => inner.would_budget_cuts += 1,
+        WouldHave::Pool => inner.would_pool_drops += 1,
+    }
+}
+
+/// Called from `after_walk` on every walk (never from `stats`), so the
+/// resolution rate does not depend on how often `/diverger` is polled.
+pub fn record_resolution_sample(inner: &mut EngineInner, made: u64, resolved: u64, now_secs: f64) {
+    inner.resolution_samples.push_back((now_secs, made, resolved));
+    while let Some((t, _, _)) = inner.resolution_samples.front() {
+        if now_secs - *t > WINDOW_SECS {
+            inner.resolution_samples.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+// ── Stats (read-only) ────────────────────────────────────────────────────────
+
+pub fn stats(inner: &EngineInner, sm: &crate::core::SelfModel, now_secs: f64) -> TensionStats {
+    let in_window = |t: f64| now_secs - t <= WINDOW_SECS;
+    let pool_in: Vec<&(f64, bool)> = inner.pool_samples.iter().filter(|(t, _)| in_window(*t)).collect();
+    let empty_fraction_1h = if pool_in.is_empty() {
+        0.0
+    } else {
+        pool_in.iter().filter(|(_, e)| *e).count() as f32 / pool_in.len() as f32
+    };
+    let res_in: Vec<&(f64, u64, u64)> = inner.resolution_samples.iter().filter(|(t, _, _)| in_window(*t)).collect();
+    let resolution_rate_1h = match (res_in.first(), res_in.last()) {
+        (Some((_, m0, r0)), Some((_, m1, r1))) if m1 > m0 => (r1 - r0) as f32 / (m1 - m0) as f32,
+        _ => 0.0,
+    };
+    TensionStats {
+        mode: inner.mode.as_str().to_string(),
+        open_predictions: sm.predictions.len() as u64,
+        open_questions: sm.open_questions.len() as u64,
+        abandoned_questions: sm.abandoned_question_hashes.len() as u64,
+        unmapped: inner.unmapped,
+        pulses_would_fire: inner.pulses_would_fire,
+        pulses_fired: inner.pulses_fired,
+        dropped_pool_empty: inner.dropped_pool_empty,
+        dropped_item_cooldown: inner.dropped_item_cooldown,
+        dropped_inbox_full: inner.dropped_inbox_full,
+        dropped_compliant: inner.dropped_compliant,
+        cascades: CascadeStats {
+            tension_origin: inner.cascades_tension_origin,
+            edge_origin: inner.cascades_edge_origin,
+            ended_by_budget: inner.cascades_ended_by_budget,
+            ended_naturally: inner.cascades_ended_naturally,
+        },
+        brakes_would_have: BrakesWouldHave {
+            fatigue_blocks: inner.would_fatigue_blocks,
+            budget_cuts: inner.would_budget_cuts,
+            pool_drops: inner.would_pool_drops,
+        },
+        pool: PoolStats { tokens: inner.pool.tokens, capacity: inner.pool.capacity, empty_fraction_1h },
+        predictions_made_total: sm.predictions_made_total,
+        predictions_resolved_total: sm.predictions_resolved_total,
+        resolution_rate_1h,
+        recent: inner.recent.iter().cloned().collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{CognitiveMode, ExpectedOutcome, SelfModel};
+
+    fn sm_with(preds: &[(&str, f64)], qs: &[&str], now: f64) -> SelfModel {
+        let mut sm = SelfModel::new();
+        sm.mode = CognitiveMode::Autonomous;
+        for (d, age) in preds {
+            sm.predictions.insert(
+                d.to_string(),
+                ExpectedOutcome { domain: d.to_string(), predicted: "x".into(), predicted_at: now - age, confidence: 0.5 },
+            );
+        }
+        sm.open_questions = qs.iter().map(|q| q.to_string()).collect();
+        sm
+    }
+
+    #[test]
+    fn plan_release_respects_cooldown_cap_and_freshness() {
+        let now = 1_000_000.0;
+        let mut inner = EngineInner::new(TensionMode::Observe, now);
+        let preds: Vec<(String, f64)> = (0..15).map(|i| (format!("d{i}"), 3600.0 + i as f64)).collect();
+        let pv: Vec<(&str, f64)> = preds.iter().map(|(d, a)| (d.as_str(), *a)).collect();
+        let mut sm = sm_with(&pv, &[], now);
+        let p1 = plan_release(&mut inner, &mut sm, now);
+        assert_eq!(p1.len(), PREDICTION_MAX_ACTIVE);
+        assert!(
+            p1.iter().all(|p| matches!(&p.source, TensionSource::Prediction { domain } if domain != "d14")),
+            "oldest excluded"
+        );
+        let p2 = plan_release(&mut inner, &mut sm, now + 1.0);
+        assert!(p2.is_empty(), "cooldown");
+        assert_eq!(inner.dropped_item_cooldown, PREDICTION_MAX_ACTIVE as u64);
+        let p3 = plan_release(&mut inner, &mut sm, now + ITEM_COOLDOWN_SECS + 1.0);
+        assert_eq!(p3.len(), PREDICTION_MAX_ACTIVE);
+    }
+
+    #[test]
+    fn plan_release_abandons_questions_and_never_revives_them() {
+        let now = 0.0;
+        let mut inner = EngineInner::new(TensionMode::Observe, now);
+        let mut sm = sm_with(&[], &["why is the ferry late"], now);
+        let mut t = now;
+        let mut releases = 0;
+        for _ in 0..(QUESTION_MAX_ATTEMPTS + 3) {
+            if !plan_release(&mut inner, &mut sm, t).is_empty() {
+                releases += 1;
+            }
+            t += ITEM_COOLDOWN_SECS + 1.0;
+        }
+        assert!(releases <= QUESTION_MAX_ATTEMPTS as usize && releases >= 1, "releases={releases}");
+        assert!(sm.is_question_abandoned(fnv1a64("why is the ferry late")));
+        sm.open_questions = vec!["why is the ferry late".into()];
+        assert!(plan_release(&mut inner, &mut sm, t + ITEM_COOLDOWN_SECS).is_empty());
+    }
+
+    #[test]
+    fn plan_release_is_silent_in_compliant_mode() {
+        let now = 0.0;
+        let mut inner = EngineInner::new(TensionMode::Live, now);
+        let mut sm = sm_with(&[("markets", 3600.0)], &[], now);
+        sm.mode = CognitiveMode::Compliant;
+        assert!(plan_release(&mut inner, &mut sm, now).is_empty());
+        assert_eq!(inner.dropped_compliant, 1);
+    }
+
+    #[test]
+    fn charge_emits_only_in_live_and_estimates_cascade_cost_otherwise() {
+        let now = 0.0;
+        let pulse = |e: f32| TensionPulse {
+            source: TensionSource::Prediction { domain: "m".into() },
+            target_node: 1,
+            energy: e,
+        };
+        let mut obs = EngineInner::new(TensionMode::Observe, now);
+        assert!(charge(&mut obs, vec![pulse(0.1)], now).is_empty());
+        assert_eq!(obs.pulses_would_fire, 1);
+        assert!((obs.pool.tokens - (20.0 - 0.1 - DEFAULT_EDGE_CASCADE_HOPS * HOP_COST)).abs() < 1e-5);
+        let mut live = EngineInner::new(TensionMode::Live, now);
+        assert_eq!(charge(&mut live, vec![pulse(0.1)], now).len(), 1);
+        assert_eq!(live.pulses_fired, 1);
+        assert!((live.pool.tokens - 19.9).abs() < 1e-5);
+        live.pool.tokens = 0.05;
+        assert!(charge(&mut live, vec![pulse(0.1)], now).is_empty());
+        assert_eq!(live.dropped_pool_empty, 1);
+    }
+
+    #[test]
+    fn stats_rates_and_ring_buffers_are_bounded() {
+        let now = 0.0;
+        let mut inner = EngineInner::new(TensionMode::Live, now);
+        for i in 0..120u32 {
+            record_edge_cascade_hops(&mut inner, i % 5);
+        }
+        assert_eq!(inner.hop_samples.len(), 100);
+        for i in 0..60 {
+            charge(
+                &mut inner,
+                vec![TensionPulse { source: TensionSource::Prediction { domain: "m".into() }, target_node: i, energy: 0.01 }],
+                now,
+            );
+        }
+        assert_eq!(inner.recent.len(), 50);
+        record_resolution_sample(&mut inner, 10, 5, now);
+        record_resolution_sample(&mut inner, 20, 13, now + 60.0);
+        let sm = SelfModel::new();
+        let s = stats(&inner, &sm, now + 60.0);
+        assert_eq!(s.mode, "live");
+        assert!((s.resolution_rate_1h - 0.8).abs() < 1e-6, "Δresolved 8 / Δmade 10");
+        assert!(s.pool.empty_fraction_1h >= 0.0 && s.pool.empty_fraction_1h <= 1.0);
+        let _s2 = stats(&inner, &sm, now + 60.0);
+        assert_eq!(inner.resolution_samples.len(), 2, "stats() never records");
+    }
 
     #[test]
     fn mode_parses_case_insensitively_and_defaults_to_observe() {
