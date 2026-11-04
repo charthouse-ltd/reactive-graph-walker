@@ -180,4 +180,4 @@ Design documents for capabilities that are specified but not yet (fully) impleme
 
 ## License
 
-Part of Project Julian.
+MIT — see [LICENSE](LICENSE). RGW is the cognitive engine behind Project Julian and 2wardsmars, and is developed in the open; the personas, their content and the backends that drive them are separate projects.
