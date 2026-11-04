@@ -1,0 +1,57 @@
+name: Secrets scan
+# This repository is public. Every push and pull request is scanned with
+# gitleaks over the full git history, so a leaked key can never land on main
+# unnoticed. Runs the pinned gitleaks binary directly (no license needed).
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks 8.30.1
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL -o /tmp/checksums.txt \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" /tmp/checksums.txt | sed 's#  .*#  /tmp/gitleaks.tar.gz#' | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Refuse PR-controlled scanner policy
+        # A PR must not be able to weaken the scan it is subject to: no new or
+        # changed gitleaks config / ignore files, and no .gitattributes changes
+        # (a `binary` or `-diff` attribute would hide content from the patch
+        # stream). Inline allow-markers are neutralised by --ignore-gitleaks-allow
+        # below, so they need no guard. Maintainers change policy on main.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if git diff --name-only "$BASE" "$HEAD" | LC_ALL=C grep -aEx '(.*/)?(\.gitleaks\.toml|\.gitleaksignore|\.gitattributes)'; then
+            echo "::error::this PR adds or changes scanner policy / git attribute files; do that on main with maintainer review"; exit 1
+          fi
+          echo "scanner policy untouched by this PR"
+      - name: Scan full history and the checked-out tree
+        # Built-in rules only; repo-local config, .gitleaksignore and inline
+        # allow-markers are all ignored. Two passes: the git history (every
+        # commit's patch) and the working tree (independent of git attributes).
+        run: |
+          set -euo pipefail
+          test ! -e .gitleaks.toml || { echo "::error::.gitleaks.toml present; the scan does not accept repo-local policy"; exit 1; }
+          COMMON="--redact --no-banner --exit-code 1 --ignore-gitleaks-allow --gitleaks-ignore-path /nonexistent"
+          gitleaks detect --source . $COMMON -v
+          gitleaks dir . $COMMON
