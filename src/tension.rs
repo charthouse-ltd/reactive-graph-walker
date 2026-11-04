@@ -269,7 +269,18 @@ pub fn would_have(what: WouldHave) {
     }
 }
 
-/// Release tension after a walk. No engine → 0.
+/// Release tension after a walk on a detached task, so the walk's caller (an
+/// HTTP response, or the reactor's walk task) never waits for embedding or DB
+/// lookups. Returns the task handle, or `None` when no engine is installed.
+pub fn spawn_after_walk(
+    pool: sqlx::PgPool,
+    sm: Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
+) -> Option<tokio::task::JoinHandle<usize>> {
+    let e = engine()?;
+    Some(tokio::spawn(async move { e.after_walk(&pool, &sm).await }))
+}
+
+/// Release tension after a walk, inline. No engine → 0.
 pub async fn after_walk(
     pool: &sqlx::PgPool,
     sm: &Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
@@ -305,10 +316,14 @@ impl TensionEngine {
         }
         let mut inner = self.inner.lock().await;
         let pulses = resolve_targets(pool, &mut inner, pending).await;
-        let emit = charge(&mut inner, pulses, now);
+        let charged = charge(&mut inner, pulses, now);
+        {
+            let mut sm = sm.lock().await;
+            settle(&mut inner, &mut sm, &charged.accepted_keys, now);
+        }
         let mut sent = 0;
         if let Some(tx) = self.inbox.get() {
-            for p in emit {
+            for p in charged.emit {
                 let stim = crate::diverger::Stimulus {
                     kind: crate::diverger::StimulusKind::Tension(p),
                     origin: Origin::Tension,
@@ -340,6 +355,14 @@ impl TensionEngine {
 
     pub async fn record_cascade_end(&self, origin: Origin, by_budget: bool) {
         record_cascade_end(&mut *self.inner.lock().await, origin, by_budget);
+    }
+
+    pub async fn record_hop_pool_drop(&self) {
+        record_hop_pool_drop(&mut *self.inner.lock().await, crate::core::now());
+    }
+
+    pub async fn record_inbox_full(&self) {
+        record_inbox_full(&mut *self.inner.lock().await);
     }
 
     /// Spend `amount` from the global pool (feedback hops in enforcing modes).
@@ -579,7 +602,6 @@ pub fn plan_release(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, no
         if energy < MIN_PULSE_ENERGY {
             continue;
         }
-        entry.1 = now_secs;
         out.push(PendingPulse {
             source: TensionSource::Prediction { domain: domain.clone() },
             key: domain.clone(),
@@ -619,12 +641,29 @@ pub fn plan_release(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, no
             key: format!("{hash:016x}"),
             energy,
         });
-        state.after_release(now_secs);
-        if state.abandoned {
-            sm.note_question_abandoned(hash);
-        }
     }
     out
+}
+
+/// Apply the release to the items the pool actually accepted: predictions get
+/// their cooldown stamp, questions decay and may abandon (mirrored into `sm`).
+/// Items the pool dropped keep their state untouched, so a drop never costs a
+/// question one of its attempts.
+pub fn settle(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, accepted_keys: &[String], now_secs: f64) {
+    for key in accepted_keys {
+        if let Some(entry) = inner.prediction_targets.get_mut(key) {
+            entry.1 = now_secs;
+            continue;
+        }
+        if let Ok(hash) = u64::from_str_radix(key, 16)
+            && let Some(state) = inner.questions.get_mut(&hash)
+        {
+            state.after_release(now_secs);
+            if state.abandoned {
+                sm.note_question_abandoned(hash);
+            }
+        }
+    }
 }
 
 // ── Target resolution (I/O) ──────────────────────────────────────────────────
@@ -712,15 +751,44 @@ pub async fn resolve_targets(pool: &sqlx::PgPool, inner: &mut EngineInner, pendi
 
 // ── Charging against the pool ────────────────────────────────────────────────
 
-/// Charge each pulse to the global pool and record it. Returns the pulses to
-/// emit: empty unless the mode emits. In non-emitting modes a pulse is charged
-/// its energy plus the estimated cascade it would have started, so the pool's
-/// empty fraction forecasts `live` honestly.
-pub fn charge(inner: &mut EngineInner, pulses: Vec<TensionPulse>, now_secs: f64) -> Vec<TensionPulse> {
-    let mut out = Vec::new();
+/// Result of charging one release.
+#[derive(Debug, Default)]
+pub struct Charged {
+    /// Pulses to put into the inbox (empty unless the mode emits).
+    pub emit: Vec<TensionPulse>,
+    /// Keys of the items the pool accepted; `settle` consumes these.
+    pub accepted_keys: Vec<String>,
+}
+
+fn pulse_key(p: &TensionPulse) -> String {
+    match &p.source {
+        TensionSource::Prediction { domain } => domain.clone(),
+        TensionSource::Question { id } => id.trim_start_matches("question:").to_string(),
+    }
+}
+
+/// Charge each *item* (all of its target pulses together) to the global pool
+/// and record the outcome. In non-emitting modes an item is charged its energy
+/// plus ONE estimated cascade, so the pool's empty fraction forecasts `live`
+/// honestly without billing a cascade per target. A dropped item is counted
+/// once, logged nothing, and left for `settle` to leave untouched.
+pub fn charge(inner: &mut EngineInner, pulses: Vec<TensionPulse>, now_secs: f64) -> Charged {
+    let mut out = Charged::default();
     let emits = inner.mode.emits();
+    // Group by item, preserving first-seen order.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<TensionPulse>> = HashMap::new();
     for p in pulses {
-        let cost = if emits { p.energy } else { p.energy + inner.avg_edge_cascade_hops * HOP_COST };
+        let k = pulse_key(&p);
+        if !groups.contains_key(&k) {
+            order.push(k.clone());
+        }
+        groups.entry(k).or_default().push(p);
+    }
+    for key in order {
+        let group = groups.remove(&key).unwrap_or_default();
+        let energy: f32 = group.iter().map(|p| p.energy).sum();
+        let cost = if emits { energy } else { energy + inner.avg_edge_cascade_hops * HOP_COST };
         let ok = inner.pool.try_spend(cost, now_secs);
         inner.pool_samples.push_back((now_secs, !ok));
         trim_window(&mut inner.pool_samples, now_secs);
@@ -728,23 +796,26 @@ pub fn charge(inner: &mut EngineInner, pulses: Vec<TensionPulse>, now_secs: f64)
             inner.dropped_pool_empty += 1;
             continue;
         }
-        inner.recent.push_back(RecentEvent {
-            t: now_secs as u64,
-            source: p.source.clone(),
-            target: p.target_node,
-            energy: p.energy,
-            fired: emits,
-        });
-        while inner.recent.len() > RECENT_MAX {
-            inner.recent.pop_front();
-        }
-        if emits {
-            inner.pulses_fired += 1;
-            tracing::info!("[tension] fire source={} target={} energy={:.3} pool={:.1}", p.source, p.target_node, p.energy, inner.pool.tokens);
-            out.push(p);
-        } else {
-            inner.pulses_would_fire += 1;
-            tracing::info!("[tension] would-fire source={} target={} energy={:.3} pool={:.1}", p.source, p.target_node, p.energy, inner.pool.tokens);
+        out.accepted_keys.push(key);
+        for p in group {
+            inner.recent.push_back(RecentEvent {
+                t: now_secs as u64,
+                source: p.source.clone(),
+                target: p.target_node,
+                energy: p.energy,
+                fired: emits,
+            });
+            while inner.recent.len() > RECENT_MAX {
+                inner.recent.pop_front();
+            }
+            if emits {
+                inner.pulses_fired += 1;
+                tracing::info!("[tension] fire source={} target={} energy={:.3} pool={:.1}", p.source, p.target_node, p.energy, inner.pool.tokens);
+                out.emit.push(p);
+            } else {
+                inner.pulses_would_fire += 1;
+                tracing::info!("[tension] would-fire source={} target={} energy={:.3} pool={:.1}", p.source, p.target_node, p.energy, inner.pool.tokens);
+            }
         }
     }
     out
@@ -759,6 +830,18 @@ pub fn record_edge_cascade_hops(inner: &mut EngineInner, hops: u32) {
     }
     let n = inner.hop_samples.len() as f32;
     inner.avg_edge_cascade_hops = inner.hop_samples.iter().map(|h| *h as f32).sum::<f32>() / n;
+}
+
+/// A feedback hop the pool could not pay for: counted like a dropped pulse and
+/// sampled as an empty-pool event (spec §6.3).
+pub fn record_hop_pool_drop(inner: &mut EngineInner, now_secs: f64) {
+    inner.dropped_pool_empty += 1;
+    inner.pool_samples.push_back((now_secs, true));
+    trim_window(&mut inner.pool_samples, now_secs);
+}
+
+pub fn record_inbox_full(inner: &mut EngineInner) {
+    inner.dropped_inbox_full += 1;
 }
 
 pub fn record_cascade_end(inner: &mut EngineInner, origin: Origin, by_budget: bool) {
@@ -889,6 +972,8 @@ mod tests {
             p1.iter().all(|p| matches!(&p.source, TensionSource::Prediction { domain } if domain != "d14")),
             "oldest excluded"
         );
+        let keys: Vec<String> = p1.iter().map(|p| p.key.clone()).collect();
+        settle(&mut inner, &mut sm, &keys, now);
         let p2 = plan_release(&mut inner, &mut sm, now + 1.0);
         assert!(p2.is_empty(), "cooldown");
         assert_eq!(inner.dropped_item_cooldown, PREDICTION_MAX_ACTIVE as u64);
@@ -904,8 +989,11 @@ mod tests {
         let mut t = now;
         let mut releases = 0;
         for _ in 0..(QUESTION_MAX_ATTEMPTS + 3) {
-            if !plan_release(&mut inner, &mut sm, t).is_empty() {
+            let pending = plan_release(&mut inner, &mut sm, t);
+            if !pending.is_empty() {
                 releases += 1;
+                let keys: Vec<String> = pending.iter().map(|p| p.key.clone()).collect();
+                settle(&mut inner, &mut sm, &keys, t);
             }
             t += ITEM_COOLDOWN_SECS + 1.0;
         }
@@ -950,16 +1038,68 @@ mod tests {
             energy: e,
         };
         let mut obs = EngineInner::new(TensionMode::Observe, now);
-        assert!(charge(&mut obs, vec![pulse(0.1)], now).is_empty());
+        assert!(charge(&mut obs, vec![pulse(0.1)], now).emit.is_empty());
         assert_eq!(obs.pulses_would_fire, 1);
         assert!((obs.pool.tokens - (20.0 - 0.1 - DEFAULT_EDGE_CASCADE_HOPS * HOP_COST)).abs() < 1e-5);
         let mut live = EngineInner::new(TensionMode::Live, now);
-        assert_eq!(charge(&mut live, vec![pulse(0.1)], now).len(), 1);
+        assert_eq!(charge(&mut live, vec![pulse(0.1)], now).emit.len(), 1);
         assert_eq!(live.pulses_fired, 1);
         assert!((live.pool.tokens - 19.9).abs() < 1e-5);
         live.pool.tokens = 0.05;
-        assert!(charge(&mut live, vec![pulse(0.1)], now).is_empty());
+        assert!(charge(&mut live, vec![pulse(0.1)], now).emit.is_empty());
         assert_eq!(live.dropped_pool_empty, 1);
+    }
+
+    #[test]
+    fn charge_bills_once_per_item_and_a_dropped_item_keeps_its_attempt() {
+        let now = 0.0;
+        let three = |key: &str, e: f32| -> Vec<TensionPulse> {
+            (1..=3)
+                .map(|t| TensionPulse { source: TensionSource::Question { id: format!("question:{key}") }, target_node: t, energy: e })
+                .collect()
+        };
+        // observe: one item with 3 targets is charged energy-sum + ONE cascade estimate
+        let mut obs = EngineInner::new(TensionMode::Observe, now);
+        let c = charge(&mut obs, three("a", 0.05), now);
+        assert!(c.emit.is_empty());
+        assert_eq!(c.accepted_keys, vec!["a".to_string()]);
+        assert!((obs.pool.tokens - (20.0 - 0.15 - DEFAULT_EDGE_CASCADE_HOPS * HOP_COST)).abs() < 1e-5, "{}", obs.pool.tokens);
+        assert_eq!(obs.pulses_would_fire, 3);
+        // a dropped item: not accepted, counted once, and settle() leaves its attempt count alone
+        let mut sm = sm_with(&[], &["q"], now);
+        let key = format!("{:016x}", fnv1a64("q"));
+        let pending = plan_release(&mut obs, &mut sm, now);
+        assert_eq!(pending.len(), 1);
+        obs.pool.tokens = 0.01;
+        let pulses: Vec<TensionPulse> = pending.iter().map(|p| TensionPulse { source: p.source.clone(), target_node: 1, energy: p.energy }).collect();
+        let c2 = charge(&mut obs, pulses, now);
+        assert!(c2.accepted_keys.is_empty());
+        assert_eq!(obs.dropped_pool_empty, 1, "one item, not one per target");
+        settle(&mut obs, &mut sm, &c2.accepted_keys, now);
+        assert_eq!(obs.questions[&fnv1a64("q")].attempts, 0, "attempt not consumed when the pool dropped it");
+        // accepted → attempt consumed and cooldown set
+        settle(&mut obs, &mut sm, &[key.clone()], now);
+        assert_eq!(obs.questions[&fnv1a64("q")].attempts, 1);
+        assert!(obs.questions[&fnv1a64("q")].last_release >= now);
+    }
+
+    #[test]
+    fn hop_and_inbox_accounting_helpers() {
+        let now = 0.0;
+        let mut inner = EngineInner::new(TensionMode::Live, now);
+        record_hop_pool_drop(&mut inner, now);
+        assert_eq!(inner.dropped_pool_empty, 1);
+        assert_eq!(inner.pool_samples.len(), 1);
+        assert!(inner.pool_samples[0].1, "sampled as empty");
+        record_inbox_full(&mut inner);
+        assert_eq!(inner.dropped_inbox_full, 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_after_walk_without_engine_returns_none() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://x:x@127.0.0.1:1/x").unwrap();
+        let sm = std::sync::Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
+        assert!(spawn_after_walk(pool, sm).is_none());
     }
 
     #[test]

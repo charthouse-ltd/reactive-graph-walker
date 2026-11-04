@@ -527,7 +527,7 @@ impl Diverger {
 
                             // Tension release after this spontaneous walk (spec §5.1):
                             // activity feeds activity, no clock.
-                            let _ = crate::tension::after_walk(&pool, &sm_walk).await;
+                            let _ = crate::tension::spawn_after_walk(pool.clone(), sm_walk.clone());
 
                             // Feedback hop (spec §6.2): the last traversed edge re-enters
                             // as the next stimulus of this cascade, under the per-cascade
@@ -538,17 +538,27 @@ impl Diverger {
                                 let injected = 0.02 * result.edges_traversed.len() as f32;
                                 let next = next_hop(&stim_meta, injected, max_cascade_depth);
                                 let m = mode();
+                                let n = result.path.len();
+                                let can_hop = n >= 2 && !result.edges_traversed.is_empty();
                                 let pool_ok = match engine() {
-                                    Some(e) if next.is_some() && m.enforces_brakes() => e.try_spend(HOP_COST).await,
+                                    Some(e) if next.is_some() && can_hop && m.enforces_brakes() => e.try_spend(HOP_COST).await,
                                     Some(e) if next.is_some() => e.can_spend(HOP_COST).await,
                                     _ => true,
                                 };
+                                // In observe nothing feeds back, so every observed cascade
+                                // is exactly one hop; record that so avg_edge_cascade_hops
+                                // reflects reality rather than the default.
+                                if !m.enforces_brakes() && m != crate::tension::TensionMode::Off
+                                    && stim_meta.origin == crate::tension::Origin::Edge
+                                    && let Some(e) = engine()
+                                {
+                                    e.record_edge_cascade_hops(1).await;
+                                }
                                 match decide_feedback(m, next, pool_ok) {
                                     Feedback::None | Feedback::WouldEnqueue => {}
                                     Feedback::WouldDrop(w) => would_have(w),
                                     Feedback::Enqueue(depth, budget) => {
-                                        let n = result.path.len();
-                                        if n >= 2 && let Some(&edge_id) = result.edges_traversed.last() {
+                                        if can_hop && let Some(&edge_id) = result.edges_traversed.last() {
                                             let hop = Stimulus {
                                                 kind: StimulusKind::Edge(EdgeChange {
                                                     edge_id,
@@ -561,15 +571,30 @@ impl Diverger {
                                                 depth,
                                                 budget,
                                             };
-                                            if feedback_tx.try_send(hop).is_err() {
-                                                would_have(crate::tension::WouldHave::Pool);
+                                            if feedback_tx.try_send(hop).is_err()
+                                                && let Some(e) = engine()
+                                            {
+                                                // Hop lost: the chain ends here. Count the real cause.
+                                                e.record_inbox_full().await;
+                                                e.record_cascade_end(stim_meta.origin, false).await;
+                                                if stim_meta.origin == crate::tension::Origin::Edge {
+                                                    e.record_edge_cascade_hops(stim_meta.depth + 1).await;
+                                                }
                                             }
                                         } else if let Some(e) = engine() {
+                                            // Too short to hop (nothing was spent): the chain ends naturally.
                                             e.record_cascade_end(stim_meta.origin, false).await;
+                                            if stim_meta.origin == crate::tension::Origin::Edge {
+                                                e.record_edge_cascade_hops(stim_meta.depth + 1).await;
+                                            }
                                         }
                                     }
                                     Feedback::End { by_budget } => {
                                         if let Some(e) = engine() {
+                                            if !by_budget && next.is_some() {
+                                                // Ended because the pool could not pay for the hop.
+                                                e.record_hop_pool_drop().await;
+                                            }
                                             e.record_cascade_end(stim_meta.origin, by_budget).await;
                                             if stim_meta.origin == crate::tension::Origin::Edge {
                                                 e.record_edge_cascade_hops(stim_meta.depth + 1).await;

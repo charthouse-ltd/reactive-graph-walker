@@ -34,7 +34,15 @@ async fn observe_mode_logs_would_fire_and_emits_nothing() -> anyhow::Result<()> 
     }
     let (_out, _) = rgw::walker::walk_parallel(&pool, &rgw::graph::EmotionalState::default(), 2, 3, &sm).await;
 
-    let stats = engine.stats(&*sm.lock().await).await;
+    // The release runs on a detached task; give it a moment.
+    let mut stats = engine.stats(&*sm.lock().await).await;
+    for _ in 0..100 {
+        if stats.pulses_would_fire >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stats = engine.stats(&*sm.lock().await).await;
+    }
     assert!(stats.pulses_would_fire >= 1, "{stats:?}");
     assert_eq!(stats.pulses_fired, 0);
     assert!(rx.try_recv().is_err(), "nothing entered the inbox in observe");

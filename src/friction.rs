@@ -46,6 +46,7 @@ pub fn tool_friction(result: &ToolResult, self_model: &mut SelfModel) {
         self_model.open_questions.push(question);
         if self_model.open_questions.len() > 10 {
             self_model.open_questions.remove(0);
+            self_model.prune_abandoned_hashes();
         }
     }
 }
