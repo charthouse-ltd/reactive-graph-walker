@@ -804,6 +804,7 @@ async fn aggregate(
         walk_ms,
         total_ms,
         hops_per_sec,
+        walker_context: String::new(),
     }
 }
 
@@ -861,80 +862,136 @@ pub fn format_walk_context(output: &WalkOutput) -> String {
     lines.join("\n")
 }
 
-/// Rich graph-to-text: fetch node content and describe relationships.
-/// Translates raw node IDs into a narrative the LLM can understand.
-pub async fn format_walk_narrative(output: &WalkOutput, pool: &PgPool) -> String {
+/// Text of one graph node, as shown to the LLM.
+#[derive(Debug, Clone, Default)]
+pub struct NodeText {
+    pub title: String,
+    pub excerpt: String,
+    pub domain: String,
+}
+
+/// Length of the document excerpt shown per node. 160 chars is what the
+/// 2026-11-04 A/B used; longer excerpts cost prompt tokens without evidence.
+pub const NARRATIVE_EXCERPT_CHARS: usize = 160;
+
+/// One-line excerpt: collapse all whitespace runs to a single space and drop a
+/// leading repeat of the title (ingested documents often start with it).
+fn tidy_excerpt(title: &str, excerpt: &str) -> String {
+    let flat = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat_title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let rest = if !flat_title.is_empty() && flat.starts_with(&flat_title) {
+        flat[flat_title.len()..].trim_start_matches([':', '-', '—', ' ']).to_string()
+    } else {
+        flat
+    };
+    rest.trim().to_string()
+}
+
+/// Pure renderer: turn a walk + the texts of the nodes it surfaced into the
+/// `walker_context` string. Nodes missing from `texts`, or with neither a
+/// title nor an excerpt, are skipped so empty / malformed nodes never reach
+/// the prompt. Persona-neutral so every backend can inject it as-is.
+pub fn render_walk_narrative(output: &WalkOutput, texts: &HashMap<i32, NodeText>) -> String {
     let mut lines = Vec::new();
-    lines.push("=== JULIAN'S MIND RIGHT NOW ===".to_string());
+    lines.push("=== RGW: MIND RIGHT NOW ===".to_string());
     lines.push(format!(
         "State: {} (confidence {:.0}%, novelty {:.0}%)",
         output.recommended_action,
         output.agreement_score * 100.0,
         output.novelty_score * 100.0,
     ));
-
-    // Fetch actual content for consensus nodes (what Julian is sure about)
-    if !output.consensus_nodes.is_empty() {
-        lines.push("\nStrong convictions:".to_string());
-        for &nid in output.consensus_nodes.iter().take(3) {
-            if let Ok(Some(node)) = db::get_node(pool, nid).await {
-                // Fetch the document text (title)
-                let title: Option<String> = sqlx::query_scalar(
-                    "SELECT title FROM memory_vectors WHERE id = $1"
-                )
-                .bind(nid)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-
-                let label = title.unwrap_or_else(|| format!("[{}:{}]", node.domain, nid));
-                lines.push(format!("  - {} (domain: {})", label, node.domain));
-            }
-        }
+    if !output.primary_domain.is_empty() {
+        lines.push(format!("Primary domain: {}", output.primary_domain));
     }
-
-    // Fetch content for divergent nodes (where perspectives disagree)
-    if !output.divergent_nodes.is_empty() {
-        lines.push("\nUnresolved tensions (walkers disagreed):".to_string());
-        for &nid in output.divergent_nodes.iter().take(3) {
-            if let Ok(Some(node)) = db::get_node(pool, nid).await {
-                let title: Option<String> = sqlx::query_scalar(
-                    "SELECT title FROM memory_vectors WHERE id = $1"
-                )
-                .bind(nid)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-
-                let label = title.unwrap_or_else(|| format!("[{}:{}]", node.domain, nid));
-                lines.push(format!("  ? {} (domain: {})", label, node.domain));
-            }
-        }
-    }
-
-    // Describe walker paths (what trails of thought were followed)
     if !output.domain_distribution.is_empty() {
         let mut sorted: Vec<_> = output.domain_distribution.iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(a.1));
-        let narrative: Vec<String> = sorted.iter().take(3).map(|(d, c)| {
-            format!("{} ({}x)", d, c)
-        }).collect();
-        lines.push(format!("\nThought trails: {}", narrative.join(" → ")));
+        sorted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let top: Vec<String> = sorted.iter().take(5).map(|(d, c)| format!("{}({})", d, c)).collect();
+        lines.push(format!("Landscape: {}", top.join(", ")));
     }
+
+    let mut section = |label: &str, ids: &[i32]| {
+        let mut rows = Vec::new();
+        for nid in ids.iter().take(4) {
+            if let Some(t) = texts.get(nid) {
+                let title = t.title.trim();
+                let excerpt = tidy_excerpt(title, &t.excerpt);
+                let excerpt = excerpt.as_str();
+                if title.is_empty() && excerpt.is_empty() {
+                    continue;
+                }
+                let row = match (title.is_empty(), excerpt.is_empty()) {
+                    (false, false) => format!("  - {}: {}", title, excerpt),
+                    (false, true) => format!("  - {}", title),
+                    _ => format!("  - {}", excerpt),
+                };
+                rows.push(format!("{} [{}]", row, t.domain));
+            }
+        }
+        if !rows.is_empty() {
+            lines.push(format!("\n{}:", label));
+            lines.extend(rows);
+        }
+    };
+    section("Strong convictions (consensus)", &output.consensus_nodes);
+    section("Loose threads (walkers disagreed)", &output.divergent_nodes);
+    section("Blind spots (rarely visited)", &output.blind_spots);
 
     if output.novel_connections > 0 {
-        lines.push(format!(
-            "\nSurprises: {} unexpected cross-domain connections found",
-            output.novel_connections
-        ));
+        lines.push(format!("\nNovel connections this walk: {}", output.novel_connections));
     }
-
     lines.push(format!(
-        "\n[{} perspectives, {:.0}ms thinking time]",
-        output.walker_count, output.total_ms
+        "\n[{} walkers, {} hops, {:.0}ms]",
+        output.walker_count, output.total_hops, output.total_ms
     ));
-    lines.push("=== END ===".to_string());
+    lines.push("=== END RGW ===".to_string());
     lines.join("\n")
+}
+
+/// Fetch the texts of every node the walk surfaced (one query) and render
+/// the narrative. Any DB error degrades to a narrative without node rows.
+pub async fn format_walk_narrative(output: &WalkOutput, pool: &PgPool) -> String {
+    let mut ids: Vec<i32> = Vec::new();
+    for list in [&output.consensus_nodes, &output.divergent_nodes, &output.blind_spots] {
+        ids.extend(list.iter().take(4));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut texts: HashMap<i32, NodeText> = HashMap::new();
+    if !ids.is_empty() {
+        // The backends own this table and their schema has `title` + `document`;
+        // RGW's standalone/test schema has only `content`. Pick what exists.
+        let cols: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns WHERE table_name = 'memory_vectors'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let has = |c: &str| cols.iter().any(|x| x == c);
+        let title_expr = if has("title") { "COALESCE(title, '')" } else { "''" };
+        let text_col = ["document", "content"].into_iter().find(|c| has(c));
+        let text_expr = match text_col {
+            Some(c) => format!("COALESCE(left({c}, $2), '')"),
+            None => "''".to_string(),
+        };
+        let sql = format!(
+            "SELECT id, {title_expr}, {text_expr}, COALESCE(domain, '') FROM memory_vectors WHERE id = ANY($1)"
+        );
+        let mut q = sqlx::query_as::<_, (i32, String, String, String)>(&sql).bind(&ids);
+        if text_col.is_some() {
+            q = q.bind(NARRATIVE_EXCERPT_CHARS as i32);
+        }
+        match q.fetch_all(pool).await {
+            Ok(rows) => {
+                for (id, title, excerpt, domain) in rows {
+                    texts.insert(id, NodeText { title, excerpt, domain });
+                }
+            }
+            Err(e) => tracing::warn!("[walker] narrative node lookup failed ({} ids): {}", ids.len(), e),
+        }
+    }
+    render_walk_narrative(output, &texts)
 }
 
 fn empty_output() -> WalkOutput {
@@ -957,12 +1014,77 @@ fn empty_output() -> WalkOutput {
         walk_ms: 0.0,
         total_ms: 0.0,
         hops_per_sec: 0.0,
+        walker_context: String::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn excerpt_is_single_line_and_drops_leading_title_repeat() {
+        assert_eq!(
+            tidy_excerpt("Tweet: New city", "Tweet: New city\n\nNew city. You learn the clock\nfirst."),
+            "New city. You learn the clock first."
+        );
+        assert_eq!(tidy_excerpt("", "  a\n b  "), "a b");
+        assert_eq!(tidy_excerpt("Thesis", "Thesis: I looked at longing BTC"), "I looked at longing BTC");
+        assert_eq!(tidy_excerpt("Unrelated", "Body text here"), "Body text here");
+    }
+
+    #[test]
+    fn narrative_shows_titles_and_excerpts_and_skips_empty_or_unknown_nodes() {
+        let mut dist = HashMap::new();
+        dist.insert("travel".to_string(), 3usize);
+        dist.insert("art".to_string(), 1usize);
+        let output = WalkOutput {
+            recommended_action: "explore".into(),
+            primary_domain: "travel".into(),
+            domain_distribution: dist,
+            agreement_score: 0.5,
+            domain_agreement_score: 0.5,
+            novelty_score: 0.25,
+            emotional_resonance: 0.0,
+            search_query: None,
+            expression_seeds: vec![],
+            novel_connections: 2,
+            consensus_nodes: vec![1, 2, 99],
+            divergent_nodes: vec![3],
+            blind_spots: vec![],
+            walker_count: 2,
+            total_hops: 6,
+            walk_ms: 10.0,
+            total_ms: 12.0,
+            hops_per_sec: 500.0,
+            walker_context: String::new(),
+        };
+        let mut texts = HashMap::new();
+        texts.insert(1, NodeText { title: "Nadi silversmith".into(), excerpt: "Forty minutes by hand.".into(), domain: "travel".into() });
+        texts.insert(2, NodeText { title: "  ".into(), excerpt: "".into(), domain: "trading".into() }); // empty → skipped
+        texts.insert(3, NodeText { title: "".into(), excerpt: "A boat insured twice.".into(), domain: "inner_life".into() });
+        // node 99 has no text row → skipped
+
+        let s = render_walk_narrative(&output, &texts);
+        assert!(s.starts_with("=== RGW: MIND RIGHT NOW ==="), "{s}");
+        assert!(s.contains("State: explore (confidence 50%, novelty 25%)"), "{s}");
+        assert!(s.contains("Landscape: travel(3), art(1)"), "{s}");
+        assert!(s.contains("Strong convictions (consensus):\n  - Nadi silversmith: Forty minutes by hand. [travel]"), "{s}");
+        assert!(s.contains("Loose threads (walkers disagreed):\n  - A boat insured twice. [inner_life]"), "{s}");
+        assert!(!s.contains("trading"), "empty node must not appear: {s}");
+        assert!(!s.contains("99"), "unknown node must not appear: {s}");
+        assert!(!s.contains("Blind spots"), "empty section must be omitted: {s}");
+        assert!(s.contains("Novel connections this walk: 2"), "{s}");
+        assert!(s.ends_with("=== END RGW ==="), "{s}");
+    }
+
+    #[test]
+    fn narrative_without_any_node_text_still_reports_state() {
+        let output = WalkOutput { recommended_action: "rest".into(), ..empty_output() };
+        let s = render_walk_narrative(&output, &HashMap::new());
+        assert!(s.contains("State: rest"), "{s}");
+        assert!(!s.contains("convictions"), "{s}");
+    }
     use crate::core::Noticing;
 
     fn wr(path: Vec<i32>, total_weight: f32) -> WalkerResult {

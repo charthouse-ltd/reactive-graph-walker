@@ -1961,6 +1961,7 @@ mod tests {
             walk_ms: 120.0,
             total_ms: 180.0,
             hops_per_sec: 260.0,
+            walker_context: String::new(),
         }
     }
 

@@ -704,6 +704,13 @@ pub struct WalkOutput {
     pub walk_ms: f64,
     pub total_ms: f64,
     pub hops_per_sec: f64,
+    /// Prompt-ready narrative of this walk (node titles + excerpts for the
+    /// consensus / divergent / blind-spot nodes, domain landscape). Filled by
+    /// the `/walk` handler via `walker::format_walk_narrative`; empty elsewhere.
+    /// Backends inject this string into their LLM prompts — measured 2026-11-04
+    /// to beat both no-context and random-node context on Julian's graph.
+    #[serde(default)]
+    pub walker_context: String,
 }
 
 #[cfg(test)]
