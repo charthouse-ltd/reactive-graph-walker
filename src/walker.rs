@@ -1039,11 +1039,23 @@ pub fn narrative_excluded_source_types() -> Vec<String> {
 fn parse_excluded_source_types(raw: Option<&str>) -> Vec<String> {
     match raw {
         None => DEFAULT_NARRATIVE_EXCLUDED_SOURCE_TYPES.iter().map(|s| s.to_string()).collect(),
-        Some(v) => v
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
+        Some(v) => {
+            let list: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if list.is_empty() {
+                tracing::warn!("[walker] RGW_NARRATIVE_EXCLUDE_SOURCE_TYPES is set but empty: narrative privacy filter DISABLED");
+            } else {
+                for d in DEFAULT_NARRATIVE_EXCLUDED_SOURCE_TYPES {
+                    if !list.iter().any(|x| x == d) {
+                        tracing::warn!("[walker] RGW_NARRATIVE_EXCLUDE_SOURCE_TYPES override no longer excludes '{}'", d);
+                    }
+                }
+            }
+            list
+        }
     }
 }
 
@@ -1078,7 +1090,8 @@ pub async fn format_walk_narrative(output: &WalkOutput, pool: &PgPool) -> String
         // backends' schema has that column; RGW's standalone schema does not).
         let excluded = narrative_excluded_source_types();
         let filter_sql = if has("source_type") && !excluded.is_empty() {
-            if text_col.is_some() { " AND source_type <> ALL($3)" } else { " AND source_type <> ALL($2)" }
+            // Case/whitespace-insensitive so a stray "Trade " or "TRADE_THESIS" row cannot slip past.
+            if text_col.is_some() { " AND lower(trim(source_type)) <> ALL($3)" } else { " AND lower(trim(source_type)) <> ALL($2)" }
         } else {
             ""
         };
@@ -1176,7 +1189,7 @@ mod tests {
     fn excluded_source_types_default_and_override() {
         let d = parse_excluded_source_types(None);
         assert!(d.contains(&"trade_thesis".to_string()) && d.contains(&"negotiation".to_string()));
-        assert_eq!(parse_excluded_source_types(Some(" a, b ,,c ")), vec!["a", "b", "c"]);
+        assert_eq!(parse_excluded_source_types(Some(" a, B ,,c ")), vec!["a", "b", "c"], "lowercased + trimmed");
         assert!(parse_excluded_source_types(Some("")).is_empty(), "empty string disables the filter");
     }
 
