@@ -380,7 +380,7 @@ async fn walk(
     // never exposed to concurrent walks, the diverger or the dream loop.
     let self_model = request_self_model(&state.self_model, req.rgw_mode.as_deref()).await?;
 
-    let (output, walker_results) = walker::walk_parallel(
+    let (mut output, walker_results) = walker::walk_parallel(
         &state.pool,
         &req.emotional_state,
         n,
@@ -388,6 +388,11 @@ async fn walk(
         &self_model,
     )
     .await;
+
+    // Prompt-ready narrative for the caller's LLM. Measured 2026-11-04 on the
+    // Julian graph: injecting this beat no-context (61% vs 50%) while the old
+    // one-liner callers synthesised from action/novelty did not (45%).
+    output.walker_context = walker::format_walk_narrative(&output, &state.pool).await;
 
     // ── Metacognitive Critic: run after walk session ──
     // Algorithmic diagnosis always runs. LLM escalates only when warranted.

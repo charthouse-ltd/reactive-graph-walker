@@ -213,6 +213,15 @@ async fn run_walks(pool: &PgPool) -> anyhow::Result<()> {
     println!("  consensus nodes: {:?}", &output.consensus_nodes[..output.consensus_nodes.len().min(5)]);
     println!("  divergent nodes: {:?}", &output.divergent_nodes[..output.divergent_nodes.len().min(5)]);
     println!("  blind spots:     {:?}", &output.blind_spots[..output.blind_spots.len().min(5)]);
+
+    // /walk's walker_context is built from this narrative: it must always carry
+    // the state line, and node rows whenever the walk surfaced known nodes.
+    let narrative = walker::format_walk_narrative(&output, pool).await;
+    assert!(narrative.contains("State: "), "narrative missing state line: {narrative}");
+    if !output.consensus_nodes.is_empty() {
+        assert!(narrative.contains("Strong convictions"), "consensus nodes but no rows: {narrative}");
+    }
+    println!("\n{narrative}\n");
     println!("  total hops: {}  walk_ms: {:.0}  hops/sec: {:.0}",
         output.total_hops, output.walk_ms, output.hops_per_sec);
 
