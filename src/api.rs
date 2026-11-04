@@ -94,6 +94,7 @@ pub async fn serve(
     let diverger = Diverger::new(pool.clone(), self_model.clone(), julian_url);
     if let Some(e) = &tension_engine {
         e.attach_inbox(diverger.stimulus_sender());
+        e.attach_energy_view(diverger.energy_view());
     }
 
     // ── Start concurrent dream loop (always-on, motor-disconnected) ──

@@ -154,6 +154,12 @@ impl TokenPool {
             false
         }
     }
+
+    /// Give back tokens spent on work that did not happen (a hop whose inbox
+    /// send failed). Capped at capacity, so a refund can never mint tokens.
+    pub fn refund(&mut self, amount: f32) {
+        self.tokens = (self.tokens + amount.max(0.0)).min(self.capacity);
+    }
 }
 
 // ── Open-question state ──────────────────────────────────────────────────────
@@ -211,17 +217,26 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
 /// Admits one release at a time; a release requested while one is running is
-/// coalesced away (the running one already sees the latest self-model).
+/// coalesced away (the running one already sees the latest self-model). The
+/// admission is a token that clears the flag on drop, so a release task that
+/// panics (or is cancelled) cannot leave the engine wedged with every later
+/// release silently skipped.
 #[derive(Default)]
-pub struct ReleaseGuard(std::sync::atomic::AtomicBool);
+pub struct ReleaseGuard(Arc<std::sync::atomic::AtomicBool>);
+
+pub struct ReleaseToken(Arc<std::sync::atomic::AtomicBool>);
 
 impl ReleaseGuard {
-    pub fn try_begin(&self) -> bool {
+    pub fn try_begin(&self) -> Option<ReleaseToken> {
         self.0
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+            .then(|| ReleaseToken(self.0.clone()))
     }
-    pub fn end(&self) {
+}
+
+impl Drop for ReleaseToken {
+    fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
@@ -234,6 +249,9 @@ pub struct TensionEngine {
     pub mode: TensionMode,
     inner: tokio::sync::Mutex<EngineInner>,
     inbox: OnceLock<mpsc::Sender<crate::diverger::Stimulus>>,
+    /// Read-only view of the reactor's node energies, so non-emitting modes can
+    /// count pulses that would actually cross a threshold, not just be emitted.
+    energy_view: OnceLock<crate::diverger::EnergyView>,
     // Brake "would have" counters are atomics so the reactor can record them
     // from synchronous code without touching the async lock.
     would_fatigue: AtomicU64,
@@ -255,6 +273,7 @@ pub fn install(mode: TensionMode) -> Option<Arc<TensionEngine>> {
                     mode,
                     inner: tokio::sync::Mutex::new(EngineInner::new(mode, crate::core::now())),
                     inbox: OnceLock::new(),
+                    energy_view: OnceLock::new(),
                     would_fatigue: AtomicU64::new(0),
                     would_budget: AtomicU64::new(0),
                     would_pool: AtomicU64::new(0),
@@ -295,13 +314,11 @@ pub fn spawn_after_walk(
     sm: Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
 ) -> Option<tokio::task::JoinHandle<usize>> {
     let e = engine()?;
-    if !e.releasing.try_begin() {
-        return None; // a release is already running; it sees the same state
-    }
+    // A release is already running and sees the same state: coalesce.
+    let token = e.releasing.try_begin()?;
     Some(tokio::spawn(async move {
-        let n = e.after_walk(&pool, &sm).await;
-        e.releasing.end();
-        n
+        let _release = token; // cleared on drop, panic or cancellation included
+        e.after_walk(&pool, &sm).await
     }))
 }
 
@@ -320,6 +337,12 @@ impl TensionEngine {
     /// Give the engine the diverger's inbox so `live` can emit.
     pub fn attach_inbox(&self, tx: mpsc::Sender<crate::diverger::Stimulus>) {
         let _ = self.inbox.set(tx);
+    }
+
+    /// Give the engine a view of the reactor's node energies (observe/brakes
+    /// telemetry: `pulses_would_cross`).
+    pub fn attach_energy_view(&self, view: crate::diverger::EnergyView) {
+        let _ = self.energy_view.set(view);
     }
 
     /// The whole release cycle: sample the resolution metric, plan, resolve
@@ -349,7 +372,15 @@ impl TensionEngine {
             let mut inner = self.inner.lock().await;
             settle(&mut inner, &mut sm, &charged.accepted_keys, now);
         }
+        // Would any would-fire pulse have lifted its target over the threshold?
+        // Needs the reactor's energies (its own lock), so it runs with no engine
+        // lock held and the count is folded in below.
+        let would_cross = match self.energy_view.get() {
+            Some(view) if !charged.would_fire.is_empty() => count_would_cross(view, &charged.would_fire, now).await,
+            _ => 0,
+        };
         let mut inner = self.inner.lock().await;
+        inner.pulses_would_cross += would_cross;
         let mut sent = 0;
         if let Some(tx) = self.inbox.get() {
             for p in charged.emit {
@@ -397,6 +428,11 @@ impl TensionEngine {
     /// Spend `amount` from the global pool (feedback hops in enforcing modes).
     pub async fn try_spend(&self, amount: f32) -> bool {
         self.inner.lock().await.pool.try_spend(amount, crate::core::now())
+    }
+
+    /// Return tokens for work that did not happen (see `TokenPool::refund`).
+    pub async fn refund(&self, amount: f32) {
+        self.inner.lock().await.pool.refund(amount);
     }
 
     /// Would `amount` be affordable right now? Refills but does not spend
@@ -502,6 +538,10 @@ pub struct TensionStats {
     pub abandoned_questions: u64,
     pub unmapped: u64,
     pub pulses_would_fire: u64,
+    /// Subset of `pulses_would_fire` whose target's current energy plus the
+    /// pulse would have crossed its (fatigued) threshold. Observe-mode proxy
+    /// for the tension-origin cascades `live` would actually start.
+    pub pulses_would_cross: u64,
     pub pulses_fired: u64,
     pub dropped_pool_empty: u64,
     pub dropped_item_cooldown: u64,
@@ -537,6 +577,7 @@ pub struct EngineInner {
     pub resolution_samples: VecDeque<(f64, u64, u64)>,
     pub recent: VecDeque<RecentEvent>,
     pub pulses_would_fire: u64,
+    pub pulses_would_cross: u64,
     pub pulses_fired: u64,
     pub dropped_pool_empty: u64,
     pub dropped_item_cooldown: u64,
@@ -565,6 +606,7 @@ impl EngineInner {
             resolution_samples: VecDeque::new(),
             recent: VecDeque::new(),
             pulses_would_fire: 0,
+            pulses_would_cross: 0,
             pulses_fired: 0,
             dropped_pool_empty: 0,
             dropped_item_cooldown: 0,
@@ -794,8 +836,25 @@ pub async fn resolve_targets(pool: &sqlx::PgPool, inner: &mut EngineInner, pendi
 pub struct Charged {
     /// Pulses to put into the inbox (empty unless the mode emits).
     pub emit: Vec<TensionPulse>,
+    /// Pulses the pool accepted but the mode does not emit (observe/brakes);
+    /// `after_walk` checks these against the reactor's energies.
+    pub would_fire: Vec<TensionPulse>,
     /// Keys of the items the pool accepted; `settle` consumes these.
     pub accepted_keys: Vec<String>,
+}
+
+/// How many of `pulses` would lift their target over its current threshold,
+/// given the reactor's decayed energy and fatigue at `now_secs`. The reactor
+/// resets a node to zero when it fires, so each pulse is judged on its own.
+pub async fn count_would_cross(view: &crate::diverger::EnergyView, pulses: &[TensionPulse], now_secs: f64) -> u64 {
+    let mut n = 0;
+    for p in pulses {
+        let (energy, threshold) = view.headroom(p.target_node, now_secs).await;
+        if energy + p.energy >= threshold {
+            n += 1;
+        }
+    }
+    n
 }
 
 fn pulse_key(p: &TensionPulse) -> String {
@@ -853,6 +912,7 @@ pub fn charge(inner: &mut EngineInner, pulses: Vec<TensionPulse>, now_secs: f64)
             } else {
                 inner.pulses_would_fire += 1;
                 tracing::info!("[tension] would-fire source={} target={} energy={:.3} pool={:.1}", p.source, p.target_node, p.energy, inner.pool.tokens);
+                out.would_fire.push(p);
             }
         }
     }
@@ -929,6 +989,7 @@ pub fn stats(inner: &EngineInner, sm: &crate::core::SelfModel, now_secs: f64) ->
         abandoned_questions: sm.abandoned_question_hashes.len() as u64,
         unmapped: inner.unmapped,
         pulses_would_fire: inner.pulses_would_fire,
+        pulses_would_cross: inner.pulses_would_cross,
         pulses_fired: inner.pulses_fired,
         dropped_pool_empty: inner.dropped_pool_empty,
         dropped_item_cooldown: inner.dropped_item_cooldown,
@@ -1170,12 +1231,61 @@ mod tests {
     }
 
     #[test]
-    fn release_guard_admits_one_release_at_a_time() {
+    fn release_token_clears_the_flag_when_dropped_even_on_panic() {
         let g = ReleaseGuard::default();
-        assert!(g.try_begin());
-        assert!(!g.try_begin(), "second concurrent release is coalesced away");
-        g.end();
-        assert!(g.try_begin());
+        let token = g.try_begin().expect("first release admitted");
+        assert!(g.try_begin().is_none(), "second concurrent release is coalesced away");
+        drop(token);
+        let token = g.try_begin().expect("released after the token dropped");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _t = token;
+            panic!("release task died");
+        }));
+        assert!(r.is_err());
+        assert!(g.try_begin().is_some(), "a panicked release must not wedge the engine");
+    }
+
+    #[test]
+    fn token_pool_refund_restores_spent_tokens_up_to_capacity() {
+        let mut pool = TokenPool::new(0.0);
+        assert!(pool.try_spend(HOP_COST, 0.0));
+        let after = pool.tokens;
+        pool.refund(HOP_COST);
+        assert!((pool.tokens - (after + HOP_COST)).abs() < 1e-6);
+        pool.refund(100.0);
+        assert_eq!(pool.tokens, pool.capacity, "refund never exceeds capacity");
+    }
+
+    fn qpulse(target: i32, energy: f32) -> TensionPulse {
+        TensionPulse {
+            source: TensionSource::Question { id: "question:00000000000000ab".into() },
+            target_node: target,
+            energy,
+        }
+    }
+
+    #[test]
+    fn charge_returns_would_fire_pulses_in_non_emitting_modes() {
+        let mut observe = EngineInner::new(TensionMode::Observe, 0.0);
+        let c = charge(&mut observe, vec![qpulse(7, 0.1)], 0.0);
+        assert!(c.emit.is_empty());
+        assert_eq!(c.would_fire.len(), 1);
+        assert_eq!(c.would_fire[0].target_node, 7);
+
+        let mut live = EngineInner::new(TensionMode::Live, 0.0);
+        let c = charge(&mut live, vec![qpulse(7, 0.1)], 0.0);
+        assert_eq!(c.emit.len(), 1);
+        assert!(c.would_fire.is_empty());
+    }
+
+    #[tokio::test]
+    async fn would_cross_counts_only_pulses_that_lift_a_target_over_its_threshold() {
+        let view = crate::diverger::EnergyView::for_test(0.5, 0.01);
+        view.set_energy(1, 0.47, 0.0).await; // 0.47 + 0.05 >= 0.5: crosses
+        view.set_energy(2, 0.10, 0.0).await; // 0.15 < 0.5: does not
+        // node 3 is cold (not in the map): 0.05 < 0.5
+        let pulses = vec![qpulse(1, 0.05), qpulse(2, 0.05), qpulse(3, 0.05)];
+        assert_eq!(count_would_cross(&view, &pulses, 0.0).await, 1);
     }
 
     #[test]

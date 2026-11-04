@@ -202,7 +202,7 @@ counters exist for the metric in §9, not for the engine.
   "mode": "observe",            // off | observe | brakes | live
   "brakes_would_have": { "fatigue_blocks": 5, "budget_cuts": 3, "pool_drops": 12 },
   "open_predictions": 4, "open_questions": 7, "abandoned_questions": 2, "unmapped": 0,
-  "pulses_would_fire": 318, "pulses_fired": 0,
+  "pulses_would_fire": 318, "pulses_would_cross": 41, "pulses_fired": 0,
   "dropped_pool_empty": 12, "dropped_item_cooldown": 90, "dropped_inbox_full": 0,
   "cascades": { "tension_origin": 0, "edge_origin": 41, "ended_by_budget": 3, "ended_naturally": 38 },
   "pool": { "tokens": 17.4, "capacity": 20.0, "empty_fraction_1h": 0.01 },
@@ -212,6 +212,13 @@ counters exist for the metric in §9, not for the engine.
 }
 ```
 
+`pulses_would_fire` counts pulses the pool accepted that a non-emitting mode did
+not send. `pulses_would_cross` is the subset whose target node's current energy
+(decayed, as the reactor sees it) plus the pulse would have met the node's
+mood-modulated, fatigue-raised threshold, i.e. the tension-origin cascades `live`
+would actually have started. The gap between the two is the calibration signal
+for §12: a healthy `pulses_would_fire` with `pulses_would_cross` near zero means
+the pulse energies are too small for the threshold, not that tension is working.
 `recent` is a ring buffer of the last 50 events. A question is identified by
 `question:<16 hex>`, the FNV-1a 64 hash of its text (§3.2), so the log never carries
 the question itself and ids are stable across builds. `empty_fraction_1h` is the fraction of pool

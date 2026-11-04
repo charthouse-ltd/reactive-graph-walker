@@ -30,6 +30,66 @@ struct NodeEnergy {
     fatigue: f32,      // rises on fire, decays with rest; raises this node's threshold
 }
 
+/// The reactor's firing threshold right now: the configured base, lowered by
+/// arousal and raised by low energy (the same formula the reactor applies).
+pub(crate) fn dynamic_threshold(base: f32, emo: &EmotionalState) -> f32 {
+    base
+        * (1.0 - emo.arousal * 0.3)  // High arousal lowers threshold
+        * (1.0 + (1.0 - emo.energy) * 0.3)  // Low energy raises threshold
+}
+
+/// Read-only view of the reactor's node energies for the tension engine
+/// (spec §8 `pulses_would_cross`). Shares the reactor's map; never mutates it.
+#[derive(Clone)]
+pub struct EnergyView {
+    nodes: Arc<RwLock<HashMap<i32, NodeEnergy>>>,
+    emotion: Arc<RwLock<EmotionalState>>,
+    base_threshold: f32,
+    energy_decay_rate: f32,
+}
+
+impl EnergyView {
+    /// `(energy, threshold)` for `nid` as the reactor would see them at
+    /// `now_secs`: energy decayed since the node's last update, threshold
+    /// modulated by mood and raised by the node's decayed fatigue (what `live`
+    /// enforces). A node the reactor has never touched is cold at the base.
+    pub async fn headroom(&self, nid: i32, now_secs: f64) -> (f32, f32) {
+        let base = dynamic_threshold(self.base_threshold, &*self.emotion.read().await);
+        let nodes = self.nodes.read().await;
+        match nodes.get(&nid) {
+            Some(n) => {
+                let dt = (now_secs - n.last_update).max(0.0) as f32;
+                let energy = (n.energy - self.energy_decay_rate * dt).max(0.0);
+                let fatigue = crate::tension::decay_fatigue(n.fatigue, dt as f64);
+                (energy, crate::tension::effective_threshold(base, fatigue))
+            }
+            None => (0.0, base),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(base_threshold: f32, energy_decay_rate: f32) -> Self {
+        // Neutral mood: arousal 0 and energy 1 leave the base threshold unmodulated.
+        let emo = EmotionalState { arousal: 0.0, energy: 1.0, ..EmotionalState::default() };
+        EnergyView {
+            nodes: Arc::new(RwLock::new(HashMap::new())),
+            emotion: Arc::new(RwLock::new(emo)),
+            base_threshold,
+            energy_decay_rate,
+        }
+    }
+
+    #[cfg(test)]
+    async fn set_node(&self, nid: i32, node: NodeEnergy) {
+        self.nodes.write().await.insert(nid, node);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_energy(&self, nid: i32, energy: f32, now_secs: f64) {
+        self.set_node(nid, NodeEnergy { energy, last_fired: 0.0, last_update: now_secs, fatigue: 0.0 }).await;
+    }
+}
+
 /// The Diverger engine — a self-propagating reactive graph.
 /// Reactor inbox size. Edge changes beyond this are dropped and counted in
 /// `DivergerStats::edges_dropped` rather than queued without bound.
@@ -62,6 +122,9 @@ pub struct Diverger {
 
     /// Julian's Python backend URL (for motor commands)
     julian_url: String,
+
+    /// Threshold/decay the reactor runs with, for `energy_view()`.
+    config: DivergerConfig,
 }
 
 /// Notification that an edge was modified
@@ -219,6 +282,7 @@ impl Diverger {
         let (edge_tx, edge_rx) = mpsc::channel(EDGE_QUEUE_CAPACITY);
         let sm = self_model.clone();
 
+        let config = DivergerConfig::default();
         let diverger = Self {
             pool,
             nodes: Arc::new(RwLock::new(HashMap::new())),
@@ -230,10 +294,11 @@ impl Diverger {
             cascades_total: Arc::new(AtomicU64::new(0)),
             edges_changed: Arc::new(AtomicU64::new(0)),
             julian_url: julian_url.to_string(),
+            config: config.clone(),
         };
 
         // Start the reactor (consumes edge_rx) with shared self-model
-        diverger.start_reactor(edge_rx, DivergerConfig::default(), sm);
+        diverger.start_reactor(edge_rx, config, sm);
 
         diverger
     }
@@ -324,9 +389,7 @@ impl Diverger {
                 *emotion.write().await = emo.clone();
 
                 // Compute dynamic threshold
-                let threshold = config.base_threshold
-                    * (1.0 - emo.arousal * 0.3)  // High arousal lowers threshold
-                    * (1.0 + (1.0 - emo.energy) * 0.3);  // Low energy raises threshold
+                let threshold = dynamic_threshold(config.base_threshold, &emo);
 
                 // Energy to inject: an edge change feeds both endpoints; a tension
                 // pulse feeds its one target node with the pulse's own energy.
@@ -574,7 +637,11 @@ impl Diverger {
                                             if feedback_tx.try_send(hop).is_err()
                                                 && let Some(e) = engine()
                                             {
-                                                // Hop lost: the chain ends here. Count the real cause.
+                                                // Hop lost: the chain ends here. Count the real cause,
+                                                // and give back the token spent on a hop that never ran.
+                                                if m.enforces_brakes() {
+                                                    e.refund(HOP_COST).await;
+                                                }
                                                 e.record_inbox_full().await;
                                                 e.record_cascade_end(stim_meta.origin, false).await;
                                                 if stim_meta.origin == crate::tension::Origin::Edge {
@@ -681,6 +748,16 @@ impl Diverger {
         self.edge_tx.clone()
     }
 
+    /// Read-only view of node energies for the tension engine's telemetry.
+    pub fn energy_view(&self) -> EnergyView {
+        EnergyView {
+            nodes: self.nodes.clone(),
+            emotion: self.emotion.clone(),
+            base_threshold: self.config.base_threshold,
+            energy_decay_rate: self.config.energy_decay_rate,
+        }
+    }
+
     /// Queue any stimulus (edge change, tension pulse, or feedback hop).
     pub fn notify_stimulus(&self, s: Stimulus) {
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.edge_tx.try_send(s) {
@@ -737,6 +814,20 @@ impl Diverger {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn energy_view_headroom_decays_energy_and_raises_threshold_by_fatigue() {
+        let view = super::EnergyView::for_test(0.5, 0.01);
+        view.set_node(1, super::NodeEnergy { energy: 0.3, last_fired: 0.0, last_update: 0.0, fatigue: 0.5 }).await;
+        // 10 s later: energy 0.3 - 0.1 = 0.2; fatigue 0.5 - 0.1 = 0.4 -> threshold 0.5 * 1.4 = 0.7
+        let (e, th) = view.headroom(1, 10.0).await;
+        assert!((e - 0.2).abs() < 1e-5, "energy {e}");
+        assert!((th - 0.7).abs() < 1e-5, "threshold {th}");
+        // a node the reactor has never seen is cold at the base threshold
+        let (e, th) = view.headroom(99, 10.0).await;
+        assert_eq!(e, 0.0);
+        assert!((th - 0.5).abs() < 1e-5, "threshold {th}");
+    }
+
     use super::*;
 
     #[test]
