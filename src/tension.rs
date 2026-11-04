@@ -203,6 +203,17 @@ impl QuestionState {
     }
 }
 
+// ── Process-wide accessors (stubs until the engine is installed in Task 6) ──
+
+/// The active tension mode. `Off` until an engine is installed.
+pub fn mode() -> TensionMode {
+    TensionMode::Off
+}
+
+/// Record what a brake would have done in a non-enforcing mode. No engine
+/// installed → nothing to record.
+pub fn would_have(_what: WouldHave) {}
+
 // ── Engine types ─────────────────────────────────────────────────────────────
 
 use std::collections::{HashMap, VecDeque};
