@@ -203,16 +203,150 @@ impl QuestionState {
     }
 }
 
-// ── Process-wide accessors (stubs until the engine is installed in Task 6) ──
+
+// ── Process-wide engine ──────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::mpsc;
+
+static ENGINE: OnceLock<Option<Arc<TensionEngine>>> = OnceLock::new();
+
+/// One engine per process (same pattern as `motor::gate()`). `Off` installs
+/// nothing, so every hook is a no-op and the diverger behaves as before.
+pub struct TensionEngine {
+    pub mode: TensionMode,
+    inner: tokio::sync::Mutex<EngineInner>,
+    inbox: OnceLock<mpsc::Sender<crate::diverger::Stimulus>>,
+    // Brake "would have" counters are atomics so the reactor can record them
+    // from synchronous code without touching the async lock.
+    would_fatigue: AtomicU64,
+    would_budget: AtomicU64,
+    would_pool: AtomicU64,
+}
+
+/// Install the engine once. Returns `None` for `Off`. A second call returns the
+/// already-installed engine regardless of the mode passed.
+pub fn install(mode: TensionMode) -> Option<Arc<TensionEngine>> {
+    ENGINE
+        .get_or_init(|| {
+            tracing::info!("[tension] mode={}", mode.as_str());
+            if mode == TensionMode::Off {
+                None
+            } else {
+                Some(Arc::new(TensionEngine {
+                    mode,
+                    inner: tokio::sync::Mutex::new(EngineInner::new(mode, crate::core::now())),
+                    inbox: OnceLock::new(),
+                    would_fatigue: AtomicU64::new(0),
+                    would_budget: AtomicU64::new(0),
+                    would_pool: AtomicU64::new(0),
+                }))
+            }
+        })
+        .clone()
+}
+
+pub fn engine() -> Option<Arc<TensionEngine>> {
+    ENGINE.get().cloned().flatten()
+}
 
 /// The active tension mode. `Off` until an engine is installed.
 pub fn mode() -> TensionMode {
-    TensionMode::Off
+    engine().map(|e| e.mode).unwrap_or(TensionMode::Off)
 }
 
-/// Record what a brake would have done in a non-enforcing mode. No engine
-/// installed → nothing to record.
-pub fn would_have(_what: WouldHave) {}
+/// Record what a brake would have done in a non-enforcing mode. Synchronous
+/// and lock-free so the reactor can call it anywhere.
+pub fn would_have(what: WouldHave) {
+    if let Some(e) = engine() {
+        let c = match what {
+            WouldHave::Fatigue => &e.would_fatigue,
+            WouldHave::Budget => &e.would_budget,
+            WouldHave::Pool => &e.would_pool,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Release tension after a walk. No engine → 0.
+pub async fn after_walk(
+    pool: &sqlx::PgPool,
+    sm: &Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
+) -> usize {
+    match engine() {
+        Some(e) => e.after_walk(pool, sm).await,
+        None => 0,
+    }
+}
+
+impl TensionEngine {
+    /// Give the engine the diverger's inbox so `live` can emit.
+    pub fn attach_inbox(&self, tx: mpsc::Sender<crate::diverger::Stimulus>) {
+        let _ = self.inbox.set(tx);
+    }
+
+    /// The whole release cycle: sample the resolution metric, plan, resolve
+    /// targets, charge the pool, emit (live only). Returns pulses emitted.
+    pub async fn after_walk(
+        &self,
+        pool: &sqlx::PgPool,
+        sm: &Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
+    ) -> usize {
+        let now = crate::core::now();
+        let pending = {
+            let mut sm = sm.lock().await;
+            let mut inner = self.inner.lock().await;
+            record_resolution_sample(&mut inner, sm.predictions_made_total, sm.predictions_resolved_total, now);
+            plan_release(&mut inner, &mut sm, now)
+        };
+        if pending.is_empty() {
+            return 0;
+        }
+        let mut inner = self.inner.lock().await;
+        let pulses = resolve_targets(pool, &mut inner, pending).await;
+        let emit = charge(&mut inner, pulses, now);
+        let mut sent = 0;
+        if let Some(tx) = self.inbox.get() {
+            for p in emit {
+                let stim = crate::diverger::Stimulus {
+                    kind: crate::diverger::StimulusKind::Tension(p),
+                    origin: Origin::Tension,
+                    depth: 0,
+                    budget: CASCADE_BUDGET,
+                };
+                match tx.try_send(stim) {
+                    Ok(()) => sent += 1,
+                    Err(mpsc::error::TrySendError::Full(_)) => inner.dropped_inbox_full += 1,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }
+        }
+        sent
+    }
+
+    pub async fn stats(&self, sm: &crate::core::SelfModel) -> TensionStats {
+        let inner = self.inner.lock().await;
+        let mut s = stats(&inner, sm, crate::core::now());
+        s.brakes_would_have.fatigue_blocks += self.would_fatigue.load(Ordering::Relaxed);
+        s.brakes_would_have.budget_cuts += self.would_budget.load(Ordering::Relaxed);
+        s.brakes_would_have.pool_drops += self.would_pool.load(Ordering::Relaxed);
+        s
+    }
+
+    pub async fn record_edge_cascade_hops(&self, hops: u32) {
+        record_edge_cascade_hops(&mut *self.inner.lock().await, hops);
+    }
+
+    pub async fn record_cascade_end(&self, origin: Origin, by_budget: bool) {
+        record_cascade_end(&mut *self.inner.lock().await, origin, by_budget);
+    }
+
+    /// Spend `amount` from the global pool (feedback hops in enforcing modes).
+    pub async fn try_spend(&self, amount: f32) -> bool {
+        self.inner.lock().await.pool.try_spend(amount, crate::core::now())
+    }
+}
 
 // ── Engine types ─────────────────────────────────────────────────────────────
 
@@ -729,6 +863,14 @@ mod tests {
         assert!(inner.questions.get(&fnv1a64("q")).unwrap().unmapped);
         assert!(resolve_targets_with(&pool, &mut inner, vec![q()], failing).await.is_empty());
         assert_eq!(inner.unmapped, 1, "not counted again");
+    }
+
+    #[tokio::test]
+    async fn after_walk_without_engine_is_a_noop() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://x:x@127.0.0.1:1/x").unwrap();
+        let sm = std::sync::Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
+        assert_eq!(after_walk(&pool, &sm).await, 0); // no engine installed in this test binary
+        assert_eq!(mode(), TensionMode::Off);
     }
 
     #[test]
