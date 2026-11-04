@@ -210,6 +210,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
+/// Admits one release at a time; a release requested while one is running is
+/// coalesced away (the running one already sees the latest self-model).
+#[derive(Default)]
+pub struct ReleaseGuard(std::sync::atomic::AtomicBool);
+
+impl ReleaseGuard {
+    pub fn try_begin(&self) -> bool {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    pub fn end(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 static ENGINE: OnceLock<Option<Arc<TensionEngine>>> = OnceLock::new();
 
 /// One engine per process (same pattern as `motor::gate()`). `Off` installs
@@ -223,6 +239,7 @@ pub struct TensionEngine {
     would_fatigue: AtomicU64,
     would_budget: AtomicU64,
     would_pool: AtomicU64,
+    releasing: ReleaseGuard,
 }
 
 /// Install the engine once. Returns `None` for `Off`. A second call returns the
@@ -241,6 +258,7 @@ pub fn install(mode: TensionMode) -> Option<Arc<TensionEngine>> {
                     would_fatigue: AtomicU64::new(0),
                     would_budget: AtomicU64::new(0),
                     would_pool: AtomicU64::new(0),
+                    releasing: ReleaseGuard::default(),
                 }))
             }
         })
@@ -277,7 +295,14 @@ pub fn spawn_after_walk(
     sm: Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
 ) -> Option<tokio::task::JoinHandle<usize>> {
     let e = engine()?;
-    Some(tokio::spawn(async move { e.after_walk(&pool, &sm).await }))
+    if !e.releasing.try_begin() {
+        return None; // a release is already running; it sees the same state
+    }
+    Some(tokio::spawn(async move {
+        let n = e.after_walk(&pool, &sm).await;
+        e.releasing.end();
+        n
+    }))
 }
 
 /// Release tension after a walk, inline. No engine → 0.
@@ -314,13 +339,17 @@ impl TensionEngine {
         if pending.is_empty() {
             return 0;
         }
-        let mut inner = self.inner.lock().await;
-        let pulses = resolve_targets(pool, &mut inner, pending).await;
-        let charged = charge(&mut inner, pulses, now);
+        let charged = {
+            let mut inner = self.inner.lock().await;
+            let pulses = resolve_targets(pool, &mut inner, pending).await;
+            charge(&mut inner, pulses, now)
+        }; // `inner` released before `sm` is taken: the only lock order is sm → inner
         {
             let mut sm = sm.lock().await;
+            let mut inner = self.inner.lock().await;
             settle(&mut inner, &mut sm, &charged.accepted_keys, now);
         }
+        let mut inner = self.inner.lock().await;
         let mut sent = 0;
         if let Some(tx) = self.inbox.get() {
             for p in charged.emit {
@@ -602,6 +631,7 @@ pub fn plan_release(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, no
         if energy < MIN_PULSE_ENERGY {
             continue;
         }
+        entry.1 = now_secs; // reserve: no second release of this item within the cooldown
         out.push(PendingPulse {
             source: TensionSource::Prediction { domain: domain.clone() },
             key: domain.clone(),
@@ -636,6 +666,7 @@ pub fn plan_release(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, no
             sm.note_question_abandoned(hash);
             continue;
         }
+        state.last_release = now_secs; // reserve (decay/attempts happen in settle)
         out.push(PendingPulse {
             source: TensionSource::Question { id: question_id(&q) },
             key: format!("{hash:016x}"),
@@ -696,7 +727,7 @@ pub async fn resolve_targets_with(
                     cached
                 };
                 if let Some(entry) = inner.prediction_targets.get_mut(domain) {
-                    entry.0 = targets.clone();
+                    entry.0 = targets.clone(); // cooldown was reserved at plan time
                 }
                 if targets.is_empty() {
                     inner.unmapped += 1;
@@ -727,7 +758,14 @@ pub async fn resolve_targets_with(
                 }
                 let state = inner.questions.get_mut(&hash).expect("inserted above");
                 if state.targets.is_empty() {
+                    // Failed mapping: counts as an attempt (so a permanently unmappable
+                    // question is eventually abandoned) and starts the cooldown, so it
+                    // is not re-embedded on every walk.
                     state.unmapped = true;
+                    state.attempts += 1;
+                    if state.attempts >= QUESTION_MAX_ATTEMPTS {
+                        state.abandoned = true; // mirrored into the self-model on the next plan
+                    }
                     inner.unmapped += 1;
                 }
                 state.targets.clone()
@@ -1100,6 +1138,44 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgres://x:x@127.0.0.1:1/x").unwrap();
         let sm = std::sync::Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
         assert!(spawn_after_walk(pool, sm).is_none());
+    }
+
+    #[tokio::test]
+    async fn unmapped_question_is_not_re_embedded_within_cooldown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = sqlx::PgPool::connect_lazy("postgres://x:x@127.0.0.1:1/x").unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let failing: EmbedFn = std::sync::Arc::new(move |_| {
+            c2.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("no embedder"))
+        });
+        let now = 1000.0;
+        let mut inner = EngineInner::new(TensionMode::Observe, now);
+        let mut sm = sm_with(&[], &["unmappable"], now);
+        let p1 = plan_release(&mut inner, &mut sm, now);
+        assert_eq!(p1.len(), 1);
+        assert!(resolve_targets_with(&pool, &mut inner, p1, failing.clone()).await.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // next walk, 1 s later: still inside the cooldown → not planned, not embedded
+        let p2 = plan_release(&mut inner, &mut sm, now + 1.0);
+        assert!(p2.is_empty(), "unmapped item must respect the cooldown");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // after the cooldown it may retry once
+        let p3 = plan_release(&mut inner, &mut sm, now + ITEM_COOLDOWN_SECS + 1.0);
+        assert_eq!(p3.len(), 1);
+        let _ = resolve_targets_with(&pool, &mut inner, p3, failing).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(inner.questions[&fnv1a64("unmappable")].attempts, 2, "failed mappings count as attempts");
+    }
+
+    #[test]
+    fn release_guard_admits_one_release_at_a_time() {
+        let g = ReleaseGuard::default();
+        assert!(g.try_begin());
+        assert!(!g.try_begin(), "second concurrent release is coalesced away");
+        g.end();
+        assert!(g.try_begin());
     }
 
     #[test]
