@@ -64,9 +64,12 @@ Initial `strength = QUESTION_BASE_ENERGY` (0.20). Each release multiplies streng
 QUESTION_MAX_ATTEMPTS` (12) or `strength < MIN_PULSE_ENERGY` (0.02) the question is
 marked `abandoned`, counted, and never pulses again. A question removed from
 `open_questions` drops out of the side table. Strength and attempts are in-memory,
-but the **abandoned set is persisted** as `abandoned_question_hashes: HashSet<u64>`
-on `SelfModel` (serde default empty), so a container recreate does not resurrect
-every question the engine already gave up on. The hash is a stable FNV-1a 64 of the
+but the **abandoned set is persisted** as `abandoned_question_hashes: Vec<u64>`
+(insertion-ordered, deduplicated on insert, serde default empty) on `SelfModel`, so
+a container recreate does not resurrect every question the engine already gave up
+on. It does not grow without bound: a hash is removed when its question leaves
+`open_questions`, and the vector is capped at `ABANDONED_HASHES_MAX` (4096),
+dropping the oldest first. The hash is a stable FNV-1a 64 of the
 question text, implemented inline (no crate), and the same id appears in logs and
 stats as `question:<16 hex>`. `std::hash::DefaultHasher` is not used anywhere for
 identity because it is not stable across Rust versions.
@@ -177,7 +180,7 @@ The deploy order is `observe` → `brakes` → `live`, each a config change.
 Persisted on `SelfModel` (all serde-default, so old snapshots load):
 `predictions_made_total: u64` (incremented in `predict()`),
 `predictions_resolved_total: u64` (incremented where the `prediction_error` path
-removes an entry), and `abandoned_question_hashes: HashSet<u64>` (§3.2). The two
+removes an entry), and `abandoned_question_hashes: Vec<u64>` (§3.2). The two
 counters exist for the metric in §9, not for the engine.
 
 ## 8. Observability
@@ -252,7 +255,9 @@ Unit tests (pure functions, no DB):
 - `brakes` enforces: the same synthetic cascade is cut by budget / blocked by fatigue;
 - stale predictions: beyond `PREDICTION_MAX_ACTIVE` the oldest do not pulse; strength
   halves after one half-life;
-- abandoned set round-trips through `SelfModel` serialisation; FNV-1a vectors.
+- abandoned set round-trips through `SelfModel` serialisation, is pruned when a
+  question leaves `open_questions`, and never exceeds `ABANDONED_HASHES_MAX`;
+  FNV-1a test vectors.
 
 Integration (existing `tests/digester.rs` harness, real test graph):
 - with a seeded prediction and an open question, one `walk_parallel` in `observe`
@@ -294,6 +299,7 @@ parameter change is reviewable.
 | PREDICTION_MAX_ACTIVE | 10 |
 | PREDICTION_HALF_LIFE_SECS | 86400 |
 | LIVE_JUDGEMENT_HOURS | 72 |
+| ABANDONED_HASHES_MAX | 4096 |
 | FATIGUE_PER_FIRE / FATIGUE_DECAY_PER_SEC | 0.5 / 0.01 |
 | CASCADE_BUDGET / HOP_COST | 1.0 / 0.2 |
 | POOL capacity / refill_per_sec | 20.0 / 0.05 |
