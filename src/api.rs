@@ -1012,7 +1012,15 @@ async fn diverger_stats(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let stats = state.diverger.stats().await;
+    let tension = match crate::tension::engine() {
+        Some(e) => {
+            let sm = state.self_model.lock().await.clone();
+            serde_json::to_value(e.stats(&sm).await).unwrap_or_default()
+        }
+        None => serde_json::json!({ "mode": "off" }),
+    };
     Json(serde_json::json!({
+        "tension": tension,
         "status": if stats.alive { "alive" } else { "stopped" },
         "active_nodes": stats.active_nodes,
         "total_energy": stats.total_energy,

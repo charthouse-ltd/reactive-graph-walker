@@ -346,6 +346,14 @@ impl TensionEngine {
     pub async fn try_spend(&self, amount: f32) -> bool {
         self.inner.lock().await.pool.try_spend(amount, crate::core::now())
     }
+
+    /// Would `amount` be affordable right now? Refills but does not spend
+    /// (observe mode counts what the pool would have done).
+    pub async fn can_spend(&self, amount: f32) -> bool {
+        let mut inner = self.inner.lock().await;
+        inner.pool.refill(crate::core::now());
+        amount <= inner.pool.tokens
+    }
 }
 
 // ── Engine types ─────────────────────────────────────────────────────────────
@@ -453,6 +461,8 @@ pub struct TensionStats {
     pub predictions_made_total: u64,
     pub predictions_resolved_total: u64,
     pub resolution_rate_1h: f32,
+    /// How long `live` must hold before the stay-in-live criteria are judged (spec §9).
+    pub live_judgement_hours: u64,
     pub recent: Vec<RecentEvent>,
 }
 
@@ -763,14 +773,6 @@ pub fn record_cascade_end(inner: &mut EngineInner, origin: Origin, by_budget: bo
     }
 }
 
-pub fn record_would_have(inner: &mut EngineInner, what: WouldHave) {
-    match what {
-        WouldHave::Fatigue => inner.would_fatigue_blocks += 1,
-        WouldHave::Budget => inner.would_budget_cuts += 1,
-        WouldHave::Pool => inner.would_pool_drops += 1,
-    }
-}
-
 /// Called from `after_walk` on every walk (never from `stats`), so the
 /// resolution rate does not depend on how often `/diverger` is polled.
 pub fn record_resolution_sample(inner: &mut EngineInner, made: u64, resolved: u64, now_secs: f64) {
@@ -826,6 +828,7 @@ pub fn stats(inner: &EngineInner, sm: &crate::core::SelfModel, now_secs: f64) ->
         predictions_made_total: sm.predictions_made_total,
         predictions_resolved_total: sm.predictions_resolved_total,
         resolution_rate_1h,
+        live_judgement_hours: LIVE_JUDGEMENT_HOURS,
         recent: inner.recent.iter().cloned().collect(),
     }
 }
