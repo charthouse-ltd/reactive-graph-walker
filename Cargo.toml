@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "RGW — Reactive Graph Walker. Self-propagating cognitive engine."
+license = "MIT"
+repository = "https://github.com/charthouse-ltd/reactive-graph-walker"
+readme = "README.md"
 
 [dependencies]
 # HTTP server
