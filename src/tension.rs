@@ -162,6 +162,9 @@ impl TokenPool {
 /// `SelfModel::abandoned_question_hashes` so it survives restarts.
 #[derive(Debug, Clone)]
 pub struct QuestionState {
+    /// The question text, kept in memory only so the embedding can be computed
+    /// once. Never serialised, never logged (logs carry the hash id).
+    pub text: String,
     pub strength: f32,
     pub attempts: u32,
     pub abandoned: bool,
@@ -179,6 +182,7 @@ impl Default for QuestionState {
 impl QuestionState {
     pub fn new() -> Self {
         QuestionState {
+            text: String::new(),
             strength: QUESTION_BASE_ENERGY,
             attempts: 0,
             abandoned: false,
@@ -388,6 +392,13 @@ fn trim_window<T>(q: &mut VecDeque<(f64, T)>, now: f64) {
 /// and half-life, question decay and abandonment (mirrored into `sm`).
 pub fn plan_release(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, now_secs: f64) -> Vec<PendingPulse> {
     let mut out = Vec::new();
+    // Side tables track only live items, so they cannot grow past the
+    // self-model's own caps (10 open questions; one entry per predicted domain).
+    {
+        let open: std::collections::HashSet<u64> = sm.open_questions.iter().map(|q| fnv1a64(q)).collect();
+        inner.questions.retain(|h, _| open.contains(h));
+        inner.prediction_targets.retain(|d, _| sm.predictions.contains_key(d));
+    }
     if sm.mode == crate::core::CognitiveMode::Compliant {
         inner.dropped_compliant += 1;
         return out;
@@ -429,6 +440,9 @@ pub fn plan_release(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, no
             continue;
         }
         let state = inner.questions.entry(hash).or_default();
+        if state.text.is_empty() {
+            state.text = q.clone();
+        }
         if state.abandoned {
             sm.note_question_abandoned(hash);
             continue;
@@ -456,6 +470,89 @@ pub fn plan_release(inner: &mut EngineInner, sm: &mut crate::core::SelfModel, no
         }
     }
     out
+}
+
+// ── Target resolution (I/O) ──────────────────────────────────────────────────
+
+/// Embedding function, injectable so tests never depend on the global embedder.
+pub type EmbedFn = std::sync::Arc<dyn Fn(&str) -> anyhow::Result<Vec<f32>> + Send + Sync>;
+
+/// Max cosine distance for a question → node match (0 = identical).
+const QUESTION_MATCH_MAX_DISTANCE: f32 = 0.6;
+
+/// Turn planned releases into node-targeted pulses. Targets are resolved once
+/// per item and cached. Predictions → top nodes of the domain by importance;
+/// questions → embedding similarity, with the embedding computed on the
+/// blocking pool (CPU-bound). An item that maps to nothing is counted as
+/// `unmapped` once; `plan_release` retries it after the cooldown.
+pub async fn resolve_targets_with(
+    pool: &sqlx::PgPool,
+    inner: &mut EngineInner,
+    pending: Vec<PendingPulse>,
+    embed: EmbedFn,
+) -> Vec<TensionPulse> {
+    let mut out = Vec::new();
+    for item in pending {
+        let targets: Vec<i32> = match &item.source {
+            TensionSource::Prediction { domain } => {
+                let cached = inner.prediction_targets.get(domain).map(|(t, _)| t.clone()).unwrap_or_default();
+                let targets = if cached.is_empty() {
+                    crate::db::top_nodes_in_domain(pool, domain, K_PREDICTION_TARGETS).await.unwrap_or_default()
+                } else {
+                    cached
+                };
+                if let Some(entry) = inner.prediction_targets.get_mut(domain) {
+                    entry.0 = targets.clone();
+                }
+                if targets.is_empty() {
+                    inner.unmapped += 1;
+                }
+                targets
+            }
+            TensionSource::Question { .. } => {
+                let hash = u64::from_str_radix(&item.key, 16).unwrap_or(0);
+                let state = inner.questions.entry(hash).or_default();
+                if state.unmapped {
+                    continue; // already counted; plan_release lifts the flag after the cooldown
+                }
+                if state.targets.is_empty() {
+                    let text = state.text.clone();
+                    let embed = embed.clone();
+                    let emb = tokio::task::spawn_blocking(move || embed(&text)).await;
+                    let targets = match emb {
+                        Ok(Ok(vector)) => crate::db::nearest_node_ids(pool, &vector, K_QUESTION_TARGETS as i64, QUESTION_MATCH_MAX_DISTANCE)
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("[tension] nearest-node lookup failed: {}", e);
+                                Vec::new()
+                            }),
+                        _ => Vec::new(),
+                    };
+                    let state = inner.questions.entry(hash).or_default();
+                    state.targets = targets;
+                }
+                let state = inner.questions.get_mut(&hash).expect("inserted above");
+                if state.targets.is_empty() {
+                    state.unmapped = true;
+                    inner.unmapped += 1;
+                }
+                state.targets.clone()
+            }
+        };
+        if targets.is_empty() {
+            continue;
+        }
+        let share = item.energy / targets.len() as f32;
+        for t in targets {
+            out.push(TensionPulse { source: item.source.clone(), target_node: t, energy: share });
+        }
+    }
+    out
+}
+
+/// `resolve_targets_with` using the process embedder.
+pub async fn resolve_targets(pool: &sqlx::PgPool, inner: &mut EngineInner, pending: Vec<PendingPulse>) -> Vec<TensionPulse> {
+    resolve_targets_with(pool, inner, pending, std::sync::Arc::new(|t: &str| crate::embed::embed_text(t))).await
 }
 
 // ── Charging against the pool ────────────────────────────────────────────────
@@ -606,6 +703,23 @@ mod tests {
         sm
     }
 
+    #[tokio::test]
+    async fn unmapped_question_is_counted_once_and_not_retried_within_cooldown() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://x:x@127.0.0.1:1/x").unwrap();
+        let failing: EmbedFn = std::sync::Arc::new(|_| Err(anyhow::anyhow!("no embedder in this test")));
+        let mut inner = EngineInner::new(TensionMode::Observe, 0.0);
+        let q = || PendingPulse {
+            source: TensionSource::Question { id: question_id("q") },
+            key: format!("{:016x}", fnv1a64("q")),
+            energy: 0.2,
+        };
+        assert!(resolve_targets_with(&pool, &mut inner, vec![q()], failing.clone()).await.is_empty());
+        assert_eq!(inner.unmapped, 1);
+        assert!(inner.questions.get(&fnv1a64("q")).unwrap().unmapped);
+        assert!(resolve_targets_with(&pool, &mut inner, vec![q()], failing).await.is_empty());
+        assert_eq!(inner.unmapped, 1, "not counted again");
+    }
+
     #[test]
     fn plan_release_respects_cooldown_cap_and_freshness() {
         let now = 1_000_000.0;
@@ -643,6 +757,22 @@ mod tests {
         assert!(sm.is_question_abandoned(fnv1a64("why is the ferry late")));
         sm.open_questions = vec!["why is the ferry late".into()];
         assert!(plan_release(&mut inner, &mut sm, t + ITEM_COOLDOWN_SECS).is_empty());
+    }
+
+    #[test]
+    fn side_tables_are_pruned_to_live_items() {
+        let now = 0.0;
+        let mut inner = EngineInner::new(TensionMode::Observe, now);
+        // rotate 30 distinct questions through a self-model that keeps at most 10 open
+        let mut sm = sm_with(&[("d1", 3600.0), ("d2", 3600.0)], &[], now);
+        for i in 0..30 {
+            sm.open_questions = (i..i + 10).map(|k| format!("q{k}")).collect();
+            plan_release(&mut inner, &mut sm, now + i as f64 * (ITEM_COOLDOWN_SECS + 1.0));
+        }
+        assert!(inner.questions.len() <= 10, "questions side table {}", inner.questions.len());
+        sm.predictions.remove("d1");
+        plan_release(&mut inner, &mut sm, now + 1e6);
+        assert_eq!(inner.prediction_targets.len(), 1, "stale domain pruned");
     }
 
     #[test]

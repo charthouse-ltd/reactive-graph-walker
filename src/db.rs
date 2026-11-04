@@ -171,6 +171,34 @@ pub async fn strengthen_edges_each(pool: &PgPool, deltas: &[(i32, f32)]) -> Resu
     Ok(())
 }
 
+/// Top `k` nodes of a domain by importance: the targets a tension pulse for a
+/// prediction in that domain is aimed at. Deterministic tie-break on id.
+pub async fn top_nodes_in_domain(pool: &PgPool, domain: &str, k: i64) -> Result<Vec<i32>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM memory_vectors WHERE domain = $1 ORDER BY importance DESC, id ASC LIMIT $2",
+    )
+    .bind(domain)
+    .bind(k)
+    .fetch_all(pool)
+    .await
+}
+
+/// Ids of the nodes nearest to `embedding` within `max_distance` (cosine).
+/// Selects only `id`, so it works on both the backends' schema and RGW's own.
+pub async fn nearest_node_ids(pool: &PgPool, embedding: &[f32], limit: i64, max_distance: f32) -> Result<Vec<i32>, sqlx::Error> {
+    let emb_str = format!("[{}]", embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+    sqlx::query_scalar(
+        "SELECT id FROM memory_vectors \
+         WHERE embedding IS NOT NULL AND embedding <=> $1::vector < $2 \
+         ORDER BY embedding <=> $1::vector LIMIT $3",
+    )
+    .bind(&emb_str)
+    .bind(max_distance)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Create a new edge between two nodes. Returns the edge ID.
 /// This is how the graph GROWS — new connections form from:
 /// - Walker discovering cross-domain similarity

@@ -370,3 +370,47 @@ async fn edge_flush_applies_per_edge_deltas() -> anyhow::Result<()> {
     assert_eq!(cache.flush().await?, 0);
     Ok(())
 }
+
+/// Tension targets: a prediction maps to the top nodes of its domain by
+/// importance; an open question maps by embedding similarity. Energy is split
+/// across an item's targets, never multiplied.
+#[tokio::test]
+async fn targets_resolve_from_domain_and_embedding() -> anyhow::Result<()> {
+    rgw::embed::init()?;
+    let pool = rgw::db::connect(
+        &std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgresql:///rgw_test?host=/tmp".into()),
+    )
+    .await?;
+    sqlx::raw_sql(include_str!("schema.sql")).execute(&pool).await?;
+    if rgw::db::graph_stats(&pool).await?.nodes == 0 {
+        seed_database(&pool).await?;
+    }
+    let domain: String = sqlx::query_scalar(
+        "SELECT domain FROM memory_vectors GROUP BY domain ORDER BY count(*) DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rgw::db::top_nodes_in_domain(&pool, &domain, 3).await?.len(), 3);
+    assert!(rgw::db::top_nodes_in_domain(&pool, "no-such-domain", 3).await?.is_empty());
+
+    let mut inner = rgw::tension::EngineInner::new(rgw::tension::TensionMode::Observe, 0.0);
+    let q = "is moral realism defensible";
+    // plan_release normally records the text; this test bypasses it.
+    inner.questions.entry(rgw::tension::fnv1a64(q)).or_default().text = q.to_string();
+    let pending = vec![
+        rgw::tension::PendingPulse {
+            source: rgw::tension::TensionSource::Prediction { domain: domain.clone() },
+            key: domain.clone(),
+            energy: 0.15,
+        },
+        rgw::tension::PendingPulse {
+            source: rgw::tension::TensionSource::Question { id: rgw::tension::question_id(q) },
+            key: format!("{:016x}", rgw::tension::fnv1a64(q)),
+            energy: 0.20,
+        },
+    ];
+    let pulses = rgw::tension::resolve_targets(&pool, &mut inner, pending).await;
+    assert_eq!(pulses.len(), 6, "3 targets per item: {pulses:?}");
+    assert!((pulses.iter().map(|p| p.energy).sum::<f32>() - 0.35).abs() < 1e-4, "energy split, not multiplied");
+    Ok(())
+}

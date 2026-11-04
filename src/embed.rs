@@ -32,7 +32,8 @@ pub fn init() -> anyhow::Result<()> {
         InitOptions::new(EmbeddingModel::NomicEmbedTextV15).with_show_download_progress(true),
     )?;
 
-    *EMBEDDER.lock().unwrap() = Some(model);
+    // A panic while embedding must not poison the model for every later call.
+    *EMBEDDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(model);
     tracing::info!("[embed] Model loaded: nomic-embed-text-v1.5 (768-dim, matches pgvector)");
     Ok(())
 }
@@ -49,7 +50,7 @@ pub fn embed_text(text: &str) -> anyhow::Result<Vec<f32>> {
         return Ok(cached.clone());
     }
 
-    let mut lock = EMBEDDER.lock().unwrap();
+    let mut lock = EMBEDDER.lock().unwrap_or_else(|e| e.into_inner());
     let model = lock.as_mut().ok_or_else(|| anyhow::anyhow!("Embedder not initialized"))?;
 
     // Do NOT prepend a prefix manually: fastembed auto-applies the nomic
@@ -71,7 +72,7 @@ pub fn embed_text(text: &str) -> anyhow::Result<Vec<f32>> {
 
 /// Embed multiple texts at once (batch processing)
 pub fn embed_batch(texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-    let mut lock = EMBEDDER.lock().unwrap();
+    let mut lock = EMBEDDER.lock().unwrap_or_else(|e| e.into_inner());
     let model = lock.as_mut().ok_or_else(|| anyhow::anyhow!("Embedder not initialized"))?;
 
     let texts_owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
