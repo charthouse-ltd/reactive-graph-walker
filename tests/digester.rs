@@ -329,3 +329,44 @@ async fn test_digest_philosophy() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Edge-cache flush must apply each edge's OWN accumulated delta, not the mean
+/// of all pending deltas (which both over- and under-strengthens, and is not
+/// Hebbian). Uses two real edges well below the 1.0 cap.
+#[tokio::test]
+async fn edge_flush_applies_per_edge_deltas() -> anyhow::Result<()> {
+    rgw::embed::init()?;
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql:///rgw_test?host=/tmp".to_string());
+    let pool = rgw::db::connect(&db_url).await?;
+    sqlx::raw_sql(include_str!("schema.sql")).execute(&pool).await?;
+    if rgw::db::graph_stats(&pool).await?.nodes == 0 {
+        seed_database(&pool).await?;
+    }
+    let rows: Vec<(i32, f32)> = sqlx::query_as(
+        "SELECT id, weight::float4 FROM memory_edges WHERE weight < 0.8 ORDER BY id LIMIT 2",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(rows.len(), 2, "need two edges below the cap");
+    let (a, wa) = rows[0];
+    let (b, wb) = rows[1];
+
+    let cache = rgw::edge_cache::EdgeCache::new(pool.clone());
+    cache.strengthen_edge(a, 0.05);
+    cache.strengthen_edge(a, 0.05); // accumulates: a gets +0.10
+    cache.strengthen_edge(b, 0.01); // b gets +0.01 (mean would be 0.055)
+    let flushed = cache.flush().await?;
+    assert_eq!(flushed, 2);
+
+    let after: Vec<(i32, f32)> = sqlx::query_as("SELECT id, weight::float4 FROM memory_edges WHERE id = ANY($1) ORDER BY id")
+        .bind(vec![a, b])
+        .fetch_all(&pool)
+        .await?;
+    let get = |id: i32| after.iter().find(|r| r.0 == id).map(|r| r.1).unwrap();
+    assert!((get(a) - (wa + 0.10)).abs() < 1e-4, "edge {a}: {} -> {} (expected +0.10)", wa, get(a));
+    assert!((get(b) - (wb + 0.01)).abs() < 1e-4, "edge {b}: {} -> {} (expected +0.01)", wb, get(b));
+    // nothing left pending after a successful flush
+    assert_eq!(cache.flush().await?, 0);
+    Ok(())
+}

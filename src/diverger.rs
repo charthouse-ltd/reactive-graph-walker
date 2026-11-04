@@ -30,6 +30,10 @@ struct NodeEnergy {
 }
 
 /// The Diverger engine — a self-propagating reactive graph.
+/// Reactor inbox size. Edge changes beyond this are dropped and counted in
+/// `DivergerStats::edges_dropped` rather than queued without bound.
+pub const EDGE_QUEUE_CAPACITY: usize = 4096;
+
 pub struct Diverger {
     /// Database pool for graph access
     pool: PgPool,
@@ -43,7 +47,9 @@ pub struct Diverger {
     /// Channel for edge change notifications
     /// Any system that modifies edges pushes to this channel.
     /// The Diverger reacts — no polling needed.
-    edge_tx: mpsc::UnboundedSender<EdgeChange>,
+    edge_tx: mpsc::Sender<EdgeChange>,
+    /// Edge changes dropped because the reactor queue was full (M6 backpressure).
+    edges_dropped: Arc<AtomicU64>,
 
     /// Running state
     alive: Arc<AtomicBool>,
@@ -123,6 +129,7 @@ pub struct DivergerStats {
     pub walks_fired: u64,
     pub cascades_total: u64,
     pub edges_changed: u64,
+    pub edges_dropped: u64,
     pub emotional_state: EmotionalState,
     pub hottest_nodes: Vec<(i32, f32)>,  // top 10 by energy
 }
@@ -130,7 +137,9 @@ pub struct DivergerStats {
 impl Diverger {
     /// Create a new Diverger engine with shared self-model.
     pub fn new(pool: PgPool, self_model: std::sync::Arc<tokio::sync::Mutex<crate::core::SelfModel>>, julian_url: &str) -> Self {
-        let (edge_tx, edge_rx) = mpsc::unbounded_channel();
+        // Bounded: a burst of edge changes must apply backpressure (drop + count),
+        // not grow the heap without limit while the reactor awaits the DB.
+        let (edge_tx, edge_rx) = mpsc::channel(EDGE_QUEUE_CAPACITY);
         let sm = self_model.clone();
 
         let diverger = Self {
@@ -138,6 +147,7 @@ impl Diverger {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             emotion: Arc::new(RwLock::new(EmotionalState::default())),
             edge_tx,
+            edges_dropped: Arc::new(AtomicU64::new(0)),
             alive: Arc::new(AtomicBool::new(false)),
             walks_fired: Arc::new(AtomicU64::new(0)),
             cascades_total: Arc::new(AtomicU64::new(0)),
@@ -155,7 +165,7 @@ impl Diverger {
     /// async channel receiver, not a timer. It only runs when edges change.
     fn start_reactor(
         &self,
-        mut edge_rx: mpsc::UnboundedReceiver<EdgeChange>,
+        mut edge_rx: mpsc::Receiver<EdgeChange>,
         config: DivergerConfig,
         self_model: std::sync::Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
     ) {
@@ -457,7 +467,9 @@ impl Diverger {
                         }
 
                         // Persist edge strengthening accumulated during the walk.
-                        let _ = cache.flush().await;
+                        if let Err(e) = cache.flush().await {
+                            tracing::warn!("[diverger] edge flush failed (deltas re-queued): {}", e);
+                        }
 
                         drop(permit);  // Release semaphore
                     });
@@ -473,7 +485,12 @@ impl Diverger {
     /// This is the ONLY input the Diverger needs.
     /// Call this from: walker traversal, unconscious tax, memory storage, outcome learning.
     pub fn notify_edge_change(&self, change: EdgeChange) {
-        let _ = self.edge_tx.send(change);
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.edge_tx.try_send(change) {
+            let n = self.edges_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(1000) {
+                tracing::warn!("[diverger] edge queue full ({} capacity); dropped {} changes so far", EDGE_QUEUE_CAPACITY, n);
+            }
+        }
     }
 
     /// Get current statistics
@@ -495,6 +512,7 @@ impl Diverger {
             walks_fired: self.walks_fired.load(Ordering::Relaxed),
             cascades_total: self.cascades_total.load(Ordering::Relaxed),
             edges_changed: self.edges_changed.load(Ordering::Relaxed),
+            edges_dropped: self.edges_dropped.load(Ordering::Relaxed),
             emotional_state: emo.clone(),
             hottest_nodes: hot,
         }
