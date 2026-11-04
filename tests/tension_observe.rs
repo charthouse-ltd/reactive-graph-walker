@@ -18,6 +18,10 @@ async fn observe_mode_logs_would_fire_and_emits_nothing() -> anyhow::Result<()> 
     let engine = rgw::tension::install(rgw::tension::TensionMode::Observe).expect("observe installs an engine");
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     engine.attach_inbox(tx);
+    // A real reactor's energy map (cold: nothing has fired) for pulses_would_cross.
+    let sm_for_reactor = Arc::new(tokio::sync::Mutex::new(rgw::core::SelfModel::new()));
+    let diverger = rgw::diverger::Diverger::new(pool.clone(), sm_for_reactor, "http://127.0.0.1:9");
+    engine.attach_energy_view(diverger.energy_view());
 
     let domain: String = sqlx::query_scalar(
         "SELECT domain FROM memory_vectors GROUP BY domain ORDER BY count(*) DESC LIMIT 1",
@@ -44,6 +48,9 @@ async fn observe_mode_logs_would_fire_and_emits_nothing() -> anyhow::Result<()> 
         stats = engine.stats(&*sm.lock().await).await;
     }
     assert!(stats.pulses_would_fire >= 1, "{stats:?}");
+    // Cold targets: a would-fire pulse (<= 0.07) cannot lift a node over the
+    // 0.5 base threshold, so "would fire" and "would cross" must diverge here.
+    assert_eq!(stats.pulses_would_cross, 0, "{stats:?}");
     assert_eq!(stats.pulses_fired, 0);
     assert!(rx.try_recv().is_err(), "nothing entered the inbox in observe");
     assert_eq!(rgw::tension::mode(), rgw::tension::TensionMode::Observe);
