@@ -170,7 +170,8 @@
   - `pub fn plan_release(inner: &mut EngineInner, sm: &mut SelfModel, now_secs: f64) -> Vec<PendingPulse>` — pure: applies Compliant check (returns empty, `dropped_compliant += 1`), per-item cooldown, prediction cap/order (freshest `PREDICTION_MAX_ACTIVE` by `predicted_at` desc), `prediction_strength`, question decay/abandonment (calls `sm.note_question_abandoned`, skips `sm.is_question_abandoned`), drops `energy < MIN_PULSE_ENERGY`.
   - `pub fn charge(inner: &mut EngineInner, pulses: Vec<TensionPulse>, now_secs: f64) -> Vec<TensionPulse>` — charges the pool `energy` (+ `avg_edge_cascade_hops * HOP_COST` when `!mode.emits()`), records `pool_samples`, increments `pulses_would_fire`/`pulses_fired`/`dropped_pool_empty`, pushes `recent`, logs `[tension] would-fire …` / `fire …` at INFO; returns the pulses to emit (empty unless `mode.emits()`).
   - `pub fn record_edge_cascade_hops(inner: &mut EngineInner, hops: u32)`; `pub fn record_cascade_end(inner: &mut EngineInner, origin: Origin, by_budget: bool)`; `pub fn record_would_have(inner: &mut EngineInner, what: WouldHave)` with `pub enum WouldHave { Fatigue, Budget, Pool }`; `pub enum Origin { Edge, Tension }` (`Copy, Serialize`).
-  - `pub fn stats(inner: &EngineInner, sm: &SelfModel, now_secs: f64) -> TensionStats` (computes `empty_fraction_1h` and `resolution_rate_1h` from samples; `open_*` from `sm`).
+  - `pub fn record_resolution_sample(inner: &mut EngineInner, made: u64, resolved: u64, now_secs: f64)` — pushes `(now, made, resolved)` and trims to 3600 s. Called from `after_walk` (Task 6) on every walk, **never** from `stats`.
+  - `pub fn stats(inner: &EngineInner, sm: &SelfModel, now_secs: f64) -> TensionStats` (read-only: computes `empty_fraction_1h` and `resolution_rate_1h` from existing samples; `open_*` from `sm`).
 
 - [ ] **Step 1: Write the failing tests**:
 
@@ -222,13 +223,16 @@ fn sm_with(preds: &[(&str, f64)], qs: &[&str], now: f64) -> SelfModel { /* predi
     assert_eq!(inner.hop_samples.len(), 100);
     for i in 0..60 { charge(&mut inner, vec![TensionPulse{source:TensionSource::Prediction{domain:"m".into()},target_node:i,energy:0.01}], now); }
     assert_eq!(inner.recent.len(), 50);
-    let sm = SelfModel::new(); let s = stats(&inner, &sm, now);
-    assert_eq!(s.mode, "live"); assert!(s.pool.empty_fraction_1h >= 0.0 && s.pool.empty_fraction_1h <= 1.0);
+    record_resolution_sample(&mut inner, 10, 5, now); record_resolution_sample(&mut inner, 20, 13, now + 60.0);
+    let sm = SelfModel::new(); let s = stats(&inner, &sm, now + 60.0);
+    assert_eq!(s.mode, "live"); assert!((s.resolution_rate_1h - 0.8).abs() < 1e-6, "Δresolved 8 / Δmade 10");
+    assert!(s.pool.empty_fraction_1h >= 0.0 && s.pool.empty_fraction_1h <= 1.0);
+    let s2 = stats(&inner, &sm, now + 60.0); assert_eq!(inner.resolution_samples.len(), 2, "stats() never records"); let _ = s2;
 }
 ```
 
 - [ ] **Step 2: Run to verify failure.** `cargo test --lib tension::` — Expected: compile errors (types missing).
-- [ ] **Step 3: Implement** everything in Interfaces. `resolution_rate_1h`: push `(now, made, resolved)` into `resolution_samples` on each `stats()` call, trim to 3600 s, rate = Δresolved/Δmade over the window (0.0 when Δmade == 0). `empty_fraction_1h`: fraction of `pool_samples` in the last 3600 s with `empty == true` (0.0 when none).
+- [ ] **Step 3: Implement** everything in Interfaces. `resolution_rate_1h` = Δresolved/Δmade between the oldest and newest sample in the window (0.0 when Δmade == 0); `stats()` only reads. `empty_fraction_1h`: fraction of `pool_samples` in the last 3600 s with `empty == true` (0.0 when none).
 - [ ] **Step 4: Run to verify pass.** `cargo test --lib tension::` — Expected: 11 passed.
 - [ ] **Step 5: Commit.** `git commit -am "feat(tension): engine inner — release planning, charging, stats"`
 
@@ -237,14 +241,17 @@ fn sm_with(preds: &[(&str, f64)], qs: &[&str], now: f64) -> SelfModel { /* predi
 ### Task 4: Target resolution and `db::top_nodes_in_domain`
 
 **Files:**
-- Modify: `src/db.rs`, `src/tension.rs`
-- Test: `tests/digester.rs` (integration, real test graph)
+- Modify: `src/db.rs`, `src/tension.rs`, `src/embed.rs` (poison-recovering lock)
+- Test: `tests/digester.rs` (integration, real test graph) + unit test in `src/tension.rs`
 
 **Interfaces:**
 - Consumes: `db::find_similar_nodes(pool, &[f32], limit: i32, threshold: f32) -> Result<Vec<(i32, f32, String)>>`, `embed::embed_text(&str) -> anyhow::Result<Vec<f32>>`.
 - Produces:
   - `pub async fn db::top_nodes_in_domain(pool: &PgPool, domain: &str, k: i64) -> Result<Vec<i32>, sqlx::Error>` — `SELECT id FROM memory_vectors WHERE domain = $1 ORDER BY importance DESC, id ASC LIMIT $2`.
-  - `pub async fn resolve_targets(pool: &PgPool, inner: &mut EngineInner, pending: Vec<PendingPulse>) -> Vec<TensionPulse>` — predictions → cached `top_nodes_in_domain(domain, K_PREDICTION_TARGETS)`; questions → cached `embed_text` then `find_similar_nodes(pool, &emb, K_QUESTION_TARGETS, 0.6)`; on empty/err mark `unmapped` (question) or skip (prediction) and `inner.unmapped += 1`; one `TensionPulse` per target, energy split equally across targets.
+  - `pub type EmbedFn = Arc<dyn Fn(&str) -> anyhow::Result<Vec<f32>> + Send + Sync>`.
+  - `pub async fn resolve_targets_with(pool: &PgPool, inner: &mut EngineInner, pending: Vec<PendingPulse>, embed: EmbedFn) -> Vec<TensionPulse>` — predictions → cached `top_nodes_in_domain(domain, K_PREDICTION_TARGETS)`; questions → embed **once per question via `tokio::task::spawn_blocking`** (embedding is CPU-bound) then `find_similar_nodes(pool, &emb, K_QUESTION_TARGETS, 0.6)`; on empty/err mark `unmapped` (question) or skip (prediction) and `inner.unmapped += 1`; one `TensionPulse` per target, energy split equally across targets.
+  - `pub async fn resolve_targets(pool, inner, pending) -> Vec<TensionPulse>` = `resolve_targets_with(..., Arc::new(|t| crate::embed::embed_text(t)))`.
+  - `src/embed.rs`: replace every `EMBEDDER.lock().unwrap()` with a poison-recovering lock (`lock().unwrap_or_else(|e| e.into_inner())`), so one panic while embedding cannot disable every later call.
 
 - [ ] **Step 1: Write the failing test** in `tests/digester.rs`:
 
@@ -270,23 +277,24 @@ async fn targets_resolve_from_domain_and_embedding() -> anyhow::Result<()> {
 }
 ```
 
-Also a unit test in `src/tension.rs` for Review Focus 4 (the embedder is never initialised in the lib test binary, so `embed_text` returns `Err`):
+Also a unit test in `src/tension.rs` for Review Focus 4, with the embedder **injected** so the test never depends on global embedder state:
 
 ```rust
 #[tokio::test] async fn unmapped_question_is_counted_once_and_not_retried_within_cooldown() {
     let pool = sqlx::PgPool::connect_lazy("postgres://x:x@127.0.0.1:1/x").unwrap();
+    let failing: EmbedFn = Arc::new(|_| Err(anyhow::anyhow!("no embedder in this test")));
     let mut inner = EngineInner::new(TensionMode::Observe, 0.0);
     let q = || PendingPulse { source: TensionSource::Question{id: question_id("q")}, key: format!("{:016x}", fnv1a64("q")), energy: 0.2 };
-    assert!(resolve_targets(&pool, &mut inner, vec![q()]).await.is_empty());
+    assert!(resolve_targets_with(&pool, &mut inner, vec![q()], failing.clone()).await.is_empty());
     assert_eq!(inner.unmapped, 1);
     assert!(inner.questions.get(&fnv1a64("q")).unwrap().unmapped);
-    assert!(resolve_targets(&pool, &mut inner, vec![q()]).await.is_empty());
+    assert!(resolve_targets_with(&pool, &mut inner, vec![q()], failing).await.is_empty());
     assert_eq!(inner.unmapped, 1, "not counted again");           // plan_release skips unmapped items until cooldown passes
 }
 ```
 
 - [ ] **Step 2: Run to verify failure.** `cargo test --test digester targets_resolve` and `cargo test --lib tension::unmapped_question` — Expected: compile errors (functions missing).
-- [ ] **Step 3: Implement** both functions. `plan_release` (Task 3) must skip a question whose state is `unmapped` until `ITEM_COOLDOWN_SECS` since `last_release`, then clear `unmapped` and let it retry. Question embeddings are cached in `QuestionState.targets` (resolved once); prediction targets cached in `inner.prediction_targets` with the release timestamp.
+- [ ] **Step 3: Implement** both functions plus the `embed.rs` poison-recovery change. `plan_release` (Task 3) must skip a question whose state is `unmapped` until `ITEM_COOLDOWN_SECS` since `last_release`, then clear `unmapped` and let it retry. Question embeddings are cached in `QuestionState.targets` (resolved once); prediction targets cached in `inner.prediction_targets` with the release timestamp.
 - [ ] **Step 4: Run to verify pass.** `cargo test --test digester targets_resolve` and `cargo test --lib tension::` — Expected: all pass.
 - [ ] **Step 5: Commit.** `git commit -am "feat(tension): resolve pulse targets by domain importance and embedding similarity"`
 
@@ -342,7 +350,7 @@ Also a unit test in `src/tension.rs` for Review Focus 4 (the embedder is never i
 - Produces:
   - `pub struct TensionEngine { inner: tokio::sync::Mutex<EngineInner>, inbox: OnceLock<mpsc::Sender<Stimulus>> }`; `pub fn install(mode: TensionMode) -> Option<Arc<TensionEngine>>` (OnceLock; `Off` installs nothing and returns `None`, so `engine()` stays `None`; a second call returns the already-installed engine); `pub fn engine() -> Option<Arc<TensionEngine>>`; `pub fn mode() -> TensionMode` (`Off` when none).
   - `impl TensionEngine { pub fn attach_inbox(&self, tx: mpsc::Sender<Stimulus>); pub async fn after_walk(&self, pool: &PgPool, sm: &Arc<tokio::sync::Mutex<SelfModel>>) -> usize /* pulses emitted */; pub async fn stats(&self, sm: &SelfModel) -> TensionStats; pub async fn record_edge_cascade_hops(&self, hops: u32); pub async fn record_cascade_end(&self, origin: Origin, by_budget: bool); pub async fn record_would_have(&self, w: WouldHave); }`
-  - Free fn `pub async fn after_walk(pool: &PgPool, sm: &Arc<tokio::sync::Mutex<SelfModel>>) -> usize` — no-op returning 0 when `engine()` is `None`. Sequence inside the engine: lock `sm`, `plan_release`, unlock; `resolve_targets`; `charge`; for each returned pulse `inbox.try_send(Stimulus { kind: Tension(p), origin: Tension, depth: 0, budget: CASCADE_BUDGET })`, counting `dropped_inbox_full` on `Full`.
+  - Free fn `pub async fn after_walk(pool: &PgPool, sm: &Arc<tokio::sync::Mutex<SelfModel>>) -> usize` — no-op returning 0 when `engine()` is `None`. Sequence inside the engine: lock `sm`, `record_resolution_sample(made, resolved, now)`, `plan_release`, unlock; `resolve_targets`; `charge`; for each returned pulse `inbox.try_send(Stimulus { kind: Tension(p), origin: Tension, depth: 0, budget: CASCADE_BUDGET })`, counting `dropped_inbox_full` on `Full`.
   - `api::serve`: `let tension_engine = crate::tension::install(TensionMode::from_env_value(std::env::var("RGW_TENSION_MODE").ok().as_deref()));` immediately after the motor gate; after `Diverger::new(...)`: `if let Some(e) = &tension_engine { e.attach_inbox(diverger.stimulus_sender()); }`. Log `[tension] mode=<mode>` at INFO at startup, in every mode including `off`.
   - `walker::walk_parallel`: directly after `let output = aggregate(...)`, call `let _ = crate::tension::after_walk(pool, self_model).await;`.
 
@@ -397,7 +405,8 @@ async fn observe_mode_logs_would_fire_and_emits_nothing() -> anyhow::Result<()> 
 **Interfaces:**
 - Consumes: Task 5 `next_hop`, Task 6 engine methods, `tension::mode()`.
 - Produces:
-  - In the spawned walk task after a spontaneous walk completes: (a) `tension::after_walk(&pool, &self_model).await`; (b) for the walk's `result.edges_traversed`, compute `next_hop(&stimulus, injected = 0.02 * edges.len() as f32, config.max_cascade_depth)`. If `Some((depth, budget))` **and** `mode().enforces_brakes()` **and** the engine's pool `try_spend(HOP_COST)` succeeds: enqueue `Stimulus { kind: Edge(EdgeChange{…first traversed edge…, delta: 0.02}), origin: stimulus.origin, depth, budget }` via `notify_stimulus`, then `record_edge_cascade_hops(depth)` when the chain ends. If `None` → `record_cascade_end(origin, by_budget = budget_exhausted)`. If the mode does not enforce brakes → compute the same decision and call `record_would_have(Budget | Pool)` instead of enqueueing. In `Off` do nothing (today's behaviour).
+  - Note on semantics (spec §7): enqueueing feedback hops is what makes cascades multi-hop, so `brakes` means "self-propagation plus the brakes, without tension". `observe` computes the same decision and only counts it.
+  - In the spawned walk task after a spontaneous walk completes: (a) `tension::after_walk(&pool, &self_model).await`; (b) for the walk's `result.edges_traversed`, compute `next_hop(&stimulus, injected = 0.02 * edges.len() as f32, config.max_cascade_depth)`. If `Some((depth, budget))` **and** `mode().enforces_brakes()` **and** the engine's pool `try_spend(HOP_COST)` succeeds: enqueue `Stimulus { kind: Edge(EdgeChange{…the **last** traversed edge, i.e. where the walk ended up…, delta: 0.02}), origin: stimulus.origin, depth, budget }` via `notify_stimulus` (the first edge would bias the cascade back to where it started), then `record_edge_cascade_hops(depth)` when the chain ends. If `None` → `record_cascade_end(origin, by_budget = budget_exhausted)`. If the mode does not enforce brakes → compute the same decision and call `record_would_have(Budget | Pool)` instead of enqueueing. In `Off` do nothing (today's behaviour).
   - `api::diverger_stats` adds `"tension": <TensionStats as JSON>` when `tension::engine()` is `Some`, else `"tension": {"mode": "off"}`.
   - README: a short "Tension-driven activity" subsection under Architecture naming the env var, the four modes, and the `/diverger.tension` block.
 

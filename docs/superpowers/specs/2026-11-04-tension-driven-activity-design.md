@@ -80,8 +80,12 @@ Mapping is computed once per item and cached in the item's state.
 
 - **Prediction (domain `d`)**: the top `K_PREDICTION_TARGETS` (3) nodes in domain `d`
   by `importance`, via a new `db::top_nodes_in_domain(pool, domain, k)`.
-- **Open question (text `q`)**: embed `q` once with `embed::embed_text`, then the top
-  `K_QUESTION_TARGETS` (3) nodes from the existing `db::find_similar_nodes`.
+- **Open question (text `q`)**: embed `q` once with `embed::embed_text` **on the
+  blocking pool** (`spawn_blocking`; embedding is CPU-bound and must not stall the
+  runtime), then the top `K_QUESTION_TARGETS` (3) nodes from the existing
+  `db::find_similar_nodes`. The embedder's mutex must recover from poisoning
+  rather than `unwrap()`, so one panic while embedding cannot disable every later
+  call.
 
 An item whose mapping returns no nodes is marked `unmapped` and skipped (counted).
 
@@ -168,11 +172,17 @@ samples). Charging only the pulse energy would make the pool look healthier than
   and logs each would-be pulse at INFO:
   `[tension] would-fire source=prediction:markets target=4312 energy=0.11 pool=17.4`.
   Nothing enters the inbox. The three brakes are computed but **not enforced**:
-  edge-originated cascades run exactly as today, and the engine logs what fatigue,
-  the cascade budget and the pool *would have* cut or dropped. The §9.1 baseline is
+  edge-originated cascades run exactly as today (single hop, no feedback), and the
+  engine logs what fatigue, the cascade budget and the pool *would have* cut,
+  dropped, or enqueued as a next hop. The §9.1 baseline is
   measured in this mode, so it is a true baseline.
-- `brakes`: the three brakes are enforced on edge-originated cascades; tension is
-  still not emitted. This shows the brakes' effect in isolation before `live`.
+- `brakes`: **self-propagation plus the brakes, without tension.** A completed
+  spontaneous walk feeds its last traversed edge back into the inbox as the next
+  hop (this is what makes cascades multi-hop at all, and is the fix for the
+  "diverger is not self-propagating" finding), and the three brakes are enforced
+  on those cascades. Tension is still not emitted. Note that `brakes` therefore
+  changes edge-originated activity relative to `observe`; that is intended, and
+  §9.3 is read with it in mind.
 - `live`: brakes enforced, pulses enter the inbox.
 
 The deploy order is `observe` → `brakes` → `live`, each a config change.
@@ -207,7 +217,10 @@ counters exist for the metric in §9, not for the engine.
 the question itself and ids are stable across builds. `empty_fraction_1h` is the fraction of pool
 spend attempts in the last hour that found fewer tokens than `MIN_PULSE_ENERGY`;
 it is computed from a ring of (timestamp, empty: bool) samples taken on each attempt.
-All counters are in-memory except the two self-model totals.
+`resolution_rate_1h` is computed from (timestamp, made, resolved) samples that the
+engine records **in `after_walk`**, i.e. on every walk, never inside the stats
+read, so the rate does not depend on how often `/diverger` is polled. All counters
+are in-memory except the two self-model totals.
 
 ## 9. Pre-registered promotion metrics (observe → live)
 
@@ -223,7 +236,9 @@ Decided now, before any data:
    computed from the estimated charges (§6.3) and are a leading indicator only; they
    are confirmed in `live`.
 3. **No regression** in the existing walk telemetry (agreement, novelty, hops/s)
-   relative to the `observe` period.
+   relative to the `observe` period. For `observe` → `brakes` this check is also
+   the first look at multi-hop self-propagation; a change in diverger
+   `walks_fired` is expected there and is not by itself a regression.
 
 **Staying in `live`** (judged after `LIVE_JUDGEMENT_HOURS` = 72, then weekly):
 
