@@ -43,8 +43,13 @@ strength(a) = min(1.0, a / PREDICTION_SATURATION_SECS) * PREDICTION_BASE_ENERGY
 
 Defaults: `PREDICTION_SATURATION_SECS = 3600`, `PREDICTION_BASE_ENERGY = 0.15`.
 A prediction stops pulsing when resolved. The engine never abandons a prediction:
-resolution is the only exit, and a prediction that stays open simply keeps counting
-as open in the stats, which is itself a signal worth seeing.
+resolution is the only exit, and a prediction that stays open keeps counting as open
+in the stats, which is itself a signal worth seeing. Two limits stop stale
+predictions from starving everything else: strength halves once a prediction is
+older than `PREDICTION_HALF_LIFE_SECS` (86400) and halves again every further
+half-life, and at most `PREDICTION_MAX_ACTIVE` (10) predictions pulse per release,
+the freshest first. (Without these, forty stale predictions at full strength on the
+120 s cooldown would consume the entire 0.05/s pool refill by themselves.)
 
 ### 3.2 Open questions
 `open_questions: Vec<String>`. A question has no resolving signal, so it must not
@@ -58,8 +63,13 @@ Initial `strength = QUESTION_BASE_ENERGY` (0.20). Each release multiplies streng
 `QUESTION_DECAY` (0.85) and increments `attempts`. When `attempts >=
 QUESTION_MAX_ATTEMPTS` (12) or `strength < MIN_PULSE_ENERGY` (0.02) the question is
 marked `abandoned`, counted, and never pulses again. A question removed from
-`open_questions` drops out of the side table. The side table is in-memory; a restart
-resets attempts, which is acceptable because the global pool (§6.3) still bounds it.
+`open_questions` drops out of the side table. Strength and attempts are in-memory,
+but the **abandoned set is persisted** as `abandoned_question_hashes: HashSet<u64>`
+on `SelfModel` (serde default empty), so a container recreate does not resurrect
+every question the engine already gave up on. The hash is a stable FNV-1a 64 of the
+question text, implemented inline (no crate), and the same id appears in logs and
+stats as `question:<16 hex>`. `std::hash::DefaultHasher` is not used anywhere for
+identity because it is not stable across Rust versions.
 
 ## 4. Target mapping
 
@@ -136,28 +146,39 @@ Every tension pulse spends its energy from the pool before it is emitted; every
 cascade hop spends `HOP_COST`. If the pool cannot cover the spend, the pulse (or hop)
 is dropped and counted as `dropped_pool_empty`. Edge changes from the API are **not**
 charged for their initial injection (external stimuli always land) but their
-cascade hops are. The pool is the direct CPU bound Grok asked for: at defaults, the
-reactor cannot sustain more than 0.05 energy-units of self-generated work per
-second, about one modest cascade per 20 s, with bursts up to 20 units.
+cascade hops are. The pool is the direct CPU bound: at defaults the reactor cannot sustain more
+than 0.05 energy-units of self-generated work per second, about one modest cascade
+per 20 s, with bursts up to 20 units.
+
+In modes where tension is not emitted (§7), a would-be pulse is charged
+`energy + avg_edge_cascade_hops * HOP_COST`, where `avg_edge_cascade_hops` is a
+rolling mean over the last 100 edge-originated cascades (default 3 until there are
+samples). Charging only the pulse energy would make the pool look healthier than
+`live` will be, because in `live` every tension cascade also spends per hop.
 
 ## 7. Staging and configuration
 
-`RGW_TENSION_MODE` env var: `off | observe | live`, default **`observe`**.
+`RGW_TENSION_MODE` env var: `off | observe | brakes | live`, default **`observe`**.
 
-- `off`: the engine is not constructed and all three brakes are disabled. The
-  diverger behaves byte-for-byte as it does today. This is the rollback position.
-- `observe`: the engine computes every release and logs each would-be pulse at INFO:
+- `off`: the engine is not constructed. Byte-for-byte today's behaviour. Rollback.
+- `observe` (default): **no behaviour change**. The engine computes every release
+  and logs each would-be pulse at INFO:
   `[tension] would-fire source=prediction:markets target=4312 energy=0.11 pool=17.4`.
-  Nothing enters the inbox. The three brakes are active, and there is exactly one
-  global pool: edge-originated cascade hops spend from it for real, and would-be
-  tension pulses are charged to it as if emitted. Charging the unsent pulses is
-  deliberate: it makes `empty_fraction_1h` in `observe` predict what `live` will do.
-- `live`: identical accounting; pulses enter the inbox.
+  Nothing enters the inbox. The three brakes are computed but **not enforced**:
+  edge-originated cascades run exactly as today, and the engine logs what fatigue,
+  the cascade budget and the pool *would have* cut or dropped. The §9.1 baseline is
+  measured in this mode, so it is a true baseline.
+- `brakes`: the three brakes are enforced on edge-originated cascades; tension is
+  still not emitted. This shows the brakes' effect in isolation before `live`.
+- `live`: brakes enforced, pulses enter the inbox.
 
-Two persisted counters on `SelfModel` (serde default 0, so old snapshots load):
-`predictions_made_total: u64` (incremented in `predict()`) and
+The deploy order is `observe` → `brakes` → `live`, each a config change.
+
+Persisted on `SelfModel` (all serde-default, so old snapshots load):
+`predictions_made_total: u64` (incremented in `predict()`),
 `predictions_resolved_total: u64` (incremented where the `prediction_error` path
-removes an entry). They exist for the metric in §8, not for the engine.
+removes an entry), and `abandoned_question_hashes: HashSet<u64>` (§3.2). The two
+counters exist for the metric in §9, not for the engine.
 
 ## 8. Observability
 
@@ -165,7 +186,8 @@ removes an entry). They exist for the metric in §8, not for the engine.
 
 ```json
 "tension": {
-  "mode": "observe",
+  "mode": "observe",            // off | observe | brakes | live
+  "brakes_would_have": { "fatigue_blocks": 5, "budget_cuts": 3, "pool_drops": 12 },
   "open_predictions": 4, "open_questions": 7, "abandoned_questions": 2, "unmapped": 0,
   "pulses_would_fire": 318, "pulses_fired": 0,
   "dropped_pool_empty": 12, "dropped_item_cooldown": 90, "dropped_inbox_full": 0,
@@ -178,8 +200,8 @@ removes an entry). They exist for the metric in §8, not for the engine.
 ```
 
 `recent` is a ring buffer of the last 50 events. A question is identified by
-`question:<16 hex>` where the hex is `std::hash::DefaultHasher` over its text, so the
-log never carries the question itself. `empty_fraction_1h` is the fraction of pool
+`question:<16 hex>`, the FNV-1a 64 hash of its text (§3.2), so the log never carries
+the question itself and ids are stable across builds. `empty_fraction_1h` is the fraction of pool
 spend attempts in the last hour that found fewer tokens than `MIN_PULSE_ENERGY`;
 it is computed from a ring of (timestamp, empty: bool) samples taken on each attempt.
 All counters are in-memory except the two self-model totals.
@@ -188,20 +210,30 @@ All counters are in-memory except the two self-model totals.
 
 Decided now, before any data:
 
-1. **Resolution rate** `resolved / made` over a rolling hour must not fall below the
-   baseline measured during at least 48 h of `observe`. Tracking `made` alongside
-   `resolved` prevents gaming by predicting less or predicting easier things.
-2. **Useful edges**: the fraction of tension-originated cascades that create a
-   cross-domain edge which still exists after the next dream consolidation must be
-   ≥ the same fraction for edge-originated cascades over the same window.
-3. **Bounded**: `empty_fraction_1h` of the global pool < 0.05, and
-   `ended_by_budget / total cascades` < 0.20.
-4. **No regression** in the existing walk telemetry (agreement, novelty, hops/s)
-   between `observe` and `live` weeks.
+**Promotion `observe` → `brakes` → `live`** (judged on ≥ 48 h in each mode):
 
-Any failure → stay in `observe` and revisit parameters. Only after `live` has held
-these for a week does the mention-reply A/B harness get rerun; it is the final
-arbiter of user-visible value, not the first.
+1. **Resolution rate** `resolved / made` over a rolling hour must not fall below the
+   baseline measured in `observe` (where nothing is enforced). Tracking `made`
+   alongside `resolved` prevents gaming by predicting less or predicting easier things.
+2. **Bounded**: `empty_fraction_1h` of the global pool < 0.05 and
+   `ended_by_budget / total cascades` < 0.20. In `observe` and `brakes` these are
+   computed from the estimated charges (§6.3) and are a leading indicator only; they
+   are confirmed in `live`.
+3. **No regression** in the existing walk telemetry (agreement, novelty, hops/s)
+   relative to the `observe` period.
+
+**Staying in `live`** (judged after `LIVE_JUDGEMENT_HOURS` = 72, then weekly):
+
+4. **Useful edges**: the fraction of tension-originated cascades that create a
+   cross-domain edge which still exists after the next dream consolidation must be
+   ≥ the same fraction for edge-originated cascades over the same window. This can
+   only be measured once tension cascades exist, so it is a condition for staying in
+   `live`, not for entering it.
+5. Criteria 1–3 continue to hold.
+
+Any failure → drop one mode and revisit parameters. Only after `live` has held all
+five for a week does the mention-reply A/B harness get rerun; it is the final arbiter
+of user-visible value, not the first.
 
 ## 10. Testing
 
@@ -214,8 +246,13 @@ Unit tests (pure functions, no DB):
 - cascade budget: a synthetic cascade terminates by budget before `max_cascade_depth`
   when `HOP_COST` dictates, and by depth otherwise;
 - per-item cooldown;
-- `observe` emits nothing: the inbox receives zero `Stimulus::Tension` while
-  `pulses_would_fire` increments.
+- `observe` emits nothing and enforces nothing: the inbox receives zero
+  `Stimulus::Tension`, `pulses_would_fire` increments, and a synthetic edge cascade
+  runs identically with the engine in `observe` and with it `off`;
+- `brakes` enforces: the same synthetic cascade is cut by budget / blocked by fatigue;
+- stale predictions: beyond `PREDICTION_MAX_ACTIVE` the oldest do not pulse; strength
+  halves after one half-life;
+- abandoned set round-trips through `SelfModel` serialisation; FNV-1a vectors.
 
 Integration (existing `tests/digester.rs` harness, real test graph):
 - with a seeded prediction and an open question, one `walk_parallel` in `observe`
@@ -254,6 +291,9 @@ parameter change is reviewable.
 | MIN_PULSE_ENERGY | 0.02 |
 | K_PREDICTION_TARGETS / K_QUESTION_TARGETS | 3 / 3 |
 | ITEM_COOLDOWN_SECS | 120 |
+| PREDICTION_MAX_ACTIVE | 10 |
+| PREDICTION_HALF_LIFE_SECS | 86400 |
+| LIVE_JUDGEMENT_HOURS | 72 |
 | FATIGUE_PER_FIRE / FATIGUE_DECAY_PER_SEC | 0.5 / 0.01 |
 | CASCADE_BUDGET / HOP_COST | 1.0 / 0.2 |
 | POOL capacity / refill_per_sec | 20.0 / 0.05 |
@@ -268,4 +308,10 @@ parameter change is reviewable.
   similarity, the same selection signal the A/B showed to carry value.
 - **Gaming the metric**: resolution rate is tracked against creation rate (§9.1).
 - **Questions that never resolve**: decay + attempt cap + abandoned state (§3.2).
-- **Rollback**: `off` restores today's behaviour exactly, including no brakes.
+- **Rollback**: `off` restores today's behaviour exactly, including no brakes; and
+  `observe`, the default, is already behaviour-neutral, so a deploy with the default
+  setting changes nothing about how external input is handled.
+- **Stale predictions starving questions**: half-life decay plus a cap on active
+  pulsing predictions (§3.1).
+- **Observe looking rosier than live**: would-be pulses are charged with an
+  estimated cascade cost (§6.3), and §9.2 is explicitly a leading indicator.
