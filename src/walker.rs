@@ -352,29 +352,45 @@ pub async fn walk_parallel(
     tracing::debug!("[walker] Loaded {} knowledge domains for cross-reference", knowledge_domains.len());
 
     let walk_start = Instant::now();
-    let results: Vec<(WalkerResult, SelfModel)> = configs
-        .par_iter()
-        .enumerate()
-        .map(|(i, (seed, bias))| {
-            let mut sm = base_sm.clone();  // Each walker gets its own copy
-            let collective = Arc::clone(&collective);
-            let learned = if learned_len > 0 {
-                base_sm.learned_biases.get((learned_rotation + i) % learned_len)
-            } else {
-                None
-            };
-            let result = walk_single(&cache, *seed, *bias, &EmotionalState {
-                valence: sm.valence,
-                arousal: sm.arousal,
-                energy: sm.energy,
-            }, steps, &mut sm, &collective, learned, &knowledge_domains);
-            (result, sm)
+    // The walk is CPU-bound rayon work; run it on the blocking pool so it never
+    // stalls tokio worker threads (and every other HTTP handler) for its duration.
+    let cache = Arc::new(cache);
+    let results: Vec<(WalkerResult, SelfModel)> = {
+        let cache = Arc::clone(&cache);
+        let base_sm = base_sm.clone();
+        let collective = Arc::clone(&collective);
+        let knowledge_domains = knowledge_domains.clone();
+        tokio::task::spawn_blocking(move || {
+        let results: Vec<(WalkerResult, SelfModel)> = configs
+            .par_iter()
+            .enumerate()
+            .map(|(i, (seed, bias))| {
+                let mut sm = base_sm.clone();  // Each walker gets its own copy
+                let collective = Arc::clone(&collective);
+                let learned = if learned_len > 0 {
+                    base_sm.learned_biases.get((learned_rotation + i) % learned_len)
+                } else {
+                    None
+                };
+                let result = walk_single(&cache, *seed, *bias, &EmotionalState {
+                    valence: sm.valence,
+                    arousal: sm.arousal,
+                    energy: sm.energy,
+                }, steps, &mut sm, &collective, learned, &knowledge_domains);
+                (result, sm)
+            })
+            .collect();
+            results
         })
-        .collect();
+        .await
+        .expect("walker pool panicked")
+    };
     let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
 
     // ── Flush edge cache writes to DB ──
-    let _ = cache.flush().await;
+    if let Err(e) = cache.flush().await {
+        tracing::warn!("[walker] edge flush failed (deltas re-queued): {}", e);
+    }
 
     // Stage 2 replay buffer: session-mean intrinsic fitness (Autonomous only; set below).
     let mut session_fitness: Option<f32> = None;

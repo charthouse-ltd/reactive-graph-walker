@@ -196,8 +196,47 @@ pub async fn serve(
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Final persistence: without this, every container recreate threw away up
+    // to 60 s of self-model evolution (the periodic save is the only other
+    // writer). Pending edge deltas live in per-walk caches that flush at the
+    // end of each walk, so the self-model is the state that needs saving here.
+    let sm = state.self_model.lock().await.clone();
+    match db::save_self_model(&state.pool, &sm).await {
+        Ok(_) => tracing::info!("[rgw] shutdown: self-model saved ({} signals)", sm.total_signals_processed),
+        Err(e) => tracing::error!("[rgw] shutdown: self-model save FAILED: {}", e),
+    }
     Ok(())
+}
+
+/// Resolve on SIGINT (Ctrl-C) or SIGTERM (what `docker stop` / compose recreate
+/// send). axum then stops accepting, drains in-flight requests, and returns so
+/// `serve` can persist state before the process exits.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("[rgw] cannot install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("[rgw] SIGINT received, shutting down"),
+        _ = terminate => tracing::info!("[rgw] SIGTERM received, shutting down"),
+    }
 }
 
 /// Minimum recommended RGW_API_KEY length (shorter keys are accepted with a WARN).

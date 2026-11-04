@@ -188,28 +188,34 @@ impl EdgeCache {
 
     /// Flush pending edge writes to the database.
     /// Called periodically or at session end.
+    ///
+    /// Drains each pending entry atomically (`remove`), so deltas queued by
+    /// walkers while the flush is in flight are kept for the next flush instead
+    /// of being wiped by a blanket `clear()`. Every edge receives its own
+    /// accumulated delta. If the write fails, the deltas are re-queued and the
+    /// error is returned; callers log it.
     pub async fn flush(&self) -> Result<u64, sqlx::Error> {
-        let pending: Vec<(i32, f32)> = self.pending_write
+        let keys: Vec<i32> = self.pending_write.iter().map(|e| *e.key()).collect();
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let pending: Vec<(i32, f32)> = keys
             .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
+            .filter_map(|k| self.pending_write.remove(k))
             .collect();
-
         if pending.is_empty() {
             return Ok(0);
         }
-
         let count = pending.len() as u64;
 
-        // Batch strengthen
-        let edge_ids: Vec<i32> = pending.iter().map(|(id, _)| *id).collect();
-        let avg_delta: f32 = pending.iter().map(|(_, d)| *d).sum::<f32>() / pending.len() as f32;
-
-        crate::db::strengthen_edges(&self.pool, &edge_ids, avg_delta).await?;
-
-        // Clear pending
-        self.pending_write.clear();
+        if let Err(e) = crate::db::strengthen_edges_each(&self.pool, &pending).await {
+            // Put the deltas back so nothing is lost; the next flush retries.
+            for (id, d) in pending {
+                self.pending_write.entry(id).and_modify(|x| *x += d).or_insert(d);
+            }
+            return Err(e);
+        }
         self.flushes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         tracing::debug!("[cache] Flushed {} edge writes to DB", count);
         Ok(count)
     }

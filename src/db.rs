@@ -148,19 +148,24 @@ pub async fn strengthen_edge(pool: &PgPool, edge_id: i32, delta: f32) -> Result<
 }
 
 /// Batch strengthen multiple edges
-pub async fn strengthen_edges(pool: &PgPool, edge_ids: &[i32], delta: f32) -> Result<(), sqlx::Error> {
-    if edge_ids.is_empty() {
+/// Apply a per-edge weight delta in one statement (Hebbian: each edge gets
+/// its OWN accumulated delta). Weights are capped at 1.0.
+pub async fn strengthen_edges_each(pool: &PgPool, deltas: &[(i32, f32)]) -> Result<(), sqlx::Error> {
+    if deltas.is_empty() {
         return Ok(());
     }
+    let ids: Vec<i32> = deltas.iter().map(|(id, _)| *id).collect();
+    let ds: Vec<f32> = deltas.iter().map(|(_, d)| *d).collect();
     sqlx::query(
-        "UPDATE memory_edges SET \
-         weight = LEAST(1.0, weight + $1), \
-         traversal_count = traversal_count + 1, \
+        "UPDATE memory_edges AS e SET \
+         weight = LEAST(1.0, e.weight + v.delta), \
+         traversal_count = e.traversal_count + 1, \
          last_traversed = NOW() \
-         WHERE id = ANY($2)"
+         FROM unnest($1::int4[], $2::real[]) AS v(id, delta) \
+         WHERE e.id = v.id"
     )
-    .bind(delta)
-    .bind(edge_ids)
+    .bind(&ids)
+    .bind(&ds)
     .execute(pool)
     .await?;
     Ok(())
