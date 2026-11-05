@@ -472,6 +472,51 @@ pub async fn walk_parallel_with(
 ) -> (WalkOutput, Vec<WalkerResult>) {
     let start = Instant::now();
 
+    let deterministic = opts.seed.is_some() || crate::seeding::deterministic_env();
+    let base_seed = opts.seed.unwrap_or(0);
+    let seed_mode = opts.seed_mode.unwrap_or_else(crate::seeding::seed_mode);
+    let mut kind = decide_walk(opts.arm, seed_mode, opts.cue_embedding.is_some());
+
+    // Nearest nodes to the cue, for every kind that is seeded from it. A failed lookup
+    // (for example a cue of the wrong dimension) falls back to today's walk.
+    let cands: Vec<crate::seeding::Candidate> = match (kind, opts.cue_embedding.as_deref()) {
+        (WalkKind::Fixed, _) | (_, None) => Vec::new(),
+        (_, Some(cue)) => match crate::seeding::candidates(pool, cue).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("[seeding] candidate lookup failed, walking with fixed seeds: {}", e);
+                kind = WalkKind::Fixed;
+                Vec::new()
+            }
+        },
+    };
+    // What the output reports: "query" when the cue decided the result, "shadow" when the
+    // mode is shadow and the walk ran as today, "fixed" otherwise.
+    let mode_label = match kind {
+        WalkKind::Fixed if opts.arm.is_none() && seed_mode == crate::seeding::SeedMode::Shadow => "shadow",
+        WalkKind::Fixed => "fixed",
+        _ => "query",
+    };
+    let plan: Option<crate::seeding::SeedPlan> = match kind {
+        WalkKind::Planned(spec) => Some(crate::seeding::plan_seeds(&cands, spec)),
+        _ => None,
+    };
+
+    // No walk: the vector arm, or a plan whose best match is below the floor. This returns
+    // before any signal is processed, so the self-model is untouched.
+    if kind == WalkKind::Vector || plan.as_ref().is_some_and(|p| p.below_floor) {
+        let first_domain = match cands.first() {
+            Some(c) => db::get_node(pool, c.id).await.ok().flatten().map(|n| n.domain).unwrap_or_default(),
+            None => String::new(),
+        };
+        let mut output = vector_output(&cands, first_domain);
+        output.seed_mode = mode_label.to_string();
+        output.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        return (output, Vec::new());
+    }
+    // A plan that reaches this point is at or above the floor, so it has seeds.
+    let plan = plan.filter(|p| !p.seeds.is_empty());
+
     // Signal: walk session starting
     {
         let mut sm = self_model.lock().await;
@@ -480,27 +525,6 @@ pub async fn walk_parallel_with(
         core::process(signal, &mut sm);
     }
 
-    let deterministic = opts.seed.is_some() || crate::seeding::deterministic_env();
-    let base_seed = opts.seed.unwrap_or(0);
-    let seed_mode = opts.seed_mode.unwrap_or_else(crate::seeding::seed_mode);
-    let kind = decide_walk(opts.arm, seed_mode, opts.cue_embedding.is_some());
-
-    // The query seed plan, when this walk is seeded from the cue. A failed lookup
-    // (for example a cue of the wrong dimension) falls back to today's seeds.
-    let plan: Option<crate::seeding::SeedPlan> = match (kind, opts.cue_embedding.as_deref()) {
-        (WalkKind::Planned(spec), Some(cue)) => match crate::seeding::candidates(pool, cue).await {
-            Ok(cands) => {
-                let p = crate::seeding::plan_seeds(&cands, spec);
-                (!p.seeds.is_empty()).then_some(p)
-            }
-            Err(e) => {
-                tracing::warn!("[seeding] candidate lookup failed, walking with fixed seeds: {}", e);
-                None
-            }
-        },
-        _ => None,
-    };
-
     // Get seed nodes
     let seeds: Vec<i32> = match &plan {
         Some(p) => p.seeds.iter().map(|s| s.0).collect(),
@@ -508,7 +532,9 @@ pub async fn walk_parallel_with(
     };
 
     if seeds.is_empty() {
-        return (empty_output(), Vec::new());
+        let mut output = empty_output();
+        output.seed_mode = mode_label.to_string();
+        return (output, Vec::new());
     }
 
     // Assign biases — mode-dependent
@@ -768,7 +794,11 @@ pub async fn walk_parallel_with(
     let walker_results: Vec<WalkerResult> = results.into_iter().map(|(r, _)| r).collect();
 
     // Aggregate results (borrows walker_results, doesn't consume)
-    let output = aggregate(pool, &walker_results, walk_ms, start, agreement_metric).await;
+    let mut output = aggregate(pool, &walker_results, walk_ms, start, agreement_metric).await;
+    output.seed_mode = mode_label.to_string();
+    if crate::seeding::eval_enabled() {
+        output.telemetry.hub_visit_share = hub_visit_share(pool, &walker_results).await;
+    }
 
     // Tension release: unresolved predictions / open questions may pulse into the
     // diverger now (no-op unless RGW_TENSION_MODE=live; observe only logs).
@@ -944,6 +974,132 @@ fn domain_agreement(results: &[WalkerResult]) -> f32 {
     modal as f32 / voters as f32
 }
 
+/// Longest ranked list returned to callers.
+pub const RANKED_MAX: usize = 10;
+/// Most chains shown in the query-mode context.
+pub const CHAINS_MAX: usize = 2;
+/// Most node rows shown in the query-mode context, chains included.
+const NARRATIVE_QUERY_ROWS: usize = 8;
+/// How long the degree threshold behind `hub_visit_share` is reused.
+const HUB_THRESHOLD_TTL_SECS: u64 = 600;
+
+/// Merge mass: `m(v) = sum over walkers and visits of MERGE_DISCOUNT^depth`, depth counted
+/// from the last (re)start. Mass descending, then id ascending.
+pub fn merge_mass(results: &[WalkerResult]) -> Vec<(i32, f32)> {
+    let mut mass: HashMap<i32, f32> = HashMap::new();
+    for r in results {
+        for (i, &node) in r.path.iter().enumerate() {
+            *mass.entry(node).or_insert(0.0) += crate::seeding::MERGE_DISCOUNT.powi(r.depth_at(i) as i32);
+        }
+    }
+    let mut ranked: Vec<(i32, f32)> = mass.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    ranked
+}
+
+/// Up to `CHAINS_MAX` walk segments of at least two nodes, by summed mass descending.
+/// A node appears in one chain only: a segment that shares a node with a chosen chain is skipped.
+pub fn context_chains(results: &[WalkerResult], ranked: &[(i32, f32)]) -> Vec<Vec<i32>> {
+    let mass: HashMap<i32, f32> = ranked.iter().copied().collect();
+    let mut segments: Vec<(f32, Vec<i32>)> = Vec::new();
+    for r in results {
+        for seg in r.segments() {
+            if seg.len() >= 2 {
+                let total: f32 = seg.iter().map(|n| mass.get(n).copied().unwrap_or(0.0)).sum();
+                segments.push((total, seg.to_vec()));
+            }
+        }
+    }
+    // Stable sort: equal totals keep walker order.
+    segments.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut used: HashSet<i32> = HashSet::new();
+    let mut chains = Vec::new();
+    for (_, seg) in segments {
+        if chains.len() >= CHAINS_MAX {
+            break;
+        }
+        if seg.iter().any(|n| used.contains(n)) {
+            continue;
+        }
+        used.extend(seg.iter().copied());
+        chains.push(seg);
+    }
+    chains
+}
+
+/// Walk telemetry that needs no database (`hub_visit_share` is filled by the caller).
+pub fn telemetry(results: &[WalkerResult]) -> WalkTelemetry {
+    let sets: Vec<HashSet<i32>> = results.iter().map(|r| r.path.iter().copied().collect()).collect();
+    let mut overlap_sum = 0.0f32;
+    let mut pairs = 0u32;
+    for i in 0..sets.len() {
+        for j in (i + 1)..sets.len() {
+            let union = sets[i].union(&sets[j]).count();
+            if union > 0 {
+                overlap_sum += sets[i].intersection(&sets[j]).count() as f32 / union as f32;
+            }
+            pairs += 1;
+        }
+    }
+    let mut visitors: HashMap<i32, u32> = HashMap::new();
+    for set in &sets {
+        for &node in set {
+            *visitors.entry(node).or_insert(0) += 1;
+        }
+    }
+    let steps: u32 = results.iter().map(|r| r.step_stats.steps).sum();
+    let branching: u32 = results.iter().map(|r| r.step_stats.branching_sum).sum();
+    WalkTelemetry {
+        path_overlap: if pairs > 0 { overlap_sum / pairs as f32 } else { 0.0 },
+        hub_visit_share: None,
+        branching_factor: if steps > 0 { branching as f32 / steps as f32 } else { 0.0 },
+        duplicate_claims: visitors.values().map(|v| v.saturating_sub(1)).sum(),
+        cache_miss_stops: results.iter().map(|r| r.step_stats.cache_miss_stops).sum(),
+    }
+}
+
+/// The output when no walker runs: the nodes nearest to the query, by cosine.
+/// The self-model is not touched on this path.
+pub fn vector_output(cands: &[crate::seeding::Candidate], first_domain: String) -> WalkOutput {
+    WalkOutput {
+        walked: false,
+        ranked_nodes: cands.iter().take(RANKED_MAX).map(|c| (c.id, c.cos)).collect(),
+        primary_domain: first_domain,
+        walk_id: crate::seeding::new_walk_id(),
+        ..empty_output()
+    }
+}
+
+/// Share of all visits that land on nodes at or above the 99th-percentile degree.
+/// The threshold is cached per process; `None` on any database error.
+async fn hub_visit_share(pool: &PgPool, results: &[WalkerResult]) -> Option<f32> {
+    static THRESHOLD: Mutex<Option<(Instant, i64)>> = Mutex::new(None);
+    let cached = THRESHOLD.lock().ok().and_then(|g| *g);
+    let threshold = match cached {
+        Some((at, t)) if at.elapsed().as_secs() < HUB_THRESHOLD_TTL_SECS => t,
+        _ => {
+            let t = db::degree_at_percentile(pool, 0.99).await.ok()?;
+            if let Ok(mut g) = THRESHOLD.lock() {
+                *g = Some((Instant::now(), t));
+            }
+            t
+        }
+    };
+    let visits: Vec<i32> = results.iter().flat_map(|r| r.path.iter().copied()).collect();
+    if visits.is_empty() {
+        return Some(0.0);
+    }
+    let mut ids = visits.clone();
+    ids.sort_unstable();
+    ids.dedup();
+    let degrees = db::node_degrees(pool, &ids).await.ok()?;
+    let on_hubs = visits
+        .iter()
+        .filter(|id| degrees.get(id).is_some_and(|&d| d > 0 && d as i64 >= threshold))
+        .count();
+    Some(on_hubs as f32 / visits.len() as f32)
+}
+
 /// Emotional resonance: the mean edge weight the collective traversed per hop.
 /// High = walks moved through strong, well-worn connections; low = weak/random.
 /// Clamped to 0..1.
@@ -1029,6 +1185,11 @@ async fn aggregate(
         }
     }
 
+    // Merge mass, the context chains built from it, and the ranked list handed to callers.
+    let ranked_all = merge_mass(results);
+    let context_chains = context_chains(results, &ranked_all);
+    let ranked_nodes: Vec<(i32, f32)> = ranked_all.into_iter().take(RANKED_MAX).collect();
+
     tracing::info!(
         "[walker-perf] {} walkers × {} hops = {} total | \
          walk={:.0}ms total={:.0}ms | {:.0} hops/s | \
@@ -1064,6 +1225,12 @@ async fn aggregate(
         total_ms,
         hops_per_sec,
         walker_context: String::new(),
+        walk_id: crate::seeding::new_walk_id(),
+        walked: true,
+        seed_mode: String::new(),
+        ranked_nodes,
+        context_chains,
+        telemetry: telemetry(results),
     }
 }
 
@@ -1235,9 +1402,36 @@ pub fn render_walk_narrative(output: &WalkOutput, texts: &HashMap<i32, NodeText>
         lines.push(format!("Landscape: {}", top.join(", ")));
     }
 
-    let mut section = |label: &str, ids: &[i32]| {
+    // Query view: the walk was seeded from the query, or no walker ran. The three vote
+    // sections give way to the chains the walkers followed and the ranked nodes.
+    let query_view = output.seed_mode == "query" || !output.walked;
+    let mut chain_rows = 0usize;
+    let mut in_chains: HashSet<i32> = HashSet::new();
+    if query_view && output.walked {
+        let label_of = |nid: &i32| -> Option<String> {
+            let t = texts.get(nid)?;
+            let title = cap(&neutralise(&t.title), NARRATIVE_TITLE_CHARS);
+            let label = if title.is_empty() { cap(&tidy_excerpt("", &t.excerpt), 40) } else { title };
+            (!label.is_empty()).then_some(label)
+        };
         let mut rows = Vec::new();
-        for nid in ids.iter().take(4) {
+        for chain in output.context_chains.iter().take(CHAINS_MAX) {
+            let labels: Vec<String> = chain.iter().filter_map(label_of).collect();
+            if labels.len() >= 2 {
+                rows.push(format!("  - {}", labels.join(" -> ")));
+                in_chains.extend(chain.iter().copied());
+            }
+        }
+        if !rows.is_empty() {
+            chain_rows = rows.len();
+            lines.push("\nTrains of thought:".to_string());
+            lines.extend(rows);
+        }
+    }
+
+    let mut section = |label: &str, ids: &[i32], limit: usize| {
+        let mut rows = Vec::new();
+        for nid in ids.iter().take(limit) {
             if let Some(t) = texts.get(nid) {
                 let title = cap(&neutralise(&t.title), NARRATIVE_TITLE_CHARS);
                 let title = title.as_str();
@@ -1259,9 +1453,15 @@ pub fn render_walk_narrative(output: &WalkOutput, texts: &HashMap<i32, NodeText>
             lines.extend(rows);
         }
     };
-    section("Strong convictions (consensus)", &output.consensus_nodes);
-    section("Loose threads (walkers disagreed)", &output.divergent_nodes);
-    section("Blind spots (rarely visited)", &output.blind_spots);
+    if query_view {
+        let rest: Vec<i32> = output.ranked_nodes.iter().map(|n| n.0).filter(|id| !in_chains.contains(id)).collect();
+        let label = if output.walked { "Also relevant" } else { "Closest memories (no walk)" };
+        section(label, &rest, NARRATIVE_QUERY_ROWS.saturating_sub(chain_rows));
+    } else {
+        section("Strong convictions (consensus)", &output.consensus_nodes, 4);
+        section("Loose threads (walkers disagreed)", &output.divergent_nodes, 4);
+        section("Blind spots (rarely visited)", &output.blind_spots, 4);
+    }
 
     if output.novel_connections > 0 {
         lines.push(format!("\nNovel connections this walk: {}", output.novel_connections));
@@ -1325,6 +1525,8 @@ pub async fn format_walk_narrative(output: &WalkOutput, pool: &PgPool) -> String
     for list in [&output.consensus_nodes, &output.divergent_nodes, &output.blind_spots] {
         ids.extend(list.iter().take(4));
     }
+    ids.extend(output.ranked_nodes.iter().map(|n| n.0));
+    ids.extend(output.context_chains.iter().flatten().copied());
     ids.sort_unstable();
     ids.dedup();
 
@@ -1397,6 +1599,12 @@ fn empty_output() -> WalkOutput {
         total_ms: 0.0,
         hops_per_sec: 0.0,
         walker_context: String::new(),
+        walk_id: String::new(),
+        walked: true,
+        seed_mode: String::new(),
+        ranked_nodes: Vec::new(),
+        context_chains: Vec::new(),
+        telemetry: Default::default(),
     }
 }
 
@@ -1498,6 +1706,12 @@ mod tests {
             total_ms: 12.0,
             hops_per_sec: 500.0,
             walker_context: String::new(),
+            walk_id: String::new(),
+            walked: true,
+            seed_mode: String::new(),
+            ranked_nodes: Vec::new(),
+            context_chains: Vec::new(),
+            telemetry: Default::default(),
         };
         let mut texts = HashMap::new();
         texts.insert(1, NodeText { title: "Nadi silversmith".into(), excerpt: "Forty minutes by hand.".into(), domain: "travel".into() });
@@ -1730,5 +1944,78 @@ mod tests {
         assert_eq!(decide_walk(Some(EvalArm::Drop(WalkerBias::Fear)), SeedMode::Fixed, true), WalkKind::Planned(Specificity::Log));
         assert_eq!(decide_walk(Some(EvalArm::Vector), SeedMode::Fixed, true), WalkKind::Vector);
         assert_eq!(decide_walk(Some(EvalArm::Ppr), SeedMode::Fixed, true), WalkKind::Ppr);
+    }
+
+    use crate::seeding::Candidate;
+
+    #[test]
+    fn merge_mass_discounts_by_depth_since_the_last_restart() {
+        let a = WalkerResult { path: vec![1, 2, 3], depths: vec![0, 1, 2], ..wr(vec![], 0.0) };
+        let b = WalkerResult { path: vec![2, 1, 9], depths: vec![0, 1, 0], segment_starts: vec![0, 2], ..wr(vec![], 0.0) };
+        let m = merge_mass(&[a, b]);
+        assert_eq!(m, vec![(1, 1.5), (2, 1.5), (9, 1.0), (3, 0.25)]);
+    }
+
+    #[test]
+    fn merge_mass_of_legacy_results_uses_position_as_depth() {
+        assert_eq!(merge_mass(&[wr(vec![5, 6], 1.0)]), vec![(5, 1.0), (6, 0.5)]);
+    }
+
+    #[test]
+    fn context_chains_take_the_heaviest_segments_without_reusing_nodes() {
+        let a = WalkerResult { path: vec![1, 2, 3], depths: vec![0, 1, 2], ..wr(vec![], 0.0) };
+        let b = WalkerResult { path: vec![1, 2], depths: vec![0, 1], ..wr(vec![], 0.0) };
+        let c = WalkerResult { path: vec![7], depths: vec![0], ..wr(vec![], 0.0) };
+        let ranked = merge_mass(&[a.clone(), b.clone(), c.clone()]);
+        assert_eq!(context_chains(&[a, b, c], &ranked), vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn telemetry_counts_overlap_duplicates_branching_and_misses() {
+        let mut a = wr(vec![1, 2, 3], 1.0);
+        a.step_stats = StepStats { branching_sum: 6, steps: 2, cache_miss_stops: 1 };
+        let mut b = wr(vec![2, 3, 4], 1.0);
+        b.step_stats = StepStats { branching_sum: 2, steps: 2, cache_miss_stops: 0 };
+        let t = telemetry(&[a, b]);
+        assert!((t.path_overlap - 0.5).abs() < 1e-6, "Jaccard of {{1,2,3}} and {{2,3,4}} is 2/4");
+        assert_eq!((t.duplicate_claims, t.cache_miss_stops), (2, 1));
+        assert!((t.branching_factor - 2.0).abs() < 1e-6);
+        assert_eq!(t.hub_visit_share, None);
+    }
+
+    #[test]
+    fn vector_output_with_no_candidates_is_well_formed() {
+        let out = vector_output(&[], String::new());
+        assert!(!out.walked && out.ranked_nodes.is_empty());
+        assert_eq!((out.recommended_action.as_str(), out.walker_count), ("rest", 0));
+        let one = vector_output(&[Candidate { id: 4, cos: 0.8, degree: 2 }], "d".into());
+        assert_eq!((one.ranked_nodes.clone(), one.primary_domain.as_str()), (vec![(4, 0.8)], "d"));
+    }
+
+    #[test]
+    fn narrative_in_query_mode_shows_chains_then_ranked_nodes() {
+        let mut texts = HashMap::new();
+        for (id, title) in [(1, "One"), (2, "Two"), (3, "Three")] {
+            texts.insert(id, NodeText { title: title.into(), excerpt: String::new(), domain: "d".into() });
+        }
+        let output = WalkOutput {
+            seed_mode: "query".into(), walked: true,
+            ranked_nodes: vec![(1, 2.0), (2, 1.0), (3, 0.5)], context_chains: vec![vec![1, 2]],
+            consensus_nodes: vec![3], ..empty_output()
+        };
+        let s = render_walk_narrative(&output, &texts);
+        assert!(s.contains("Trains of thought:") && s.contains("One -> Two"));
+        assert!(s.contains("Also relevant:") && s.contains("Three"));
+        assert!(!s.contains("Strong convictions"));
+    }
+
+    #[test]
+    fn narrative_outside_query_mode_is_unchanged() {
+        let mut texts = HashMap::new();
+        texts.insert(1, NodeText { title: "One".into(), excerpt: String::new(), domain: "d".into() });
+        let output = WalkOutput { seed_mode: "shadow".into(), walked: true, consensus_nodes: vec![1],
+                                  ranked_nodes: vec![(1, 1.0)], ..empty_output() };
+        let s = render_walk_narrative(&output, &texts);
+        assert!(s.contains("Strong convictions (consensus)") && !s.contains("Also relevant"));
     }
 }

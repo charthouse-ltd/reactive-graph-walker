@@ -98,10 +98,59 @@ async fn drop_arm_removes_one_walker_profile() -> anyhow::Result<()> {
 async fn same_seed_gives_the_same_paths() -> anyhow::Result<()> {
     embedder()?;
     let pool = fixture_pool("rgw_p1_determinism").await?;
+    // Paths and the ranked list: invariant I6 of the spec.
     let run = || async {
-        let (_o, r) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Query)).await;
-        r.into_iter().map(|x| x.path).collect::<Vec<_>>()
+        let (o, r) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Query)).await;
+        (r.into_iter().map(|x| x.path).collect::<Vec<_>>(), o.ranked_nodes)
     };
     assert_eq!(run().await, run().await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_arm_ranks_the_cue_cluster_first() -> anyhow::Result<()> {
+    embedder()?;
+    let pool = fixture_pool("rgw_p1_rank").await?;
+    let (out, _) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Query)).await;
+    assert!(out.walked);
+    let top4: Vec<i32> = out.ranked_nodes.iter().take(4).map(|n| n.0).collect();
+    let gold = [B1, B2, B3, B4];
+    assert!(top4.iter().filter(|id| gold.contains(id)).count() >= 3, "top 4 were {top4:?}");
+    assert_eq!(out.walk_id.len(), 32);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fixed_arm_ranks_todays_seeds_first() -> anyhow::Result<()> {
+    embedder()?;
+    let pool = fixture_pool("rgw_p1_rank_fixed").await?;
+    // One step each: a start node holds mass 1.0, and no other node can exceed it.
+    let (out, _) = walk_parallel_with(&pool, &Default::default(), 2, 1, &sm(), opts(axis(1), EvalArm::Fixed)).await;
+    assert!([HUB, A1].contains(&out.ranked_nodes[0].0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cue_far_from_everything_does_not_walk_in_query_mode() -> anyhow::Result<()> {
+    let pool = fixture_pool("rgw_p1_floor").await?;
+    let model = sm();
+    let before = serde_json::to_value(&*model.lock().await)?;
+    let o = WalkOptions { cue_embedding: Some(axis(7)), seed: Some(1), arm: None,
+                          seed_mode: Some(rgw::seeding::SeedMode::Query) };
+    let (out, results) = walk_parallel_with(&pool, &Default::default(), 4, 5, &model, o).await;
+    assert!(!out.walked && results.is_empty());
+    assert_eq!(out.recommended_action, "rest");
+    assert_eq!(serde_json::to_value(&*model.lock().await)?, before, "no walk, no self-model change");
+    Ok(())
+}
+
+#[tokio::test]
+async fn vector_arm_returns_candidates_by_cosine() -> anyhow::Result<()> {
+    let pool = fixture_pool("rgw_p1_vector").await?;
+    let (out, _) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(2), EvalArm::Vector)).await;
+    assert!(!out.walked);
+    assert_eq!(out.ranked_nodes[0].0, LONE);
+    assert!((out.ranked_nodes[0].1 - 1.0).abs() < 1e-4);
+    assert_eq!(out.primary_domain, "gamma");
     Ok(())
 }

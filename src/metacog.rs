@@ -1962,6 +1962,12 @@ mod tests {
             total_ms: 180.0,
             hops_per_sec: 260.0,
             walker_context: String::new(),
+            walk_id: String::new(),
+            walked: true,
+            seed_mode: String::new(),
+            ranked_nodes: Vec::new(),
+            context_chains: Vec::new(),
+            telemetry: Default::default(),
         }
     }
 

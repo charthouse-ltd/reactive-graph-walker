@@ -771,6 +771,32 @@ pub struct WalkOutput {
     /// to beat both no-context and random-node context on Julian's graph.
     #[serde(default)]
     pub walker_context: String,
+    /// 128-bit id of this walk, 32 lowercase hex characters.
+    pub walk_id: String,
+    /// False when no walker ran: the vector arm, or a query whose best match is below the floor.
+    pub walked: bool,
+    /// How this walk was seeded: "fixed", "shadow" or "query".
+    pub seed_mode: String,
+    /// Nodes by merge mass (or by cosine when no walker ran), best first.
+    pub ranked_nodes: Vec<(i32, f32)>,
+    /// The heaviest intact walk segments, for the query-mode context.
+    pub context_chains: Vec<Vec<i32>>,
+    pub telemetry: WalkTelemetry,
+}
+
+/// Per-walk health numbers (spec §5.1).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct WalkTelemetry {
+    /// Mean pairwise Jaccard overlap of the walkers' node sets; 0 with fewer than 2 walkers.
+    pub path_overlap: f32,
+    /// Share of visits on the 1 % highest-degree nodes. Needs a degree query per walk,
+    /// so it is filled only under `RGW_EVAL=1`.
+    pub hub_visit_share: Option<f32>,
+    /// Candidate edges within 0.1 of the heaviest one, per step.
+    pub branching_factor: f32,
+    /// Sum over nodes of (walkers that visited it - 1).
+    pub duplicate_claims: u32,
+    pub cache_miss_stops: u32,
 }
 
 #[cfg(test)]
