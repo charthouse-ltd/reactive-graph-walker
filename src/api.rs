@@ -52,6 +52,13 @@ pub struct WalkRequest {
     /// May lower autonomy for this walk, never exceed the configured global mode.
     #[serde(default)]
     pub rgw_mode: Option<String>,
+    /// Makes this walk deterministic with the given base seed.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Evaluation arm (`fixed`, `query`, `query:linear`, `vector`, `ppr`, `drop:<bias>`).
+    /// Accepted only when the server runs with `RGW_EVAL=1`.
+    #[serde(default)]
+    pub arm: Option<String>,
 }
 
 fn default_walkers() -> usize { 4 }
@@ -148,6 +155,7 @@ pub async fn serve(
         .route("/recall", get(recall))
         .route("/metrics", get(metrics_endpoint))
         .route("/diverger", get(diverger_stats))
+        .route("/learning", get(learning_stats))
         .route("/self", get(self_state))
         .route("/metacog/config", get(get_metacog_config).post(set_metacog_config))
         .route("/selection/stage", post(set_selection_stage))
@@ -424,16 +432,27 @@ async fn walk(
         req.n_walkers
     };
 
+    // Rejected before any walk and before the self-model is touched.
+    let arm = validate_arm(req.arm.as_deref(), crate::seeding::eval_enabled())?;
+
     // A lowered mode belongs to this request, including its critic updates. It is
     // never exposed to concurrent walks, the diverger or the dream loop.
     let self_model = request_self_model(&state.self_model, req.rgw_mode.as_deref()).await?;
 
-    let (mut output, walker_results) = walker::walk_parallel(
+    // The query, embedded. Too short or not embeddable means a fixed-seed walk.
+    let opts = walker::WalkOptions {
+        cue_embedding: crate::seeding::embed_cue(&req.stimulus).await,
+        seed: req.seed,
+        arm,
+        seed_mode: None,
+    };
+    let (mut output, walker_results) = walker::walk_parallel_with(
         &state.pool,
         &req.emotional_state,
         n,
         req.steps,
         &self_model,
+        opts,
     )
     .await;
 
@@ -444,7 +463,9 @@ async fn walk(
 
     // ── Metacognitive Critic: run after walk session ──
     // Algorithmic diagnosis always runs. LLM escalates only when warranted.
-    {
+    // A query-decided result with no walkers (below the floor, or the vector and ppr arms)
+    // is not a walk session: the critic does not run and the self-model stays untouched.
+    if !(output.seed_mode == "query" && walker_results.is_empty()) {
         let mut sm = self_model.lock().await;
         let diagnosis = crate::metacog::run_critic(&output, &walker_results, &mut sm);
 
@@ -1009,6 +1030,11 @@ async fn recall(
 }
 
 /// GET /diverger — self-propagating reactive graph stats
+/// GET /learning — what the learning stages have measured. Plan P1 fills the `seed` block.
+async fn learning_stats() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "seed": crate::seeding::seed_stats_json() }))
+}
+
 async fn diverger_stats(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
@@ -1226,6 +1252,19 @@ async fn ingest_signal_endpoint(
 
 /// Fixed errors never echo caller-controlled values or request bodies.
 pub(crate) type ModeError = (StatusCode, &'static str);
+
+/// The eval arm of a request: `Ok(None)` when none was sent. An arm sent without
+/// `RGW_EVAL=1`, or one that does not parse, is a 400.
+pub(crate) fn validate_arm(arm: Option<&str>, eval_enabled: bool) -> Result<Option<walker::EvalArm>, ModeError> {
+    let Some(arm) = arm else { return Ok(None); };
+    if !eval_enabled {
+        return Err((StatusCode::BAD_REQUEST, "arm requires RGW_EVAL=1"));
+    }
+    match walker::EvalArm::parse(arm) {
+        Some(parsed) => Ok(Some(parsed)),
+        None => Err((StatusCode::BAD_REQUEST, "unknown arm")),
+    }
+}
 
 pub(crate) fn validate_request_mode(
     requested: Option<&str>, configured: &CognitiveMode,
@@ -1768,5 +1807,20 @@ mod mode_ceiling_tests {
         assert_eq!(request_self_model(&shared, Some("autonomous")).await.unwrap_err().0, StatusCode::FORBIDDEN);
         assert_eq!(request_self_model(&shared, Some("unknown")).await.unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(serde_json::to_value(&*shared.lock().await).unwrap(), before);
+    }
+
+    use crate::walker::EvalArm;
+
+    #[tokio::test]
+    async fn arm_is_rejected_without_eval_and_when_unknown() {
+        let state = state(CognitiveMode::Autonomous).await;
+        let app = Router::new().route("/walk", post(walk)).with_state(state);
+        let send = |body: serde_json::Value| app.clone().oneshot(Request::post("/walk")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap());
+        // RGW_EVAL is not set in the test process.
+        assert_eq!(send(serde_json::json!({"arm": "query"})).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(validate_arm(Some("nonsense"), true).unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(validate_arm(Some("ppr"), true).unwrap(), Some(EvalArm::Ppr));
+        assert_eq!(validate_arm(None, false).unwrap(), None);
     }
 }

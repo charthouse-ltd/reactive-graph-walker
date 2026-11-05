@@ -499,8 +499,25 @@ pub async fn walk_parallel_with(
     };
     let plan: Option<crate::seeding::SeedPlan> = match kind {
         WalkKind::Planned(spec) => Some(crate::seeding::plan_seeds(&cands, spec)),
+        WalkKind::Ppr => Some(crate::seeding::plan_seeds(&cands, crate::seeding::Specificity::Log)),
         _ => None,
     };
+
+    // Statistics (spec §13): only for walks seeded by the configured mode, never for eval arms.
+    if opts.arm.is_none() {
+        match (seed_mode, &plan, opts.cue_embedding.as_deref()) {
+            (crate::seeding::SeedMode::Query, Some(p), _) => observe_seed_plan(pool, p, n_walkers, seed_mode).await,
+            // Shadow walks exactly as today; the plan is computed only to be measured.
+            (crate::seeding::SeedMode::Shadow, None, Some(cue)) => match crate::seeding::candidates(pool, cue).await {
+                Ok(c) => {
+                    let shadow_plan = crate::seeding::plan_seeds(&c, crate::seeding::Specificity::Log);
+                    observe_seed_plan(pool, &shadow_plan, n_walkers, seed_mode).await;
+                }
+                Err(e) => tracing::warn!("[seeding] shadow candidate lookup failed: {}", e),
+            },
+            _ => {}
+        }
+    }
 
     // No walk: the vector arm, or a plan whose best match is below the floor. This returns
     // before any signal is processed, so the self-model is untouched.
@@ -516,6 +533,37 @@ pub async fn walk_parallel_with(
     }
     // A plan that reaches this point is at or above the floor, so it has seeds.
     let plan = plan.filter(|p| !p.seeds.is_empty());
+
+    // Eval arm `ppr`: one Personalized PageRank push over the preloaded neighbourhood in
+    // place of the walkers. No walker runs and the self-model is untouched.
+    if let (WalkKind::Ppr, Some(p)) = (kind, &plan) {
+        let seed_ids: Vec<i32> = p.seeds.iter().map(|s| s.0).collect();
+        let cache = EdgeCache::new(pool.clone());
+        let k = seed_ids.len().min(crate::seeding::SEED_TOP_K);
+        let _ = cache.preload_radius(&seed_ids[..k]).await;
+        let _ = cache.preload_batch(&seed_ids[k..]).await;
+        let neighbours = |node: i32| -> Vec<(i32, f32)> {
+            cache
+                .try_get(node)
+                .iter()
+                .map(|e| (if e.source_id == node { e.target_id } else { e.source_id }, e.weight))
+                .collect()
+        };
+        let ranked = ppr_push(p, steps, &neighbours);
+        let primary_domain = match ranked.first() {
+            Some(top) => db::get_node(pool, top.0).await.ok().flatten().map(|n| n.domain).unwrap_or_default(),
+            None => String::new(),
+        };
+        let output = WalkOutput {
+            ranked_nodes: ranked.into_iter().take(RANKED_MAX).collect(),
+            primary_domain,
+            walk_id: crate::seeding::new_walk_id(),
+            seed_mode: mode_label.to_string(),
+            total_ms: start.elapsed().as_secs_f64() * 1000.0,
+            ..empty_output()
+        };
+        return (output, Vec::new());
+    }
 
     // Signal: walk session starting
     {
@@ -1098,6 +1146,51 @@ async fn hub_visit_share(pool: &PgPool, results: &[WalkerResult]) -> Option<f32>
         .filter(|id| degrees.get(id).is_some_and(|&d| d > 0 && d as i64 >= threshold))
         .count();
     Some(on_hubs as f32 / visits.len() as f32)
+}
+
+/// Personalized PageRank by power iteration: `p0 = r`;
+/// `p(t+1) = RESTART_PROB * r + (1 - RESTART_PROB) * P^T p(t)`, where a node passes its mass to
+/// its neighbours in proportion to edge weight and keeps it if it has none.
+/// Returns `(node, mass)`, mass descending then id ascending.
+pub fn ppr_push(
+    plan: &crate::seeding::SeedPlan,
+    steps: usize,
+    neighbours: &dyn Fn(i32) -> Vec<(i32, f32)>,
+) -> Vec<(i32, f32)> {
+    let restart = crate::seeding::RESTART_PROB;
+    let r: HashMap<i32, f32> = plan.seeds.iter().copied().collect();
+    let mut p = r.clone();
+    for _ in 0..steps {
+        let mut next: HashMap<i32, f32> = HashMap::new();
+        for (&node, &mass) in &r {
+            *next.entry(node).or_insert(0.0) += restart * mass;
+        }
+        for (&node, &mass) in &p {
+            let out = neighbours(node);
+            let total: f32 = out.iter().map(|n| n.1.max(0.0)).sum();
+            if total <= 0.0 {
+                *next.entry(node).or_insert(0.0) += (1.0 - restart) * mass;
+                continue;
+            }
+            for (target, weight) in out {
+                *next.entry(target).or_insert(0.0) += (1.0 - restart) * mass * weight.max(0.0) / total;
+            }
+        }
+        p = next;
+    }
+    let mut ranked: Vec<(i32, f32)> = p.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    ranked
+}
+
+/// Record a query seed plan in the shadow statistics: its best cosine, how much its
+/// strongest seeds overlap today's fixed seeds, and whether it is below the floor.
+async fn observe_seed_plan(pool: &PgPool, plan: &crate::seeding::SeedPlan, n_walkers: usize, mode: crate::seeding::SeedMode) {
+    let fixed: HashSet<i32> = db::seed_nodes(pool, (n_walkers * 2) as i32).await.unwrap_or_default().into_iter().collect();
+    let top: HashSet<i32> = plan.seeds.iter().take(crate::seeding::SEED_TOP_K).map(|s| s.0).collect();
+    let union = fixed.union(&top).count();
+    let overlap = if union > 0 { fixed.intersection(&top).count() as f32 / union as f32 } else { 0.0 };
+    crate::seeding::record_seed_observation(mode, plan.best_cos, overlap, plan.below_floor);
 }
 
 /// Emotional resonance: the mean edge weight the collective traversed per hop.
@@ -2017,5 +2110,18 @@ mod tests {
                                   ranked_nodes: vec![(1, 1.0)], ..empty_output() };
         let s = render_walk_narrative(&output, &texts);
         assert!(s.contains("Strong convictions (consensus)") && !s.contains("Also relevant"));
+    }
+
+    use crate::seeding::SeedPlan;
+
+    #[test]
+    fn ppr_mass_decays_along_a_chain_and_sums_to_one() {
+        let plan = SeedPlan { seeds: vec![(1, 1.0)], best_cos: 1.0, below_floor: false };
+        let nb = |n: i32| -> Vec<(i32, f32)> { match n { 1 => vec![(2, 1.0)], 2 => vec![(1, 1.0), (3, 1.0)], 3 => vec![(2, 1.0)], _ => vec![] } };
+        let p = ppr_push(&plan, 2, &nb);
+        let mass = |id: i32| p.iter().find(|x| x.0 == id).map(|x| x.1).unwrap_or(0.0);
+        assert!(mass(1) > mass(2) && mass(2) > mass(3) && mass(3) > 0.0);
+        assert!((p.iter().map(|x| x.1).sum::<f32>() - 1.0).abs() < 1e-5);
+        assert_eq!(p[0].0, 1);
     }
 }

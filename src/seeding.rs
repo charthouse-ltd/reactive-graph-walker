@@ -1,7 +1,9 @@
 //! Query-derived seeding: seed mode, pure seed planning, walk ids.
 //! Spec: docs/superpowers/specs/2026-11-05-learning-walkers-design.md §5.2.
 
-use std::sync::OnceLock;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Nearest nodes that take part in the plan at full weight.
 pub const SEED_TOP_K: usize = 5;
@@ -177,6 +179,93 @@ pub async fn candidates(pool: &sqlx::PgPool, cue_embedding: &[f32]) -> Result<Ve
         .collect())
 }
 
+/// Embed the query text as a walk cue. `None` for text shorter than `MIN_CUE_CHARS`
+/// after trimming, or when embedding fails (one WARN, without the text). The embedder
+/// is CPU-bound, so it runs on the blocking pool.
+pub async fn embed_cue(text: &str) -> Option<Vec<f32>> {
+    let trimmed = text.trim();
+    if trimmed.chars().count() < MIN_CUE_CHARS {
+        return None;
+    }
+    let owned = trimmed.to_string();
+    match tokio::task::spawn_blocking(move || crate::embed::embed_text(&owned)).await {
+        Ok(Ok(embedding)) => Some(embedding),
+        Ok(Err(e)) => {
+            tracing::warn!("[seeding] cue embedding failed, walking with fixed seeds: {}", e);
+            None
+        }
+        Err(e) => {
+            tracing::warn!("[seeding] cue embedding task failed, walking with fixed seeds: {}", e);
+            None
+        }
+    }
+}
+
+/// How many recent observations the medians are taken over.
+const SEED_STATS_RING: usize = 512;
+
+/// What the query seed plans looked like, walk by walk (spec §13, `seed` block).
+#[derive(Debug, Default)]
+pub struct SeedStats {
+    walks: AtomicU64,
+    fallbacks: AtomicU64,
+    best_cos: Mutex<VecDeque<f32>>,
+    overlap: Mutex<VecDeque<f32>>,
+}
+
+impl SeedStats {
+    /// Record one plan: its best cosine, the Jaccard overlap of its first `SEED_TOP_K`
+    /// ids with the fixed seeds, and whether it was (or would have been) below the floor.
+    pub fn record(&self, best_cos: f32, overlap: f32, fell_back: bool) {
+        self.walks.fetch_add(1, Ordering::Relaxed);
+        if fell_back {
+            self.fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+        for (ring, value) in [(&self.best_cos, best_cos), (&self.overlap, overlap)] {
+            let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+            ring.push_back(value);
+            while ring.len() > SEED_STATS_RING {
+                ring.pop_front();
+            }
+        }
+    }
+
+    pub fn to_json(&self, mode: SeedMode) -> serde_json::Value {
+        let median = |ring: &Mutex<VecDeque<f32>>| -> serde_json::Value {
+            let mut values: Vec<f32> = ring.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+            if values.is_empty() {
+                return serde_json::Value::Null;
+            }
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            serde_json::json!(values[values.len() / 2])
+        };
+        serde_json::json!({
+            "mode": mode.as_str(),
+            "walks": self.walks.load(Ordering::Relaxed),
+            "fallbacks": self.fallbacks.load(Ordering::Relaxed),
+            "best_cos_p50": median(&self.best_cos),
+            "overlap_with_fixed_p50": median(&self.overlap),
+        })
+    }
+}
+
+fn process_stats() -> &'static SeedStats {
+    static STATS: OnceLock<SeedStats> = OnceLock::new();
+    STATS.get_or_init(SeedStats::default)
+}
+
+/// Record a plan in the process-wide statistics. `Fixed` records nothing.
+pub fn record_seed_observation(mode: SeedMode, best_cos: f32, overlap: f32, fell_back: bool) {
+    if mode != SeedMode::Fixed {
+        process_stats().record(best_cos, overlap, fell_back);
+    }
+}
+
+/// The process-wide statistics as JSON, labelled with the configured mode.
+pub fn seed_stats_json() -> serde_json::Value {
+    process_stats().to_json(seed_mode())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +345,24 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
         assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn short_or_blank_text_is_no_cue() {
+        assert!(embed_cue("").await.is_none());
+        assert!(embed_cue("   ").await.is_none());
+        assert!(embed_cue("hi").await.is_none());
+    }
+
+    #[test]
+    fn seed_stats_report_medians_and_counts() {
+        // Uses a local SeedStats value, not the process-wide one, so tests do not interfere.
+        let s = SeedStats::default();
+        for (cos, ov, fb) in [(0.2, 0.0, true), (0.6, 0.2, false), (0.8, 0.4, false)] { s.record(cos, ov, fb); }
+        let j = s.to_json(SeedMode::Shadow);
+        assert_eq!((j["walks"].as_u64(), j["fallbacks"].as_u64()), (Some(3), Some(1)));
+        assert!((j["best_cos_p50"].as_f64().unwrap() - 0.6).abs() < 1e-6);
+        assert!((j["overlap_with_fixed_p50"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+        assert!(SeedStats::default().to_json(SeedMode::Shadow)["best_cos_p50"].is_null());
     }
 }

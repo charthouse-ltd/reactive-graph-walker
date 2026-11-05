@@ -154,3 +154,49 @@ async fn vector_arm_returns_candidates_by_cosine() -> anyhow::Result<()> {
     assert_eq!(out.primary_domain, "gamma");
     Ok(())
 }
+
+#[tokio::test]
+async fn shadow_mode_walks_as_fixed_and_records_the_plan() -> anyhow::Result<()> {
+    embedder()?;
+    let pool = fixture_pool("rgw_p1_shadow").await?;
+    let before = rgw::seeding::seed_stats_json()["walks"].as_u64().unwrap_or(0);
+    let o = WalkOptions { cue_embedding: Some(axis(1)), seed: Some(1), arm: None,
+                          seed_mode: Some(rgw::seeding::SeedMode::Shadow) };
+    let (out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), o).await;
+    assert_eq!(out.seed_mode, "shadow");
+    assert_eq!(results.iter().map(|r| r.path[0]).collect::<Vec<_>>(), vec![HUB, A1]);
+    // Other tests in this binary record too, so this is a lower bound.
+    assert!(rgw::seeding::seed_stats_json()["walks"].as_u64().unwrap() >= before + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_cue_means_a_fixed_walk_in_every_mode() -> anyhow::Result<()> {
+    embedder()?;
+    let pool = fixture_pool("rgw_p1_nocue").await?;
+    let o = WalkOptions { cue_embedding: None, seed: Some(1), arm: None, seed_mode: Some(rgw::seeding::SeedMode::Query) };
+    let (out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), o).await;
+    assert!(out.walked);
+    assert_eq!(results.iter().map(|r| r.path[0]).collect::<Vec<_>>(), vec![HUB, A1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wrong_dimension_cue_falls_back_to_a_fixed_walk() -> anyhow::Result<()> {
+    embedder()?;
+    let pool = fixture_pool("rgw_p1_baddim").await?;
+    let o = WalkOptions { cue_embedding: Some(vec![1.0, 0.0]), seed: Some(1), arm: None, seed_mode: Some(rgw::seeding::SeedMode::Query) };
+    let (out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), o).await;
+    assert!(out.walked);
+    assert_eq!(results[0].path[0], HUB);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ppr_arm_ranks_the_cue_cluster_without_walkers() -> anyhow::Result<()> {
+    let pool = fixture_pool("rgw_p1_ppr").await?;
+    let (out, results) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Ppr)).await;
+    assert!(results.is_empty() && out.walked);
+    assert!([B1, B2, B3, B4].contains(&out.ranked_nodes[0].0));
+    Ok(())
+}
