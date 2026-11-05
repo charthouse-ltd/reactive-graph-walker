@@ -28,7 +28,6 @@ mod speech;
 mod api;
 mod tension;
 mod seeding;
-mod evalkit;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
