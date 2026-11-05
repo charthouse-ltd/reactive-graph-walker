@@ -42,12 +42,21 @@ pub fn init() -> anyhow::Result<()> {
 /// Prepends "search_document:" prefix for pgvector compatibility
 /// (matches Julian's Python-embedded memory_vectors format).
 pub fn embed_text(text: &str) -> anyhow::Result<Vec<f32>> {
+    embed_text_traced(text, true).map(|(embedding, _)| embedding)
+}
+
+/// [`embed_text`], returning also whether the result came from the cache. With
+/// `use_cache = false` the cache is not read, so the call pays the real embedding cost;
+/// the evaluation harness relies on that to time each arm honestly.
+pub fn embed_text_traced(text: &str, use_cache: bool) -> anyhow::Result<(Vec<f32>, bool)> {
     // Reuse a cached embedding for identical text instead of recomputing.
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     let key = hasher.finish();
-    if let Some(cached) = EMBED_CACHE.get(&key) {
-        return Ok(cached.clone());
+    if use_cache
+        && let Some(cached) = EMBED_CACHE.get(&key)
+    {
+        return Ok((cached.clone(), true));
     }
 
     let mut lock = EMBEDDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -67,7 +76,7 @@ pub fn embed_text(text: &str) -> anyhow::Result<Vec<f32>> {
         EMBED_CACHE.clear(); // simple bounded reset; embeddings are cheap to rebuild
     }
     EMBED_CACHE.insert(key, embedding.clone());
-    Ok(embedding)
+    Ok((embedding, false))
 }
 
 /// Embed multiple texts at once (batch processing)

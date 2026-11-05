@@ -1962,6 +1962,12 @@ mod tests {
             total_ms: 180.0,
             hops_per_sec: 260.0,
             walker_context: String::new(),
+            walk_id: String::new(),
+            walked: true,
+            seed_mode: String::new(),
+            ranked_nodes: Vec::new(),
+            context_chains: Vec::new(),
+            telemetry: Default::default(),
         }
     }
 
@@ -1976,6 +1982,9 @@ mod tests {
                 surprises: 1,
                 dead_ends: 0,
                 edges_traversed: vec![10, 11],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
             WalkerResult {
                 bias: WalkerBias::Experience,
@@ -1986,6 +1995,9 @@ mod tests {
                 surprises: 2,
                 dead_ends: 1,
                 edges_traversed: vec![12],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
             WalkerResult {
                 bias: WalkerBias::Fear,
@@ -1996,6 +2008,9 @@ mod tests {
                 surprises: 0,
                 dead_ends: 0,
                 edges_traversed: vec![13],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
             WalkerResult {
                 bias: WalkerBias::Random,
@@ -2006,6 +2021,9 @@ mod tests {
                 surprises: 0,
                 dead_ends: 0,
                 edges_traversed: vec![14],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
         ]
     }
@@ -2069,6 +2087,9 @@ mod tests {
                 surprises: 0,
                 dead_ends: 5,  // Many dead ends
                 edges_traversed: vec![10],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
             WalkerResult {
                 bias: WalkerBias::Experience,
@@ -2079,6 +2100,9 @@ mod tests {
                 surprises: 1,  // Very few surprises
                 dead_ends: 4,
                 edges_traversed: vec![11],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
         ];
         let output = WalkOutput {
@@ -2185,6 +2209,9 @@ mod tests {
                 surprises: 12,
                 dead_ends: 0,
                 edges_traversed: vec![10, 11, 12, 13],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
         ];
         let output = WalkOutput {
@@ -2214,6 +2241,9 @@ mod tests {
                 surprises: 5,
                 dead_ends: 2,
                 edges_traversed: vec![1],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
         ];
         let output = WalkOutput { total_hops: 25, ..test_walk_output() };
@@ -2571,6 +2601,9 @@ mod tests {
                 surprises: 0,
                 dead_ends: 5, // High dead ends, low surprise
                 edges_traversed: vec![1],
+                depths: Vec::new(),
+                segment_starts: Vec::new(),
+                step_stats: Default::default(),
             },
         ];
         let output = WalkOutput { total_hops: 10, ..test_walk_output() };

@@ -73,6 +73,12 @@ impl EdgeCache {
         Vec::new()
     }
 
+    /// Whether this node's edges have been loaded. `try_get` returns an empty list both
+    /// for a node with no edges and for a node that was never loaded; this tells them apart.
+    pub fn is_loaded(&self, node_id: i32) -> bool {
+        self.loaded_nodes.contains_key(&node_id)
+    }
+
     /// Get a node's domain synchronously from cache.
     pub fn get_domain(&self, node_id: i32) -> Option<String> {
         self.node_domains.get(&node_id).map(|d| d.clone())

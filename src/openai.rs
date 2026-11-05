@@ -182,12 +182,21 @@ pub async fn chat_completions(
         }
     }
 
-    let (walk_output, _walker_results) = walker::walk_parallel(
+    // The last user message is the cue: under RGW_SEED_MODE=query the walk starts from it.
+    // The rollback mode does not embed.
+    let cue_embedding = if walker::cue_needed(crate::seeding::seed_mode(), None) {
+        crate::seeding::embed_cue(&stimulus, false).await
+    } else {
+        None
+    };
+    let walk_opts = walker::WalkOptions { cue_embedding, ..Default::default() };
+    let (walk_output, _walker_results) = walker::walk_parallel_with(
         &state.pool,
         &emotion,
         req.rgw_walkers,
         req.rgw_steps,
         &self_model,
+        walk_opts,
     )
     .await;
 
