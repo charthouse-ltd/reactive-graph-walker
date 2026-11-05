@@ -166,6 +166,17 @@ pub fn new_walk_id() -> String {
     format!("{:016x}{:016x}", rng.random::<u64>(), rng.random::<u64>())
 }
 
+/// The `SEED_TOP_K + SEED_WIDE_M` nodes nearest to the cue, with their degrees.
+pub async fn candidates(pool: &sqlx::PgPool, cue_embedding: &[f32]) -> Result<Vec<Candidate>, sqlx::Error> {
+    let near = crate::db::similar_node_ids(pool, cue_embedding, (SEED_TOP_K + SEED_WIDE_M) as i64).await?;
+    let ids: Vec<i32> = near.iter().map(|n| n.0).collect();
+    let degrees = crate::db::node_degrees(pool, &ids).await?;
+    Ok(near
+        .into_iter()
+        .map(|(id, cos)| Candidate { id, cos, degree: degrees.get(&id).copied().unwrap_or(0) })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

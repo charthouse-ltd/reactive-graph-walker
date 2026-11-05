@@ -75,7 +75,7 @@ pub async fn edges_from(pool: &PgPool, node_id: i32) -> Result<Vec<MemoryEdge>, 
          COALESCE(traversal_count, 0) as traversal_count \
          FROM memory_edges \
          WHERE source_id = $1 OR target_id = $1 \
-         ORDER BY weight DESC \
+         ORDER BY weight DESC, id ASC \
          LIMIT 20"
     )
     .bind(node_id)
@@ -196,6 +196,62 @@ pub async fn nearest_node_ids(pool: &PgPool, embedding: &[f32], limit: i64, max_
     .bind(max_distance)
     .bind(limit)
     .fetch_all(pool)
+    .await
+}
+
+/// `(id, cosine similarity)` of the nodes nearest to `embedding`, most similar first,
+/// ties by id. Selects only `id`, so it works on the backends' schema and the test
+/// schema alike. Errors (for example on a dimension mismatch) are returned, not hidden.
+pub async fn similar_node_ids(pool: &PgPool, embedding: &[f32], limit: i64) -> Result<Vec<(i32, f32)>, sqlx::Error> {
+    let emb_str = format!("[{}]", embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+    let rows = sqlx::query(
+        "SELECT id, (1.0 - (embedding <=> $1::vector))::real AS similarity \
+         FROM memory_vectors \
+         WHERE embedding IS NOT NULL \
+         ORDER BY embedding <=> $1::vector, id \
+         LIMIT $2",
+    )
+    .bind(&emb_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| (r.get("id"), r.get("similarity"))).collect())
+}
+
+/// Number of edges touching each id (0 for an id with none, or one that does not exist).
+pub async fn node_degrees(pool: &PgPool, ids: &[i32]) -> Result<std::collections::HashMap<i32, u32>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows = sqlx::query(
+        "SELECT n.id AS id, count(e.id) AS degree \
+         FROM unnest($1::int4[]) AS n(id) \
+         LEFT JOIN memory_edges e ON e.source_id = n.id OR e.target_id = n.id \
+         GROUP BY n.id",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let degree: i64 = r.get("degree");
+            (r.get::<i32, _>("id"), degree.max(0) as u32)
+        })
+        .collect())
+}
+
+/// Degree at percentile `pct` (0..1) over all nodes that have an edge; 0 for an empty graph.
+pub async fn degree_at_percentile(pool: &PgPool, pct: f64) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(percentile_disc($1) WITHIN GROUP (ORDER BY d), 0)::int8 \
+         FROM (SELECT count(*) AS d \
+               FROM (SELECT source_id AS id FROM memory_edges \
+                     UNION ALL SELECT target_id FROM memory_edges) x \
+               GROUP BY id) y",
+    )
+    .bind(pct.clamp(0.0, 1.0))
+    .fetch_one(pool)
     .await
 }
 

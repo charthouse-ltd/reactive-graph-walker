@@ -2,6 +2,8 @@
 //! tests. Each test binary that needs a seeded graph does `mod common;`.
 #![allow(dead_code)]
 
+pub mod fixture;
+
 use sqlx::PgPool;
 
 struct SeedNode {
