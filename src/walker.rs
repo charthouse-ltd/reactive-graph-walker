@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use sqlx::PgPool;
 
@@ -20,6 +21,109 @@ use crate::core::{self, AgreementMetric, Signal, SelfModel, safe_truncate};
 use crate::db;
 use crate::edge_cache::EdgeCache;
 use crate::graph::*;
+
+/// An evaluation arm, selectable per request when `RGW_EVAL=1` (spec §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalArm {
+    /// Today's seeds.
+    Fixed,
+    /// Query-derived seeds and the Stage 1 walk rules.
+    Query,
+    /// As `Query`, with linear specificity.
+    QueryLinear,
+    /// No walk: the nodes nearest to the query.
+    Vector,
+    /// Query-derived seeds, one Personalized PageRank push in place of the walkers.
+    Ppr,
+    /// As `Query`, without one walker profile.
+    Drop(WalkerBias),
+}
+
+impl EvalArm {
+    /// `fixed` | `query` | `query:linear` | `vector` | `ppr` | `drop:<bias>`, lowercase only.
+    pub fn parse(s: &str) -> Option<EvalArm> {
+        match s {
+            "fixed" => Some(EvalArm::Fixed),
+            "query" => Some(EvalArm::Query),
+            "query:linear" => Some(EvalArm::QueryLinear),
+            "vector" => Some(EvalArm::Vector),
+            "ppr" => Some(EvalArm::Ppr),
+            _ => s.strip_prefix("drop:").and_then(WalkerBias::from_name).map(EvalArm::Drop),
+        }
+    }
+}
+
+/// Per-walk options. The default is today's walk: no cue, mode from the environment.
+#[derive(Debug, Clone, Default)]
+pub struct WalkOptions {
+    /// The embedded query. `None` means a fixed-seed walk in every mode.
+    pub cue_embedding: Option<Vec<f32>>,
+    /// `Some` makes the walk deterministic with this base seed. `None` is deterministic
+    /// only under `RGW_DETERMINISTIC=1` (base seed 0).
+    pub seed: Option<u64>,
+    /// Honoured by the caller only under `RGW_EVAL=1`.
+    pub arm: Option<EvalArm>,
+    /// `None` uses `seeding::seed_mode()`.
+    pub seed_mode: Option<crate::seeding::SeedMode>,
+}
+
+/// RNG seed of walker `walker_index` under base seed `base`.
+pub fn walker_rng_seed(base: u64, walker_index: usize) -> u64 {
+    base ^ (walker_index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Divide each score by the number of candidates that share its edge type, so that a
+/// node with fifty `similar` edges and one `causes` edge gives each type the same mass.
+pub fn fan_divide(scored: &mut [(&str, f32)]) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (ty, _) in scored.iter() {
+        *counts.entry(*ty).or_insert(0) += 1;
+    }
+    for (ty, score) in scored.iter_mut() {
+        *score /= counts[*ty] as f32;
+    }
+}
+
+/// Which walk a request gets (decided once per walk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkKind {
+    /// Today's seeds, today's rules.
+    Fixed,
+    /// The query seed plan and the Stage 1 walk rules.
+    Planned(crate::seeding::Specificity),
+    /// No walk: nearest nodes only.
+    Vector,
+    /// The query seed plan, one PPR push in place of the walkers.
+    Ppr,
+}
+
+/// The arm, when given, overrides the mode; without a cue every walk is `Fixed`.
+fn decide_walk(arm: Option<EvalArm>, mode: crate::seeding::SeedMode, has_cue: bool) -> WalkKind {
+    use crate::seeding::{SeedMode, Specificity};
+    if !has_cue {
+        return WalkKind::Fixed;
+    }
+    match arm {
+        Some(EvalArm::Fixed) => WalkKind::Fixed,
+        Some(EvalArm::Query) | Some(EvalArm::Drop(_)) => WalkKind::Planned(Specificity::Log),
+        Some(EvalArm::QueryLinear) => WalkKind::Planned(Specificity::Linear),
+        Some(EvalArm::Vector) => WalkKind::Vector,
+        Some(EvalArm::Ppr) => WalkKind::Ppr,
+        None => match mode {
+            SeedMode::Query => WalkKind::Planned(Specificity::Log),
+            SeedMode::Fixed | SeedMode::Shadow => WalkKind::Fixed,
+        },
+    }
+}
+
+/// Start a new segment at a seed drawn from the plan; returns the seed.
+fn restart_at_seed(result: &mut WalkerResult, plan: &crate::seeding::SeedPlan, rng: &mut StdRng) -> i32 {
+    let seed = crate::seeding::draw_seed(plan, rng);
+    result.segment_starts.push(result.path.len());
+    result.path.push(seed);
+    result.depths.push(0);
+    seed
+}
 
 /// Run a single walker through the graph.
 /// Now accepts a shared WalkerCollective for inter-walker stigmergy.
@@ -35,6 +139,8 @@ pub fn walk_single(
     collective: &Arc<Mutex<WalkerCollective>>,
     learned_bias: Option<&crate::graph::LearnedBias>,
     knowledge_domains: &std::collections::HashSet<String>,
+    plan: Option<&crate::seeding::SeedPlan>,
+    rng_seed: Option<u64>,
 ) -> WalkerResult {
     let mut result = WalkerResult {
         bias,
@@ -45,6 +151,9 @@ pub fn walk_single(
         surprises: 0,
         dead_ends: 0,
         edges_traversed: Vec::new(),
+        depths: vec![0],
+        segment_starts: vec![0],
+        step_stats: Default::default(),
     };
 
     // Signal the self-model: walk is starting
@@ -53,13 +162,56 @@ pub fn walk_single(
     core::process(start_signal, self_model);
 
     let mut current_id = seed_id;
-    let mut rng = rand::rng();
+    // One RNG type for both paths: seeded in deterministic mode, from the thread RNG otherwise.
+    let mut rng: StdRng = match rng_seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_rng(&mut rand::rng()),
+    };
     let mut prev_domain = String::new();
+    // Hops since the last (re)start.
+    let mut depth: u8 = 0;
 
     for step in 0..steps {
+        // Stage 1 rule: before each step after the first, restart at a seed with
+        // probability RESTART_PROB. The restart uses up the step.
+        if let Some(p) = plan
+            && step > 0
+            && rng.random::<f32>() < crate::seeding::RESTART_PROB
+        {
+            current_id = restart_at_seed(&mut result, p, &mut rng);
+            prev_domain.clear();
+            depth = 0;
+            continue;
+        }
+
         // Get edges from current node — sync cache read (lock-free)
-        let edges = cache.try_get(current_id);
+        let mut edges = cache.try_get(current_id);
+        if rng_seed.is_some() {
+            // Deterministic mode: candidate order must not depend on the database.
+            edges.sort_by_key(|e| e.id);
+        }
         if edges.is_empty() {
+            let cache_miss = !cache.is_loaded(current_id);
+            if cache_miss {
+                result.step_stats.cache_miss_stops += 1;
+            }
+            if let Some(p) = plan {
+                // Under a seed plan an unloaded node is the edge of the preloaded
+                // neighbourhood, not a dead end: no dead-end count, signal or mark.
+                if !cache_miss {
+                    result.dead_ends += 1;
+                    if let Ok(mut c) = collective.try_lock() {
+                        c.dead_end_nodes.insert(current_id);
+                    }
+                    let signal = Signal::new("dead_end", &format!("No edges from node {}", current_id))
+                        .with_intensity(0.2);
+                    core::process(signal, self_model);
+                }
+                current_id = restart_at_seed(&mut result, p, &mut rng);
+                prev_domain.clear();
+                depth = 0;
+                continue;
+            }
             result.dead_ends += 1;
             // Write dead end to collective so other walkers avoid this node
             if let Ok(mut c) = collective.try_lock() {
@@ -75,7 +227,12 @@ pub fn walk_single(
         // Score each edge — mode determines whether emotion participates
         // In Autonomous mode: full context scoring (collective + self-model)
         // In Compliant mode: pure weight-based, no emotional/collective influence
-        let scored: Vec<(&db::MemoryEdge, f32)> = if self_model.mode == core::CognitiveMode::Compliant {
+        // Telemetry: how many candidates are within 0.1 of the heaviest one.
+        result.step_stats.steps += 1;
+        let max_weight = edges.iter().map(|e| e.weight).fold(0.0f32, f32::max);
+        result.step_stats.branching_sum += edges.iter().filter(|e| e.weight >= 0.1 * max_weight).count() as u32;
+
+        let mut scored: Vec<(&db::MemoryEdge, f32)> = if self_model.mode == core::CognitiveMode::Compliant {
             // Compliant: pure weight-based scoring, no emotional/collective influence
             edges.iter().map(|e| {
                 let score = bias.score_edge_compliant(
@@ -168,10 +325,25 @@ pub fn walk_single(
             }).collect()
         };
 
+        // Stage 1 rule: divide each score by the number of candidates of the same edge type.
+        if plan.is_some() {
+            let mut typed: Vec<(&str, f32)> = scored.iter().map(|(e, s)| (e.edge_type.as_str(), *s)).collect();
+            fan_divide(&mut typed);
+            for (slot, (_, s)) in scored.iter_mut().zip(typed) {
+                slot.1 = s;
+            }
+        }
+
         // Weighted random selection
         let total: f32 = scored.iter().map(|(_, s)| s).sum();
         if total < f32::EPSILON {
             result.dead_ends += 1;
+            if let Some(p) = plan {
+                current_id = restart_at_seed(&mut result, p, &mut rng);
+                prev_domain.clear();
+                depth = 0;
+                continue;
+            }
             break;
         }
 
@@ -194,7 +366,9 @@ pub fn walk_single(
         };
 
         // Record traversal
+        depth = depth.saturating_add(1);
         result.path.push(next_id);
+        result.depths.push(depth);
         result.edge_types_used.push(edge.edge_type.clone());
         result.total_weight += edge.weight;
         result.edges_traversed.push(edge.id);
@@ -278,10 +452,23 @@ pub fn walk_single(
 /// Returns (WalkOutput, per-walker results) for post-walk analysis.
 pub async fn walk_parallel(
     pool: &PgPool,
+    emotion: &EmotionalState,
+    n_walkers: usize,
+    steps: usize,
+    self_model: &std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
+) -> (WalkOutput, Vec<WalkerResult>) {
+    walk_parallel_with(pool, emotion, n_walkers, steps, self_model, WalkOptions::default()).await
+}
+
+/// [`walk_parallel`] with per-walk options: the embedded query, a deterministic seed,
+/// an eval arm, a seed mode. With default options this is exactly `walk_parallel`.
+pub async fn walk_parallel_with(
+    pool: &PgPool,
     _emotion: &EmotionalState,
     n_walkers: usize,
     steps: usize,
     self_model: &std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
+    opts: WalkOptions,
 ) -> (WalkOutput, Vec<WalkerResult>) {
     let start = Instant::now();
 
@@ -293,10 +480,32 @@ pub async fn walk_parallel(
         core::process(signal, &mut sm);
     }
 
+    let deterministic = opts.seed.is_some() || crate::seeding::deterministic_env();
+    let base_seed = opts.seed.unwrap_or(0);
+    let seed_mode = opts.seed_mode.unwrap_or_else(crate::seeding::seed_mode);
+    let kind = decide_walk(opts.arm, seed_mode, opts.cue_embedding.is_some());
+
+    // The query seed plan, when this walk is seeded from the cue. A failed lookup
+    // (for example a cue of the wrong dimension) falls back to today's seeds.
+    let plan: Option<crate::seeding::SeedPlan> = match (kind, opts.cue_embedding.as_deref()) {
+        (WalkKind::Planned(spec), Some(cue)) => match crate::seeding::candidates(pool, cue).await {
+            Ok(cands) => {
+                let p = crate::seeding::plan_seeds(&cands, spec);
+                (!p.seeds.is_empty()).then_some(p)
+            }
+            Err(e) => {
+                tracing::warn!("[seeding] candidate lookup failed, walking with fixed seeds: {}", e);
+                None
+            }
+        },
+        _ => None,
+    };
+
     // Get seed nodes
-    let seeds = db::seed_nodes(pool, (n_walkers * 2) as i32)
-        .await
-        .unwrap_or_default();
+    let seeds: Vec<i32> = match &plan {
+        Some(p) => p.seeds.iter().map(|s| s.0).collect(),
+        None => db::seed_nodes(pool, (n_walkers * 2) as i32).await.unwrap_or_default(),
+    };
 
     if seeds.is_empty() {
         return (empty_output(), Vec::new());
@@ -317,17 +526,43 @@ pub async fn walk_parallel(
             &[WalkerBias::Experience, WalkerBias::Analytical]
         }
     };
-    let configs: Vec<(i32, WalkerBias)> = (0..n_walkers)
+    // Eval arm `drop:<bias>`: that slot is skipped. With learned profiles in use the named
+    // bias is only a label, so the slot's learned profile is skipped with it.
+    let dropped = match opts.arm {
+        Some(EvalArm::Drop(b)) if plan.is_some() => Some(b),
+        _ => None,
+    };
+    let mut slots: Vec<usize> = (0..biases.len()).filter(|&s| Some(biases[s]) != dropped).collect();
+    if slots.is_empty() {
+        slots = (0..biases.len()).collect();
+    }
+    // (start node, bias label, learned-profile offset)
+    let configs: Vec<(i32, WalkerBias, usize)> = (0..n_walkers)
         .map(|i| {
-            let seed = seeds[i % seeds.len()];
-            let bias = biases[i % biases.len()];
-            (seed, bias)
+            let slot = slots[i % slots.len()];
+            let seed = match &plan {
+                Some(p) if deterministic => crate::seeding::start_seed(p, i),
+                Some(p) => crate::seeding::draw_seed(p, &mut rand::rng()),
+                None => seeds[i % seeds.len()],
+            };
+            let profile = if dropped.is_some() { slot } else { i };
+            (seed, biases[slot], profile)
         })
         .collect();
 
     // ── Edge cache: preload seed neighborhoods for fast walks ──
     let cache = EdgeCache::new(pool.clone());
-    let _ = cache.preload_radius(&seeds).await;
+    match &plan {
+        // Radius 1 around the strongest seeds; the wide seeds get their own edges only.
+        Some(_) => {
+            let k = seeds.len().min(crate::seeding::SEED_TOP_K);
+            let _ = cache.preload_radius(&seeds[..k]).await;
+            let _ = cache.preload_batch(&seeds[k..]).await;
+        }
+        None => {
+            let _ = cache.preload_radius(&seeds).await;
+        }
+    }
 
     // Clone self-model per walker (parallel perspectives, integrate after)
     // Like the brain: process in parallel, integrate in global workspace
@@ -361,14 +596,11 @@ pub async fn walk_parallel(
         let collective = Arc::clone(&collective);
         let knowledge_domains = knowledge_domains.clone();
         tokio::task::spawn_blocking(move || {
-        let results: Vec<(WalkerResult, SelfModel)> = configs
-            .par_iter()
-            .enumerate()
-            .map(|(i, (seed, bias))| {
+            let run = |(i, (seed, bias, profile)): (usize, &(i32, WalkerBias, usize))| {
                 let mut sm = base_sm.clone();  // Each walker gets its own copy
                 let collective = Arc::clone(&collective);
                 let learned = if learned_len > 0 {
-                    base_sm.learned_biases.get((learned_rotation + i) % learned_len)
+                    base_sm.learned_biases.get((learned_rotation + profile) % learned_len)
                 } else {
                     None
                 };
@@ -376,10 +608,17 @@ pub async fn walk_parallel(
                     valence: sm.valence,
                     arousal: sm.arousal,
                     energy: sm.energy,
-                }, steps, &mut sm, &collective, learned, &knowledge_domains);
+                }, steps, &mut sm, &collective, learned, &knowledge_domains,
+                    plan.as_ref(), deterministic.then(|| walker_rng_seed(base_seed, i)));
                 (result, sm)
-            })
-            .collect();
+            };
+            // Deterministic mode: walkers run one after another in index order, so the
+            // shared table is order-deterministic too.
+            let results: Vec<(WalkerResult, SelfModel)> = if deterministic {
+                configs.iter().enumerate().map(run).collect()
+            } else {
+                configs.par_iter().enumerate().map(run).collect()
+            };
             results
         })
         .await
@@ -712,7 +951,7 @@ fn compute_resonance(results: &[WalkerResult]) -> f32 {
     let per_walker: Vec<f32> = results
         .iter()
         .filter_map(|r| {
-            let hops = r.path.len().saturating_sub(1);
+            let hops = r.hops();
             (hops > 0).then(|| r.total_weight / hops as f32)
         })
         .collect();
@@ -1298,6 +1537,9 @@ mod tests {
             surprises: 0,
             dead_ends: 0,
             edges_traversed: Vec::new(),
+            depths: Vec::new(),
+            segment_starts: Vec::new(),
+            step_stats: Default::default(),
         }
     }
 
@@ -1311,6 +1553,9 @@ mod tests {
             surprises: 0,
             dead_ends: 0,
             edges_traversed: Vec::new(),
+            depths: Vec::new(),
+            segment_starts: Vec::new(),
+            step_stats: Default::default(),
         }
     }
 
@@ -1447,5 +1692,43 @@ mod tests {
             effective_agreement(AgreementMetric::Domain, v.agreement, dom), v.novelty, &results);
         assert_eq!(domain, "express", "Domain: all walkers converge on 'markets'");
         assert_ne!(legacy, "express", "Legacy: structural zero never expresses");
+    }
+
+    #[test]
+    fn eval_arm_parses() {
+        assert_eq!(EvalArm::parse("fixed"), Some(EvalArm::Fixed));
+        assert_eq!(EvalArm::parse("ppr"), Some(EvalArm::Ppr));
+        assert_eq!(EvalArm::parse("query:linear"), Some(EvalArm::QueryLinear));
+        assert_eq!(EvalArm::parse("drop:contrarian"), Some(EvalArm::Drop(WalkerBias::Contrarian)));
+        assert_eq!(EvalArm::parse("drop:nobody"), None);
+        assert_eq!(EvalArm::parse("QUERY"), None, "arms are lowercase only");
+    }
+
+    #[test]
+    fn fan_divide_splits_by_edge_type() {
+        let mut s = vec![("similar", 0.6), ("similar", 0.3), ("causes", 0.5)];
+        fan_divide(&mut s);
+        assert_eq!(s, vec![("similar", 0.3), ("similar", 0.15), ("causes", 0.5)]);
+    }
+
+    #[test]
+    fn walker_rng_seeds_differ_per_walker_and_repeat_per_base() {
+        assert_ne!(walker_rng_seed(1, 0), walker_rng_seed(1, 1));
+        assert_ne!(walker_rng_seed(1, 0), walker_rng_seed(2, 0));
+        assert_eq!(walker_rng_seed(5, 3), walker_rng_seed(5, 3));
+    }
+
+    #[test]
+    fn decide_walk_follows_the_arm_then_the_mode_and_needs_a_cue() {
+        use crate::seeding::{SeedMode, Specificity};
+        assert_eq!(decide_walk(Some(EvalArm::Query), SeedMode::Fixed, false), WalkKind::Fixed, "no cue, no plan");
+        assert_eq!(decide_walk(None, SeedMode::Query, true), WalkKind::Planned(Specificity::Log));
+        assert_eq!(decide_walk(None, SeedMode::Shadow, true), WalkKind::Fixed);
+        assert_eq!(decide_walk(None, SeedMode::Fixed, true), WalkKind::Fixed);
+        assert_eq!(decide_walk(Some(EvalArm::Fixed), SeedMode::Query, true), WalkKind::Fixed, "the arm overrides the mode");
+        assert_eq!(decide_walk(Some(EvalArm::QueryLinear), SeedMode::Fixed, true), WalkKind::Planned(Specificity::Linear));
+        assert_eq!(decide_walk(Some(EvalArm::Drop(WalkerBias::Fear)), SeedMode::Fixed, true), WalkKind::Planned(Specificity::Log));
+        assert_eq!(decide_walk(Some(EvalArm::Vector), SeedMode::Fixed, true), WalkKind::Vector);
+        assert_eq!(decide_walk(Some(EvalArm::Ppr), SeedMode::Fixed, true), WalkKind::Ppr);
     }
 }

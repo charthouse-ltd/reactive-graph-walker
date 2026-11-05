@@ -87,6 +87,19 @@ impl WalkerBias {
     /// All available biases. Previously this omitted Analytical and Contrarian,
     /// leaving Contrarian permanently unreachable (it appears in no other set)
     /// and its "contradicts"-seeking scoring dead. Now genuinely all six.
+    /// The bias named as serde names it (lowercase), or `None`.
+    pub fn from_name(name: &str) -> Option<WalkerBias> {
+        match name {
+            "fear" => Some(WalkerBias::Fear),
+            "curiosity" => Some(WalkerBias::Curiosity),
+            "experience" => Some(WalkerBias::Experience),
+            "random" => Some(WalkerBias::Random),
+            "analytical" => Some(WalkerBias::Analytical),
+            "contrarian" => Some(WalkerBias::Contrarian),
+            _ => None,
+        }
+    }
+
     pub fn all() -> &'static [WalkerBias] {
         &[
             WalkerBias::Fear,
@@ -464,7 +477,7 @@ pub fn behavioural_niche(sc: &ProfileFitness) -> Option<(u8, u8)> {
 /// (novelty = distinct-domain breadth, surprise_kept = cross-domain leap rate, dead_end_rate).
 /// `repetition` is session-level and supplied separately by the caller.
 pub fn fitness_inputs(result: &WalkerResult) -> (f32, f32, f32) {
-    let hops = result.path.len().saturating_sub(1).max(1) as f32;
+    let hops = result.hops().max(1) as f32;
     let mut domains = std::collections::HashSet::new();
     for d in &result.domains_visited {
         if !d.is_empty() {
@@ -679,6 +692,53 @@ pub struct WalkerResult {
     pub surprises: usize,   // cross-domain transitions
     pub dead_ends: usize,
     pub edges_traversed: Vec<i32>,  // edge IDs for batch strengthening
+    /// Depth of `path[i]` since the last (re)start. Empty in results built without it.
+    pub depths: Vec<u8>,
+    /// Indices into `path` where a segment starts. Empty means one segment starting at 0.
+    pub segment_starts: Vec<usize>,
+    pub step_stats: StepStats,
+}
+
+/// Per-walker step counters behind the walk telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct StepStats {
+    /// Sum over steps of the candidate edges within 0.1 of the heaviest candidate.
+    pub branching_sum: u32,
+    pub steps: u32,
+    /// Steps that ended on a node whose edges were not in the cache.
+    pub cache_miss_stops: u32,
+}
+
+impl WalkerResult {
+    /// Edges traversed: nodes minus segments. A restart adds a node without an edge,
+    /// so `path.len() - 1` over-counts once a walk has restarted.
+    pub fn hops(&self) -> usize {
+        self.path.len().saturating_sub(self.segment_starts.len().max(1))
+    }
+
+    /// Depth of `path[i]` since the last (re)start; its position when no depths were recorded.
+    pub fn depth_at(&self, i: usize) -> u8 {
+        self.depths.get(i).copied().unwrap_or(i.min(u8::MAX as usize) as u8)
+    }
+
+    /// `path` split at `segment_starts`.
+    pub fn segments(&self) -> Vec<&[i32]> {
+        if self.path.is_empty() {
+            return Vec::new();
+        }
+        let mut starts: Vec<usize> = self.segment_starts.iter().copied().filter(|&s| s < self.path.len()).collect();
+        if starts.first() != Some(&0) {
+            starts.insert(0, 0);
+        }
+        let mut out = Vec::with_capacity(starts.len());
+        for (k, &s) in starts.iter().enumerate() {
+            let end = starts.get(k + 1).copied().unwrap_or(self.path.len());
+            if end > s {
+                out.push(&self.path[s..end]);
+            }
+        }
+        out
+    }
 }
 
 /// Aggregated output of all parallel walkers
@@ -801,6 +861,9 @@ mod tests {
             surprises: 1,
             dead_ends: 1,
             edges_traversed: vec![],
+            depths: Vec::new(),
+            segment_starts: Vec::new(),
+            step_stats: Default::default(),
         };
         let (novelty, surprise_kept, dead_end_rate) = fitness_inputs(&r);
         assert!((novelty - 2.0 / 3.0).abs() < 1e-6, "2 domains / 3 hops");
@@ -917,5 +980,36 @@ mod tests {
             pf.record(n, s, d, r, appr, &w);
             assert!((pf.fitness_mean - walk_intrinsic(&w, n, s, d, r)).abs() < 1e-6);
         }
+    }
+
+    /// A result as older code builds it: no depths, no segment starts.
+    fn legacy_result(path: Vec<i32>) -> WalkerResult {
+        let hops = path.len().saturating_sub(1);
+        WalkerResult {
+            bias: WalkerBias::Curiosity,
+            path,
+            domains_visited: vec![],
+            edge_types_used: vec![],
+            total_weight: 0.0,
+            surprises: 0,
+            dead_ends: 0,
+            edges_traversed: (0..hops as i32).collect(),
+            depths: vec![],
+            segment_starts: vec![],
+            step_stats: StepStats::default(),
+        }
+    }
+
+    #[test]
+    fn hops_depths_and_segments_survive_a_restart() {
+        let r = WalkerResult {
+            path: vec![10, 11, 12, 20, 21], edges_traversed: vec![1, 2, 3],
+            depths: vec![0, 1, 2, 0, 1], segment_starts: vec![0, 3], ..legacy_result(vec![])
+        };
+        assert_eq!(r.hops(), 3);
+        assert_eq!(r.depth_at(3), 0);
+        assert_eq!(r.segments(), vec![&[10, 11, 12][..], &[20, 21][..]]);
+        let legacy = legacy_result(vec![1, 2, 3]);
+        assert_eq!((legacy.depth_at(2), legacy.segments().len()), (2, 1));
     }
 }

@@ -570,6 +570,7 @@ impl Diverger {
                                 &cache_walk, node_id,
                                 WalkerBias::all()[node_id as usize % WalkerBias::all().len()],
                                 &emo, steps, &mut walked, &collective, None, &kd,
+                                None, None,
                             );
                             (result, base, walked)
                         })
