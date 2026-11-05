@@ -75,7 +75,7 @@ pub async fn edges_from(pool: &PgPool, node_id: i32) -> Result<Vec<MemoryEdge>, 
          COALESCE(traversal_count, 0) as traversal_count \
          FROM memory_edges \
          WHERE source_id = $1 OR target_id = $1 \
-         ORDER BY weight DESC, id ASC \
+         ORDER BY weight DESC \
          LIMIT 20"
     )
     .bind(node_id)
@@ -199,8 +199,9 @@ pub async fn nearest_node_ids(pool: &PgPool, embedding: &[f32], limit: i64, max_
     .await
 }
 
-/// `(id, cosine similarity)` of the nodes nearest to `embedding`, most similar first,
-/// ties by id. Selects only `id`, so it works on the backends' schema and the test
+/// `(id, cosine similarity)` of the nodes nearest to `embedding`, most similar first.
+/// The ORDER BY is the bare distance, as in `find_similar_nodes`, so a vector index stays usable;
+/// `plan_seeds` breaks ties by id. Selects only `id`, so it works on the backends' schema and the test
 /// schema alike. Errors (for example on a dimension mismatch) are returned, not hidden.
 pub async fn similar_node_ids(pool: &PgPool, embedding: &[f32], limit: i64) -> Result<Vec<(i32, f32)>, sqlx::Error> {
     let emb_str = format!("[{}]", embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
@@ -208,7 +209,7 @@ pub async fn similar_node_ids(pool: &PgPool, embedding: &[f32], limit: i64) -> R
         "SELECT id, (1.0 - (embedding <=> $1::vector))::real AS similarity \
          FROM memory_vectors \
          WHERE embedding IS NOT NULL \
-         ORDER BY embedding <=> $1::vector, id \
+         ORDER BY embedding <=> $1::vector \
          LIMIT $2",
     )
     .bind(&emb_str)

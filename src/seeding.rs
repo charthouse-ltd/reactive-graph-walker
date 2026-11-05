@@ -181,15 +181,16 @@ pub async fn candidates(pool: &sqlx::PgPool, cue_embedding: &[f32]) -> Result<Ve
 
 /// Embed the query text as a walk cue. `None` for text shorter than `MIN_CUE_CHARS`
 /// after trimming, or when embedding fails (one WARN, without the text). The embedder
-/// is CPU-bound, so it runs on the blocking pool.
-pub async fn embed_cue(text: &str) -> Option<Vec<f32>> {
+/// is CPU-bound, so it runs on the blocking pool. `fresh` skips the embedding cache, so
+/// that an evaluation request pays the real embedding cost every time.
+pub async fn embed_cue(text: &str, fresh: bool) -> Option<Vec<f32>> {
     let trimmed = text.trim();
     if trimmed.chars().count() < MIN_CUE_CHARS {
         return None;
     }
     let owned = trimmed.to_string();
-    match tokio::task::spawn_blocking(move || crate::embed::embed_text(&owned)).await {
-        Ok(Ok(embedding)) => Some(embedding),
+    match tokio::task::spawn_blocking(move || crate::embed::embed_text_traced(&owned, !fresh)).await {
+        Ok(Ok((embedding, _))) => Some(embedding),
         Ok(Err(e)) => {
             tracing::warn!("[seeding] cue embedding failed, walking with fixed seeds: {}", e);
             None
@@ -349,9 +350,9 @@ mod tests {
 
     #[tokio::test]
     async fn short_or_blank_text_is_no_cue() {
-        assert!(embed_cue("").await.is_none());
-        assert!(embed_cue("   ").await.is_none());
-        assert!(embed_cue("hi").await.is_none());
+        assert!(embed_cue("", false).await.is_none());
+        assert!(embed_cue("   ", false).await.is_none());
+        assert!(embed_cue("hi", true).await.is_none());
     }
 
     #[test]

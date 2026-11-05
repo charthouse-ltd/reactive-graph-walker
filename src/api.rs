@@ -439,9 +439,16 @@ async fn walk(
     // never exposed to concurrent walks, the diverger or the dream loop.
     let self_model = request_self_model(&state.self_model, req.rgw_mode.as_deref()).await?;
 
-    // The query, embedded. Too short or not embeddable means a fixed-seed walk.
+    // The query, embedded. Too short or not embeddable means a fixed-seed walk. The rollback
+    // mode and the `fixed` arm do not embed at all; an eval arm embeds without the cache, so
+    // every arm of a harness run pays the real cost.
+    let cue_embedding = if walker::cue_needed(crate::seeding::seed_mode(), arm) {
+        crate::seeding::embed_cue(&req.stimulus, arm.is_some()).await
+    } else {
+        None
+    };
     let opts = walker::WalkOptions {
-        cue_embedding: crate::seeding::embed_cue(&req.stimulus).await,
+        cue_embedding,
         seed: req.seed,
         arm,
         seed_mode: None,
@@ -463,9 +470,9 @@ async fn walk(
 
     // ── Metacognitive Critic: run after walk session ──
     // Algorithmic diagnosis always runs. LLM escalates only when warranted.
-    // A query-decided result with no walkers (below the floor, or the vector and ppr arms)
-    // is not a walk session: the critic does not run and the self-model stays untouched.
-    if !(output.seed_mode == "query" && walker_results.is_empty()) {
+    // Not for an eval arm, and not when the query decided the result and no walker ran
+    // (below the floor): neither is a walk session.
+    if critic_applies(arm.is_some(), &output.seed_mode, walker_results.len()) {
         let mut sm = self_model.lock().await;
         let diagnosis = crate::metacog::run_critic(&output, &walker_results, &mut sm);
 
@@ -1253,6 +1260,14 @@ async fn ingest_signal_endpoint(
 /// Fixed errors never echo caller-controlled values or request bodies.
 pub(crate) type ModeError = (StatusCode, &'static str);
 
+/// Whether the metacognitive critic runs after this walk. It does not run for an eval arm
+/// (a measurement, which must neither change the self-model nor be timed with an LLM call),
+/// nor when the query decided the result and no walker ran. An empty fixed walk still
+/// reaches the critic, as before.
+pub(crate) fn critic_applies(arm_present: bool, seed_mode: &str, n_results: usize) -> bool {
+    !arm_present && !(seed_mode == "query" && n_results == 0)
+}
+
 /// The eval arm of a request: `Ok(None)` when none was sent. An arm sent without
 /// `RGW_EVAL=1`, or one that does not parse, is a 400.
 pub(crate) fn validate_arm(arm: Option<&str>, eval_enabled: bool) -> Result<Option<walker::EvalArm>, ModeError> {
@@ -1822,5 +1837,15 @@ mod mode_ceiling_tests {
         assert_eq!(validate_arm(Some("nonsense"), true).unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(validate_arm(Some("ppr"), true).unwrap(), Some(EvalArm::Ppr));
         assert_eq!(validate_arm(None, false).unwrap(), None);
+    }
+
+    #[test]
+    fn critic_runs_only_for_real_walk_sessions() {
+        assert!(critic_applies(false, "shadow", 2));
+        assert!(critic_applies(false, "query", 3));
+        assert!(critic_applies(false, "fixed", 0), "an empty fixed walk reaches the critic as before");
+        assert!(!critic_applies(false, "query", 0), "no walker ran: below the floor");
+        assert!(!critic_applies(true, "query", 4), "eval arms are measurements, not sessions");
+        assert!(!critic_applies(true, "fixed", 4));
     }
 }

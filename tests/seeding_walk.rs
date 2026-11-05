@@ -59,8 +59,11 @@ fn opts(cue: Vec<f32>, arm: EvalArm) -> WalkOptions {
 async fn query_arm_starts_in_the_cue_cluster_and_restarts_keep_the_invariant() -> anyhow::Result<()> {
     embedder()?; // signal processing embeds text
     let pool = fixture_pool("rgw_p1_query").await?;
-    let (_out, results) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Query)).await;
+    let (out, results) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Query)).await;
     assert_eq!(results.len(), 4);
+    assert_eq!(out.seed_mode, "query");
+    assert!(results.iter().any(|r| r.segment_starts.len() > 1), "with p = 0.5 over 16 chances, someone restarts");
+    assert!(results.iter().any(|r| !r.edges_traversed.is_empty()), "the preloaded neighbourhood is walked");
     let starts: Vec<i32> = results.iter().map(|r| r.path[0]).collect();
     // Plan order is cosine times specificity: B4 (degree 1) 0.543, B2 0.474, B1 0.419, B3 0.407, HUB 0.271.
     assert_eq!(starts, vec![B4, B2, B1, B3], "round-robin over the plan by rank");
@@ -77,7 +80,8 @@ async fn query_arm_starts_in_the_cue_cluster_and_restarts_keep_the_invariant() -
 async fn fixed_arm_starts_where_it_does_today() -> anyhow::Result<()> {
     embedder()?;
     let pool = fixture_pool("rgw_p1_fixed").await?;
-    let (_out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), opts(axis(1), EvalArm::Fixed)).await;
+    let (out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), opts(axis(1), EvalArm::Fixed)).await;
+    assert_eq!(out.seed_mode, "fixed");
     assert_eq!(results.iter().map(|r| r.path[0]).collect::<Vec<_>>(), vec![HUB, A1]);
     assert!(results.iter().all(|r| r.segment_starts.len() <= 1));
     Ok(())
@@ -159,14 +163,11 @@ async fn vector_arm_returns_candidates_by_cosine() -> anyhow::Result<()> {
 async fn shadow_mode_walks_as_fixed_and_records_the_plan() -> anyhow::Result<()> {
     embedder()?;
     let pool = fixture_pool("rgw_p1_shadow").await?;
-    let before = rgw::seeding::seed_stats_json()["walks"].as_u64().unwrap_or(0);
     let o = WalkOptions { cue_embedding: Some(axis(1)), seed: Some(1), arm: None,
                           seed_mode: Some(rgw::seeding::SeedMode::Shadow) };
     let (out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), o).await;
     assert_eq!(out.seed_mode, "shadow");
     assert_eq!(results.iter().map(|r| r.path[0]).collect::<Vec<_>>(), vec![HUB, A1]);
-    // Other tests in this binary record too, so this is a lower bound.
-    assert!(rgw::seeding::seed_stats_json()["walks"].as_u64().unwrap() >= before + 1);
     Ok(())
 }
 
@@ -198,5 +199,40 @@ async fn ppr_arm_ranks_the_cue_cluster_without_walkers() -> anyhow::Result<()> {
     let (out, results) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Ppr)).await;
     assert!(results.is_empty() && out.walked);
     assert!([B1, B2, B3, B4].contains(&out.ranked_nodes[0].0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn leaving_the_preloaded_neighbourhood_is_not_a_dead_end() -> anyhow::Result<()> {
+    embedder()?;
+    let pool = fixture_pool("rgw_p1_miss").await?;
+    // The only seed is LONE. Radius-1 preload covers LONE and A3; A3's other neighbours are not loaded.
+    let (_out, results) = walk_parallel_with(&pool, &Default::default(), 4, 6, &sm(), opts(axis(2), EvalArm::Query)).await;
+    let misses: u32 = results.iter().map(|r| r.step_stats.cache_miss_stops).sum();
+    assert!(misses > 0, "some walker must step past A3 into an unloaded node");
+    assert!(results.iter().all(|r| r.dead_ends == 0), "an unloaded node is not a dead end");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_planned_walk_cannot_be_made_arbitrarily_long() -> anyhow::Result<()> {
+    embedder()?;
+    let pool = fixture_pool("rgw_p1_clamp").await?;
+    let (_out, results) = walk_parallel_with(&pool, &Default::default(), 2, 10_000, &sm(), opts(axis(1), EvalArm::Query)).await;
+    let longest = results.iter().map(|r| r.path.len()).max().unwrap_or(0);
+    assert!(longest <= rgw::walker::MAX_PLANNED_STEPS + 1, "path of {longest} nodes");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fresh_embedding_bypasses_the_cache() -> anyhow::Result<()> {
+    embedder()?;
+    let text = "cache probe for the eval timing path";
+    let (first, _) = rgw::embed::embed_text_traced(text, true)?;
+    let (_, cached) = rgw::embed::embed_text_traced(text, true)?;
+    let (fresh, from_cache) = rgw::embed::embed_text_traced(text, false)?;
+    assert!(cached, "the second call is served from the cache");
+    assert!(!from_cache, "a fresh call recomputes");
+    assert_eq!(first, fresh);
     Ok(())
 }

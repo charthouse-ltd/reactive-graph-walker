@@ -47,6 +47,8 @@ const G1_LOOKUP_SLACK: f32 = 0.02;
 const G1_FALLBACK_SHARE: f32 = 0.70;
 const G1_ADDED_P95_MS: f64 = 50.0;
 const G1B_PPR_SLACK: f32 = 0.02;
+/// Recall is a ratio of small integers; an exact 10-point gain must not fail on f32 rounding.
+const GATE_EPS: f32 = 1e-6;
 
 /// Share of the gold nodes found in the first `k` ranked nodes; 0.0 when there is no gold.
 pub fn recall_at_k(ranked: &[i32], gold: &[i32], k: usize) -> f32 {
@@ -103,7 +105,7 @@ pub struct GateVerdict {
 /// 0.02 of `vector` on lookup; `query` falls back on at least 0.70 of unanswerable; the p95 of
 /// `query` exceeds that of `fixed` by at most 50 ms (overall). G1b: `ppr` beats `query` overall
 /// by at most 0.02. A missing arm or category makes the corresponding gate false with a reason.
-/// Thresholds are compared in f32 without tolerance; the tests stay clear of the exact boundary.
+/// Recall thresholds are compared with a 1e-6 tolerance, so a gain of exactly the threshold passes.
 pub fn judge_gates(summary: &BTreeMap<(String, String), CategorySummary>) -> GateVerdict {
     let get = |arm: &str, category: &str| summary.get(&(arm.to_string(), category.to_string()));
     let mut reasons = Vec::new();
@@ -112,7 +114,7 @@ pub fn judge_gates(summary: &BTreeMap<(String, String), CategorySummary>) -> Gat
 
     match (get("query", "multi_hop"), get("fixed", "multi_hop")) {
         (Some(q), Some(f)) => {
-            if q.recall_at_10 - f.recall_at_10 < G1_MULTI_HOP_GAIN {
+            if q.recall_at_10 - f.recall_at_10 < G1_MULTI_HOP_GAIN - GATE_EPS {
                 g1 = false;
                 reasons.push(format!(
                     "G1: query multi_hop recall {:.3} is not {:.2} above fixed {:.3}",
@@ -127,7 +129,7 @@ pub fn judge_gates(summary: &BTreeMap<(String, String), CategorySummary>) -> Gat
     }
     match (get("query", "lookup"), get("vector", "lookup")) {
         (Some(q), Some(v)) => {
-            if v.recall_at_10 - q.recall_at_10 > G1_LOOKUP_SLACK {
+            if v.recall_at_10 - q.recall_at_10 > G1_LOOKUP_SLACK + GATE_EPS {
                 g1 = false;
                 reasons.push(format!(
                     "G1: query lookup recall {:.3} is more than {:.2} below vector {:.3}",
@@ -142,7 +144,7 @@ pub fn judge_gates(summary: &BTreeMap<(String, String), CategorySummary>) -> Gat
     }
     match get("query", UNANSWERABLE) {
         Some(q) => {
-            if q.fallback_share < G1_FALLBACK_SHARE {
+            if q.fallback_share < G1_FALLBACK_SHARE - GATE_EPS {
                 g1 = false;
                 reasons.push(format!(
                     "G1: query fell back on {:.2} of unanswerable queries, below {:.2}",
@@ -172,7 +174,7 @@ pub fn judge_gates(summary: &BTreeMap<(String, String), CategorySummary>) -> Gat
     }
     match (get("ppr", OVERALL), get("query", OVERALL)) {
         (Some(p), Some(q)) => {
-            if p.recall_at_10 - q.recall_at_10 > G1B_PPR_SLACK {
+            if p.recall_at_10 - q.recall_at_10 > G1B_PPR_SLACK + GATE_EPS {
                 g1b = false;
                 reasons.push(format!(
                     "G1b: ppr overall recall {:.3} beats query {:.3} by more than {:.2}",
@@ -251,5 +253,19 @@ mod tests {
     fn a_missing_arm_fails_its_gate_with_a_reason() {
         let v = judge_gates(&table(&[("query", "overall", cs(0.5, 0.0, 10.0))]));
         assert!(!v.g1 && !v.g1b && !v.reasons.is_empty());
+    }
+
+    #[test]
+    fn gates_pass_exactly_on_the_boundary() {
+        // 0.40 - 0.30 is 0.099999994 in f32; an exact 10-point gain must still pass.
+        let exact = table(&[
+            ("fixed", "multi_hop", cs(0.30, 0.0, 40.0)), ("query", "multi_hop", cs(0.40, 0.0, 60.0)),
+            ("vector", "lookup", cs(0.80, 1.0, 5.0)),    ("query", "lookup", cs(0.78, 0.0, 60.0)),
+            ("query", "unanswerable", cs(0.0, 0.70, 5.0)),
+            ("fixed", "overall", cs(0.30, 0.0, 40.0)),   ("query", "overall", cs(0.60, 0.0, 90.0)),
+            ("ppr", "overall", cs(0.62, 0.0, 20.0)),
+        ]);
+        let v = judge_gates(&exact);
+        assert!(v.g1 && v.g1b, "{:?}", v.reasons);
     }
 }

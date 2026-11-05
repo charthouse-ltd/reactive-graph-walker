@@ -116,6 +116,54 @@ fn decide_walk(arm: Option<EvalArm>, mode: crate::seeding::SeedMode, has_cue: bo
     }
 }
 
+/// Longest walk, in steps, when a seed plan is active (and most PPR iterations). Without a
+/// plan a walk ends at its first dead end; with one it always runs every step, so the
+/// request's `steps` must not be able to grow it without bound.
+pub const MAX_PLANNED_STEPS: usize = 32;
+
+/// The step count a planned walk actually runs.
+pub fn planned_steps(requested: usize) -> usize {
+    requested.min(MAX_PLANNED_STEPS)
+}
+
+/// Whether the query needs embedding at all. The rollback mode and the `fixed` arm walk
+/// exactly as before this feature, so they must not pay for an embedding nobody reads.
+pub fn cue_needed(mode: crate::seeding::SeedMode, arm: Option<EvalArm>) -> bool {
+    match arm {
+        Some(EvalArm::Fixed) => false,
+        Some(_) => true,
+        None => mode != crate::seeding::SeedMode::Fixed,
+    }
+}
+
+/// `(bias slot, learned-profile index)` per walker.
+/// Without a drop this is today's assignment: slot `i`, profile `rotation + i`.
+/// With one, the dropped slot is skipped and each walker uses the learned profile of its own
+/// slot, so the omitted profile is the same on every walk instead of rotating.
+fn walker_profiles(
+    n_walkers: usize,
+    n_biases: usize,
+    dropped_slot: Option<usize>,
+    rotation: usize,
+    learned_len: usize,
+) -> Vec<(usize, Option<usize>)> {
+    let mut slots: Vec<usize> = (0..n_biases).filter(|s| Some(*s) != dropped_slot).collect();
+    if slots.is_empty() {
+        slots = (0..n_biases).collect();
+    }
+    (0..n_walkers)
+        .map(|i| {
+            let slot = slots[i % slots.len()];
+            let profile = match (learned_len, dropped_slot) {
+                (0, _) => None,
+                (len, Some(_)) => Some(slot % len),
+                (len, None) => Some((rotation + i) % len),
+            };
+            (slot, profile)
+        })
+        .collect()
+}
+
 /// Start a new segment at a seed drawn from the plan; returns the seed.
 fn restart_at_seed(result: &mut WalkerResult, plan: &crate::seeding::SeedPlan, rng: &mut StdRng) -> i32 {
     let seed = crate::seeding::draw_seed(plan, rng);
@@ -506,15 +554,24 @@ pub async fn walk_parallel_with(
     // Statistics (spec §13): only for walks seeded by the configured mode, never for eval arms.
     if opts.arm.is_none() {
         match (seed_mode, &plan, opts.cue_embedding.as_deref()) {
-            (crate::seeding::SeedMode::Query, Some(p), _) => observe_seed_plan(pool, p, n_walkers, seed_mode).await,
-            // Shadow walks exactly as today; the plan is computed only to be measured.
-            (crate::seeding::SeedMode::Shadow, None, Some(cue)) => match crate::seeding::candidates(pool, cue).await {
-                Ok(c) => {
-                    let shadow_plan = crate::seeding::plan_seeds(&c, crate::seeding::Specificity::Log);
-                    observe_seed_plan(pool, &shadow_plan, n_walkers, seed_mode).await;
-                }
-                Err(e) => tracing::warn!("[seeding] shadow candidate lookup failed: {}", e),
-            },
+            (crate::seeding::SeedMode::Query, Some(p), _) => {
+                let (pool, plan) = (pool.clone(), p.clone());
+                tokio::spawn(async move { observe_seed_plan(&pool, &plan, n_walkers, seed_mode).await });
+            }
+            // Shadow walks exactly as today; the plan is computed only to be measured, on a
+            // detached task so that the default mode adds no query to the request path.
+            (crate::seeding::SeedMode::Shadow, None, Some(cue)) => {
+                let (pool, cue) = (pool.clone(), cue.to_vec());
+                tokio::spawn(async move {
+                    match crate::seeding::candidates(&pool, &cue).await {
+                        Ok(c) => {
+                            let shadow_plan = crate::seeding::plan_seeds(&c, crate::seeding::Specificity::Log);
+                            observe_seed_plan(&pool, &shadow_plan, n_walkers, seed_mode).await;
+                        }
+                        Err(e) => tracing::warn!("[seeding] shadow candidate lookup failed: {}", e),
+                    }
+                });
+            }
             _ => {}
         }
     }
@@ -533,6 +590,8 @@ pub async fn walk_parallel_with(
     }
     // A plan that reaches this point is at or above the floor, so it has seeds.
     let plan = plan.filter(|p| !p.seeds.is_empty());
+    // A planned walk runs every step, so the request cannot make it arbitrarily long.
+    let steps = if plan.is_some() { planned_steps(steps) } else { steps };
 
     // Eval arm `ppr`: one Personalized PageRank push over the preloaded neighbourhood in
     // place of the walkers. No walker runs and the self-model is untouched.
@@ -549,7 +608,7 @@ pub async fn walk_parallel_with(
                 .map(|e| (if e.source_id == node { e.target_id } else { e.source_id }, e.weight))
                 .collect()
         };
-        let ranked = ppr_push(p, steps, &neighbours);
+        let ranked = ppr_push(p, planned_steps(steps), &neighbours);
         let primary_domain = match ranked.first() {
             Some(top) => db::get_node(pool, top.0).await.ok().flatten().map(|n| n.domain).unwrap_or_default(),
             None => String::new(),
@@ -600,29 +659,6 @@ pub async fn walk_parallel_with(
             &[WalkerBias::Experience, WalkerBias::Analytical]
         }
     };
-    // Eval arm `drop:<bias>`: that slot is skipped. With learned profiles in use the named
-    // bias is only a label, so the slot's learned profile is skipped with it.
-    let dropped = match opts.arm {
-        Some(EvalArm::Drop(b)) if plan.is_some() => Some(b),
-        _ => None,
-    };
-    let mut slots: Vec<usize> = (0..biases.len()).filter(|&s| Some(biases[s]) != dropped).collect();
-    if slots.is_empty() {
-        slots = (0..biases.len()).collect();
-    }
-    // (start node, bias label, learned-profile offset)
-    let configs: Vec<(i32, WalkerBias, usize)> = (0..n_walkers)
-        .map(|i| {
-            let slot = slots[i % slots.len()];
-            let seed = match &plan {
-                Some(p) if deterministic => crate::seeding::start_seed(p, i),
-                Some(p) => crate::seeding::draw_seed(p, &mut rand::rng()),
-                None => seeds[i % seeds.len()],
-            };
-            let profile = if dropped.is_some() { slot } else { i };
-            (seed, biases[slot], profile)
-        })
-        .collect();
 
     // ── Edge cache: preload seed neighborhoods for fast walks ──
     let cache = EdgeCache::new(pool.clone());
@@ -653,6 +689,28 @@ pub async fn walk_parallel_with(
     let base_pool_generation = base_sm.pool_generation; // detect a Stage-1 cull/breed mid-walk
     let agreement_metric = base_sm.agreement_metric; // Legacy (default) or Domain — see aggregate()
 
+    // Bias slot and learned profile per walker. Eval arm `drop:<bias>` skips that slot; with
+    // learned profiles in use the named bias is only a label, so the slot's learned profile
+    // is skipped with it, and stays the same profile on every walk.
+    let dropped_slot = match opts.arm {
+        Some(EvalArm::Drop(b)) if plan.is_some() => biases.iter().position(|x| *x == b),
+        _ => None,
+    };
+    let profiles = walker_profiles(n_walkers, biases.len(), dropped_slot, learned_rotation, learned_len);
+    // (start node, bias label, learned profile)
+    let configs: Vec<(i32, WalkerBias, Option<usize>)> = profiles
+        .iter()
+        .enumerate()
+        .map(|(i, &(slot, profile))| {
+            let seed = match &plan {
+                Some(p) if deterministic => crate::seeding::start_seed(p, i),
+                Some(p) => crate::seeding::draw_seed(p, &mut rand::rng()),
+                None => seeds[i % seeds.len()],
+            };
+            (seed, biases[slot], profile)
+        })
+        .collect();
+
     // Create shared stigmergic collective — walkers leave trails for each other
     let collective = Arc::new(Mutex::new(WalkerCollective::new()));
 
@@ -670,14 +728,10 @@ pub async fn walk_parallel_with(
         let collective = Arc::clone(&collective);
         let knowledge_domains = knowledge_domains.clone();
         tokio::task::spawn_blocking(move || {
-            let run = |(i, (seed, bias, profile)): (usize, &(i32, WalkerBias, usize))| {
+            let run = |(i, (seed, bias, profile)): (usize, &(i32, WalkerBias, Option<usize>))| {
                 let mut sm = base_sm.clone();  // Each walker gets its own copy
                 let collective = Arc::clone(&collective);
-                let learned = if learned_len > 0 {
-                    base_sm.learned_biases.get((learned_rotation + profile) % learned_len)
-                } else {
-                    None
-                };
+                let learned = profile.and_then(|p| base_sm.learned_biases.get(p));
                 let result = walk_single(&cache, *seed, *bias, &EmotionalState {
                     valence: sm.valence,
                     arousal: sm.arousal,
@@ -796,14 +850,17 @@ pub async fn walk_parallel_with(
         }
         if pool_stable {
             for (i, (result, _walker_sm)) in results.iter().enumerate() {
-                let bias_idx = if sm.learned_biases.is_empty() {
-                    None
-                } else {
-                    Some((learned_rotation + i) % sm.learned_biases.len())
-                };
+                // The profile this walker actually scored with (see `walker_profiles`).
+                let bias_idx = profiles
+                    .get(i)
+                    .and_then(|p| p.1)
+                    .filter(|idx| *idx < sm.learned_biases.len());
                 if let Some(bias) = bias_idx.and_then(|idx| sm.learned_biases.get_mut(idx)) {
+                    // Start node plus traversals: the path length, without the nodes a
+                    // restart adds.
+                    let visited = result.hops() + 1;
                     let novelty = if result.path.len() > 1 {
-                        result.surprises as f32 / result.path.len() as f32
+                        result.surprises as f32 / visited as f32
                     } else {
                         0.0
                     };
@@ -972,7 +1029,11 @@ fn vote_stats(results: &[WalkerResult]) -> VoteStats {
         for &node_id in &r.path {
             *node_votes.entry(node_id).or_insert(0) += 1;
         }
-        total_hops += r.path.len();
+        // One per node reached by walking: the start plus each traversal. Equal to the path
+        // length for a walk that never restarted.
+        if !r.path.is_empty() {
+            total_hops += r.hops() + 1;
+        }
     }
 
     // Classify nodes by agreement level (pure, complete partition — see helper).
@@ -1045,32 +1106,45 @@ pub fn merge_mass(results: &[WalkerResult]) -> Vec<(i32, f32)> {
     ranked
 }
 
-/// Up to `CHAINS_MAX` walk segments of at least two nodes, by summed mass descending.
-/// A node appears in one chain only: a segment that shares a node with a chosen chain is skipped.
+/// Up to `CHAINS_MAX` trains of thought for the query-mode context.
+///
+/// A chain is a walk segment with its revisits collapsed (each node once, in first-visit
+/// order) and at least two distinct nodes. It is scored by the summed mass of its distinct
+/// nodes, so a walker bouncing between two heavy nodes gains nothing. It qualifies only if
+/// at least half of its nodes are among the `RANKED_MAX` best-ranked, which keeps a chain
+/// from wandering off what the walkers agreed on. A node appears in one chain only.
 pub fn context_chains(results: &[WalkerResult], ranked: &[(i32, f32)]) -> Vec<Vec<i32>> {
     let mass: HashMap<i32, f32> = ranked.iter().copied().collect();
-    let mut segments: Vec<(f32, Vec<i32>)> = Vec::new();
+    let top: HashSet<i32> = ranked.iter().take(RANKED_MAX).map(|n| n.0).collect();
+    let mut candidates: Vec<(f32, Vec<i32>)> = Vec::new();
     for r in results {
         for seg in r.segments() {
-            if seg.len() >= 2 {
-                let total: f32 = seg.iter().map(|n| mass.get(n).copied().unwrap_or(0.0)).sum();
-                segments.push((total, seg.to_vec()));
+            let mut seen: HashSet<i32> = HashSet::new();
+            let chain: Vec<i32> = seg.iter().copied().filter(|n| seen.insert(*n)).collect();
+            if chain.len() < 2 {
+                continue;
             }
+            let in_top = chain.iter().filter(|n| top.contains(n)).count();
+            if in_top * 2 < chain.len() {
+                continue;
+            }
+            let total: f32 = chain.iter().map(|n| mass.get(n).copied().unwrap_or(0.0)).sum();
+            candidates.push((total, chain));
         }
     }
     // Stable sort: equal totals keep walker order.
-    segments.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut used: HashSet<i32> = HashSet::new();
     let mut chains = Vec::new();
-    for (_, seg) in segments {
+    for (_, chain) in candidates {
         if chains.len() >= CHAINS_MAX {
             break;
         }
-        if seg.iter().any(|n| used.contains(n)) {
+        if chain.iter().any(|n| used.contains(n)) {
             continue;
         }
-        used.extend(seg.iter().copied());
-        chains.push(seg);
+        used.extend(chain.iter().copied());
+        chains.push(chain);
     }
     chains
 }
@@ -2123,5 +2197,111 @@ mod tests {
         assert!(mass(1) > mass(2) && mass(2) > mass(3) && mass(3) > 0.0);
         assert!((p.iter().map(|x| x.1).sum::<f32>() - 1.0).abs() < 1e-5);
         assert_eq!(p[0].0, 1);
+    }
+
+    // ── Final-review fixes ──
+
+    /// A cache holding one node (1) with six edges of one type and one edge of another,
+    /// all of the same weight. No database is touched.
+    fn skewed_cache() -> EdgeCache {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgresql://localhost/unused").unwrap();
+        let cache = EdgeCache::new(pool);
+        for (i, target) in (10..16).enumerate() {
+            cache.cache_new_edge(&db::MemoryEdge {
+                id: i as i32 + 1, source_id: 1, target_id: target, edge_type: "type_a".into(),
+                weight: 0.5, emotional_charge: 0.0, traversal_count: 0,
+            });
+        }
+        cache.cache_new_edge(&db::MemoryEdge {
+            id: 7, source_id: 1, target_id: 99, edge_type: "type_b".into(),
+            weight: 0.5, emotional_charge: 0.0, traversal_count: 0,
+        });
+        cache
+    }
+
+    /// How many of 600 one-step walks from node 1 take the single `type_b` edge.
+    fn lone_type_draws(cache: &EdgeCache, plan: Option<&SeedPlan>) -> usize {
+        let collective = Arc::new(Mutex::new(WalkerCollective::new()));
+        let known = HashSet::new();
+        (0..600u64)
+            .filter(|&seed| {
+                let mut sm = SelfModel::new();
+                sm.mode = core::CognitiveMode::Compliant; // weight-only scoring: both types score alike
+                let r = walk_single(cache, 1, WalkerBias::Curiosity, &EmotionalState::default(), 1,
+                                    &mut sm, &collective, None, &known, plan, Some(seed));
+                r.path.get(1) == Some(&99)
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn fan_division_is_applied_to_the_draw_under_a_seed_plan() {
+        let cache = skewed_cache();
+        let plan = SeedPlan { seeds: vec![(1, 1.0)], best_cos: 1.0, below_floor: false };
+        let without = lone_type_draws(&cache, None);
+        let with = lone_type_draws(&cache, Some(&plan));
+        assert!(without < 140, "one edge in seven without fan division, got {without}/600");
+        assert!(with > 220, "one type in two with fan division, got {with}/600");
+    }
+
+    #[test]
+    fn context_chains_collapse_revisits_and_score_distinct_nodes() {
+        let ping_pong = WalkerResult { path: vec![8, 7, 8, 7, 6, 7], depths: vec![0, 1, 2, 3, 4, 5], ..wr(vec![], 0.0) };
+        let ranked = merge_mass(std::slice::from_ref(&ping_pong));
+        assert_eq!(context_chains(&[ping_pong], &ranked), vec![vec![8, 7, 6]]);
+    }
+
+    #[test]
+    fn context_chains_skip_segments_outside_the_top_ranked() {
+        let mut results: Vec<WalkerResult> = (0..3)
+            .map(|_| WalkerResult { path: vec![1, 2], depths: vec![0, 1], ..wr(vec![], 0.0) })
+            .collect();
+        for node in 3..12 {
+            results.push(WalkerResult { path: vec![node], depths: vec![0], ..wr(vec![], 0.0) });
+        }
+        // A deep, light segment far from everything the walkers agreed on.
+        results.push(WalkerResult { path: vec![20, 21], depths: vec![5, 6], ..wr(vec![], 0.0) });
+        let ranked = merge_mass(&results);
+        assert!(!ranked.iter().take(RANKED_MAX).any(|n| n.0 == 20 || n.0 == 21));
+        assert_eq!(context_chains(&results, &ranked), vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn total_hops_counts_traversals_and_keeps_todays_value_without_restarts() {
+        let legacy = wr(vec![1, 2, 3], 1.0);
+        assert_eq!(vote_stats(std::slice::from_ref(&legacy)).total_hops, 3, "as before: one per node");
+        let restarted = WalkerResult {
+            path: vec![1, 2, 9, 8], depths: vec![0, 1, 0, 1], segment_starts: vec![0, 2], ..wr(vec![], 0.0)
+        };
+        assert_eq!(vote_stats(std::slice::from_ref(&restarted)).total_hops, 3, "two edges plus the start, not four nodes");
+    }
+
+    #[test]
+    fn walker_profiles_match_today_without_a_drop_and_are_stable_with_one() {
+        assert_eq!(
+            walker_profiles(4, 6, None, 2, 6),
+            vec![(0, Some(2)), (1, Some(3)), (2, Some(4)), (3, Some(5))],
+            "bias slot i, learned profile (rotation + i)"
+        );
+        let dropped = walker_profiles(6, 6, Some(0), 2, 6);
+        assert_eq!(dropped, vec![(1, Some(1)), (2, Some(2)), (3, Some(3)), (4, Some(4)), (5, Some(5)), (1, Some(1))]);
+        assert_eq!(walker_profiles(6, 6, Some(0), 5, 6), dropped, "the omitted profile does not rotate");
+        assert_eq!(walker_profiles(2, 6, None, 0, 0), vec![(0, None), (1, None)]);
+    }
+
+    #[test]
+    fn planned_steps_are_clamped() {
+        assert_eq!(planned_steps(5), 5);
+        assert_eq!(planned_steps(10_000), MAX_PLANNED_STEPS);
+    }
+
+    #[test]
+    fn the_cue_is_embedded_only_when_something_will_read_it() {
+        use crate::seeding::SeedMode;
+        assert!(!cue_needed(SeedMode::Fixed, None), "the rollback mode pays nothing");
+        assert!(cue_needed(SeedMode::Shadow, None));
+        assert!(cue_needed(SeedMode::Query, None));
+        assert!(cue_needed(SeedMode::Fixed, Some(EvalArm::Query)));
+        assert!(!cue_needed(SeedMode::Query, Some(EvalArm::Fixed)), "the fixed arm walks as before");
     }
 }

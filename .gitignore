@@ -10,7 +10,7 @@ ab_scenarios.json
 ab_results.json
 
 # Recall harness: gold sets and results describe a deployment's memory
-*.gold.json
+*gold*.json
 recall_results*.json
 
 # stray planning/business docs — archived locally 2026-06-29, removed from repo
