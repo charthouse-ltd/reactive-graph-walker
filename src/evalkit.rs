@@ -49,6 +49,8 @@ const G1_ADDED_P95_MS: f64 = 50.0;
 const G1B_PPR_SLACK: f32 = 0.02;
 /// Recall is a ratio of small integers; an exact 10-point gain must not fail on f32 rounding.
 const GATE_EPS: f32 = 1e-6;
+/// Fewest queries a category needs before a gate may pass on it (spec gate run: at least 20).
+pub const MIN_GATE_N: usize = 20;
 
 /// Share of the gold nodes found in the first `k` ranked nodes; 0.0 when there is no gold.
 pub fn recall_at_k(ranked: &[i32], gold: &[i32], k: usize) -> f32 {
@@ -106,11 +108,27 @@ pub struct GateVerdict {
 /// `query` exceeds that of `fixed` by at most 50 ms (overall). G1b: `ppr` beats `query` overall
 /// by at most 0.02. A missing arm or category makes the corresponding gate false with a reason.
 /// Recall thresholds are compared with a 1e-6 tolerance, so a gain of exactly the threshold passes.
+/// A category with fewer than `MIN_GATE_N` queries fails its gate with a reason.
 pub fn judge_gates(summary: &BTreeMap<(String, String), CategorySummary>) -> GateVerdict {
     let get = |arm: &str, category: &str| summary.get(&(arm.to_string(), category.to_string()));
     let mut reasons = Vec::new();
     let mut g1 = true;
     let mut g1b = true;
+
+    // A verdict on a handful of queries is noise: every category a gate reads must be large enough.
+    for (gate, arm, category) in [
+        ("G1", "query", "multi_hop"), ("G1", "fixed", "multi_hop"),
+        ("G1", "query", "lookup"), ("G1", "vector", "lookup"),
+        ("G1", "query", UNANSWERABLE),
+        ("G1b", "ppr", OVERALL), ("G1b", "query", OVERALL),
+    ] {
+        if let Some(s) = get(arm, category)
+            && s.n < MIN_GATE_N
+        {
+            if gate == "G1" { g1 = false } else { g1b = false }
+            reasons.push(format!("{gate}: {arm}/{category} has {} queries; the gate needs at least {MIN_GATE_N}", s.n));
+        }
+    }
 
     match (get("query", "multi_hop"), get("fixed", "multi_hop")) {
         (Some(q), Some(f)) => {
@@ -267,5 +285,20 @@ mod tests {
         ]);
         let v = judge_gates(&exact);
         assert!(v.g1 && v.g1b, "{:?}", v.reasons);
+    }
+
+    #[test]
+    fn a_gold_set_that_is_too_small_cannot_pass() {
+        let small = |recall: f32, fallback: f32, p95: f64| CategorySummary { n: 5, ..cs(recall, fallback, p95) };
+        let t = table(&[
+            ("fixed", "multi_hop", small(0.30, 0.0, 40.0)), ("query", "multi_hop", small(0.90, 0.0, 60.0)),
+            ("vector", "lookup", small(0.80, 1.0, 5.0)),    ("query", "lookup", small(0.80, 0.0, 60.0)),
+            ("query", "unanswerable", small(0.0, 1.0, 5.0)),
+            ("fixed", "overall", small(0.30, 0.0, 40.0)),   ("query", "overall", small(0.90, 0.0, 60.0)),
+            ("ppr", "overall", small(0.50, 0.0, 20.0)),
+        ]);
+        let v = judge_gates(&t);
+        assert!(!v.g1 && !v.g1b, "five queries per category prove nothing");
+        assert!(v.reasons.iter().any(|r| r.contains("at least 20")), "{:?}", v.reasons);
     }
 }

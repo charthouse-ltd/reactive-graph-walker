@@ -39,9 +39,12 @@ async fn statistics_record_mode_walks_and_never_eval_arms() -> anyhow::Result<()
         }
     };
 
-    // An eval arm is a measurement of the system, not of its traffic.
-    run(axis(1), Some(EvalArm::Query), SeedMode::Shadow).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // An eval arm is a measurement of the system, not of its traffic. These are the two
+    // combinations that would record if the arm were ignored: a planned walk under query
+    // mode, and a fixed walk with a cue under shadow mode.
+    run(axis(1), Some(EvalArm::Query), SeedMode::Query).await;
+    run(axis(1), Some(EvalArm::Fixed), SeedMode::Shadow).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(walks(), 0, "eval arms must not move the statistics");
 
     // Shadow: walks as today, records the plan.

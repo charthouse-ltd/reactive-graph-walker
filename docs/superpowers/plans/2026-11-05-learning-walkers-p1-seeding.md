@@ -1102,3 +1102,57 @@ Expected: no leaks.
 - `edges_from` returns at most 20 edges per node, by weight. Degree-based specificity uses true degrees; fan division sees at most 20 candidates.
 - The cue is embedded with `embed::embed_text`, the same call and prefix used for stored documents. A query-prefix variant is not part of this plan.
 - With a seed plan, radius-1 preload covers the first five seeds only. A walker that restarts at a wide seed can take one step before it meets uncached edges. `telemetry.cache_miss_stops` measures how often that happens.
+
+---
+
+## Execution record
+
+Executed inline on `feat/learning-walkers-p1`, one independent whole-branch review, one fix pass.
+
+### Decisions that deviate from the plan above
+
+| Where | Decision | Why | Cost if wrong |
+|---|---|---|---|
+| Task 3 | `hops()` is nodes minus segments, not `edges_traversed.len()` | Existing tests build results with empty `edges_traversed` and expect `path.len() - 1`; for real walks the two are equal | Hop-rate metrics off for a result whose path and edges disagree |
+| Task 3 | The per-step restart draw starts at the second step | A restart before the first step only re-draws the start node | First segments slightly longer |
+| Task 3 | Integration tests load the embedding model once per binary | Several tests loading it at once against a cold cache failed while it downloaded | None for behaviour |
+| Task 3, review | `drop:<bias>` skips the slot's learned profile as well as its label, and the omitted profile does not rotate; credit goes to the profile a walker scored with | With learned profiles in use the named bias is only a label | The arm ablates a different profile than intended |
+| Task 4 | No serde default attributes on the new `WalkOutput` fields | The struct derives only `Serialize` | None until it is deserialised |
+| Task 4 | The similarity floor applies to every query-seeded kind, eval arms and `ppr` included | G1 measures the query arm's fallback share | An eval arm returns no walk where one was wanted |
+| Task 4 | `seed_mode` reports what decided the result | The narrative keys on it | A caller sees `fixed` although the mode is `query` and no cue was usable |
+| Task 5, review | The critic does not run when the query decided the result and no walker ran, nor for any eval arm | Those are not walk sessions; eval timings must not include an LLM call | Critic counters do not advance on those requests |
+| Task 5 | Shadow statistics are recorded only without an eval arm | A harness run must not move production medians | Eval traffic is invisible in `GET /learning` |
+| Task 7 | `evalkit` is declared in the library only | The binary does not use it; declaring it there added dead-code warnings | None |
+| Review | The `, id ASC` tie-break in `edges_from` is not applied | It changes which 20 edges every walk sees on a node with more than 20 equal-weight edges, against the "exactly as today" constraint | Two deterministic runs may see different edges on such a node |
+| Review | `fixed` mode and the `fixed` arm do not embed the query; eval arms embed without the cache | The rollback mode must cost what it cost before; each harness arm must pay the real embedding | None |
+| Review | Planned walks and PPR are clamped to 32 steps | A planned walk runs every step, so `steps` was an unbounded allocation | A caller asking for more gets 32 |
+| Review | Chains collapse revisits, score distinct nodes, and need half their nodes in the top-ranked ten | Ping-pong segments won; the second chain left the topic | A legitimate long chain through lower-ranked nodes is not shown |
+| Review | `total_hops` and the novelty denominator count the start plus traversals | Restart nodes are not hops; unchanged for walks without restarts | None |
+| Review | Gate thresholds tolerate 1e-6; a category under 20 queries fails its gate | An exact 10-point gain compared as under 10 in f32; a toy set printed PASS | A gold set of 19 cannot pass |
+| Review | The similarity query orders by distance only | A second sort key can keep Postgres from using a vector index | Ties in cosine are cut arbitrarily at the limit |
+| Review | Shadow observation runs on a detached task | The default mode must not add queries to the request path | The statistic lags the walk by milliseconds |
+
+### Set aside by the reviewer, and where each stands
+
+- The chat prompt carries no node text: out of scope here; query seeding does not reach chat prompts until that prompt changes.
+- `edges_from` returns at most 20 edges per node: unchanged.
+- The cue is embedded with the document prefix: unchanged; `SEED_FLOOR` is tuned at the gate run.
+- Radius-1 preload covers the first five seeds only: unchanged; `telemetry.cache_miss_stops` measures it.
+- Spec §5.1 asks `ab_eval` to run both judge orderings: not done; no P1 gate reads `ab_eval`. Needed before it is used as evidence.
+- The in-repo fixture is synthetic: the harness was run end to end on it once, which exercises the pipeline and says nothing about recall.
+- `rgw_walk_id` on the chat response: plan P2.
+- A harness run changes the server's self-model through the walk merge (the critic no longer runs for eval arms): run the gate on a copy, or accept the drift.
+- Unbounded `n_walkers`, and `seed_nodes` without a tie-break: pre-existing, untouched.
+
+### Deferred, not fixed
+
+- A request `seed` alone makes the walk deterministic and sequential; the spec reads as the environment flag plus an optional seed.
+- In deterministic mode the start nodes round-robin over all plan seeds, so with more than five walkers the extras start at wide seeds without a preloaded neighbourhood.
+- `WalkerBias::Random` scoring uses the thread RNG in deterministic mode when no learned profile exists.
+- `ppr_push` sums in hash-map order; unloaded frontier nodes keep their mass.
+- Node domains are cached only for first-pass seeds; check at the gate run that `primary_domain` is not empty more often under `query`.
+- Votes are per visit, so a walker that restarts at a seed votes for it again; agreement and the `express` action rise under `query`.
+- `empty_output()` reports `walked: true` with an empty `walk_id`.
+- Two doc comments sit on the wrong item (`WalkerBias::from_name` / `all`, `learning_stats` / `diverger_stats`).
+- The README does not mention the new variables or `GET /learning`, and no startup line states the seed mode.
+- Confirm with `EXPLAIN` on a deployment that the similarity query uses the vector index.
