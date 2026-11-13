@@ -13,7 +13,7 @@
 //! Every outbound action goes through [`MotorGate`] (RGW_MOTOR_MODE:
 //! off | shadow | propose | live, default shadow). Only the gate sends.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -210,7 +210,10 @@ pub struct MotorGate {
     shadow: Mutex<VecDeque<ShadowRecord>>,
     next_id: AtomicU64,
     counters: Counters,
-    outcomes: Mutex<VecDeque<MotorOutcome>>,
+    outcomes: Mutex<VecDeque<OutcomeRecord>>,
+    origins: Mutex<VecDeque<(uuid::Uuid, MotorOrigin)>>,
+    // Serialize callback read/update/learning, without holding a std mutex across I/O.
+    outcome_writer: tokio::sync::Mutex<()>,
 }
 
 fn now_secs() -> u64 {
@@ -229,6 +232,8 @@ impl MotorGate {
             next_id: AtomicU64::new(1),
             counters: Counters::default(),
             outcomes: Mutex::new(VecDeque::new()),
+            origins: Mutex::new(VecDeque::new()),
+            outcome_writer: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -249,6 +254,14 @@ impl MotorGate {
         cmd: MotorCommand,
         timeout: Duration,
     ) -> DispatchOutcome {
+        if self.mode != MotorMode::Off {
+            let mut origins = self.origins.lock().unwrap_or_else(|e| e.into_inner());
+            origins.retain(|(id, _)| *id != cmd.correlation_id);
+            origins.push_back((cmd.correlation_id, MotorOrigin {
+                action: cmd.action.clone(), domain: cmd.domain.clone(), target: base_url.to_string(),
+            }));
+            while origins.len() > PROPOSAL_CAP { origins.pop_front(); }
+        }
         match self.mode {
             MotorMode::Off => {
                 self.counters.off_dropped.fetch_add(1, Ordering::Relaxed);
@@ -751,7 +764,7 @@ fn motor_request(base_url: &str, cmd: &MotorCommand, timeout: Duration,
     request
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MotorOutcome {
     pub correlation_id: uuid::Uuid,
     pub outcome: String,
@@ -759,13 +772,274 @@ pub struct MotorOutcome {
     pub lesson: Option<String>,
 }
 
+/// Only server-side command metadata is attached to callbacks; clients cannot supply it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MotorOrigin {
+    action: String,
+    domain: String,
+    target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct OutcomeRecord {
+    #[serde(flatten)]
+    pub(crate) callback: MotorOutcome,
+    /// None explicitly marks a late/unknown callback as unmatched.
+    origin: Option<MotorOrigin>,
+    received_at: u64,
+    /// First eligible feedback only; corrections must not multiply evidence.
+    reflected: bool,
+}
+
+impl OutcomeRecord {
+    fn can_reflect(&self, model: &crate::core::SelfModel) -> bool {
+        !self.reflected
+            && self.origin.is_some()
+            && self.callback.success.is_some()
+            && model.mode == crate::core::CognitiveMode::Autonomous
+            && crate::metacog::critic_enabled(model)
+    }
+
+    fn reflect(&mut self, model: &mut crate::core::SelfModel) -> bool {
+        if !self.can_reflect(model) {
+            return false;
+        }
+        if let (Some(origin), Some(success)) = (&self.origin, self.callback.success) {
+            crate::metacog::reflect(
+                &format!("{} in {}", origin.action, origin.domain),
+                &self.callback.outcome,
+                success,
+                model,
+            );
+            self.reflected = true;
+            return true;
+        }
+        false
+    }
+}
+
 impl MotorGate {
-    /// No episode correlation exists yet. Retain the latest bounded callbacks for inspection.
-    pub fn record_outcome(&self, outcome: MotorOutcome) {
-        tracing::info!(correlation_id = %outcome.correlation_id, "Motor outcome received");
+    fn origin(&self, id: uuid::Uuid) -> Option<MotorOrigin> {
+        // Proposals can outlive the recent dispatch ring (decided entries are evicted first).
+        if let Some(p) = self
+            .proposals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|p| p.correlation_id == id)
+        {
+            return Some(MotorOrigin {
+                action: p.command.action.clone(),
+                domain: p.command.domain.clone(),
+                target: p.target.clone(),
+            });
+        }
+        self.origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, origin)| origin.clone())
+    }
+
+    fn retain_outcome(&self, outcome: OutcomeRecord) {
         let mut outcomes = self.outcomes.lock().unwrap_or_else(|e| e.into_inner());
-        outcomes.retain(|o| o.correlation_id != outcome.correlation_id);
+        outcomes.retain(|o| o.callback.correlation_id != outcome.callback.correlation_id);
         outcomes.push_back(outcome);
-        while outcomes.len() > PROPOSAL_CAP { outcomes.pop_front(); }
+        while outcomes.len() > PROPOSAL_CAP {
+            outcomes.pop_front();
+        }
+    }
+
+    /// Rehydrate inspection only, before serving requests; never replay learning at startup.
+    pub async fn restore_outcomes(&self, pool: &sqlx::PgPool) {
+        match tokio::time::timeout(
+            Duration::from_millis(750),
+            crate::db::recent_motor_outcomes(pool),
+        )
+        .await
+        {
+            Ok(Ok(rows)) => {
+                for row in rows.into_iter().rev() {
+                    match serde_json::from_str::<OutcomeRecord>(&row) {
+                        Ok(outcome) => self.retain_outcome(outcome),
+                        Err(_) => tracing::warn!("[motor] Skipped malformed stored outcome"),
+                    }
+                }
+            }
+            _ => tracing::warn!(
+                "[motor] Recent outcomes unavailable; starting with in-memory inspection"
+            ),
+        }
+    }
+
+    /// Request-scoped persistence. Failures retain inspection and return normally to the callback.
+    pub async fn record_outcome(
+        &self,
+        pool: &sqlx::PgPool,
+        model: &tokio::sync::Mutex<crate::core::SelfModel>,
+        callback: MotorOutcome,
+    ) {
+        let _writer = self.outcome_writer.lock().await;
+        let previous = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|o| o.callback.correlation_id == callback.correlation_id)
+            .cloned();
+        let mut record = OutcomeRecord {
+            origin: self
+                .origin(callback.correlation_id)
+                .or_else(|| previous.as_ref().and_then(|o| o.origin.clone())),
+            reflected: previous.as_ref().is_some_and(|o| o.reflected),
+            callback,
+            received_at: now_secs(),
+        };
+        let persisted = tokio::time::timeout(Duration::from_millis(750), async {
+            // Consult durable history even when the inspection ring has evicted this UUID.
+            if let Some(prior) =
+                crate::db::load_motor_outcome(pool, record.callback.correlation_id).await?
+            {
+                record.origin = record.origin.take().or(prior.origin);
+                record.reflected |= prior.reflected;
+            }
+            // A long walk may hold the self-model. Still persist its callback;
+            // a later retry can perform the deferred reflection.
+            let mut model = model.try_lock().ok();
+            let mut stored = record.clone();
+            stored.reflected |= model.as_ref().is_some_and(|m| record.can_reflect(m));
+            // Persist the learning receipt first, so retries/restarts cannot replay feedback.
+            crate::db::save_motor_outcome(pool, &stored).await?;
+            if let Some(model) = model.as_mut() {
+                record.reflect(model);
+            } else {
+                tracing::info!(correlation_id = %record.callback.correlation_id,
+                    "[motor] Outcome stored; reflection deferred while self-model is busy");
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(()))) {
+            tracing::warn!(correlation_id = %record.callback.correlation_id,
+                "[motor] Outcome persistence unavailable; retained in memory, learning deferred");
+        }
+        self.retain_outcome(record);
+    }
+}
+
+#[cfg(test)]
+mod outcome_learning_tests {
+    use super::*;
+    use crate::core::{CognitiveMode, SelfModStage, SelfModel};
+
+    fn record(success: Option<bool>) -> OutcomeRecord {
+        OutcomeRecord {
+            callback: MotorOutcome {
+                correlation_id: uuid::Uuid::new_v4(),
+                outcome: "finished".into(),
+                success,
+                lesson: Some("remember this".into()),
+            },
+            origin: Some(MotorOrigin {
+                action: "search".into(),
+                domain: "science".into(),
+                target: "".into(),
+            }),
+            received_at: now_secs(),
+            reflected: false,
+        }
+    }
+
+    #[test]
+    fn outcome_learning_obeys_mode_critic_and_known_result() {
+        let mut model = SelfModel::new();
+        let before = serde_json::to_value(&model).unwrap();
+        assert!(!record(Some(true)).reflect(&mut model));
+        assert_eq!(serde_json::to_value(&model).unwrap(), before);
+        model.mode = CognitiveMode::Autonomous;
+        assert!(!record(Some(true)).reflect(&mut model));
+        model.self_mod_stage = SelfModStage::SelectionLive;
+        assert!(!record(None).reflect(&mut model));
+        let mut unmatched = record(Some(false));
+        unmatched.origin = None;
+        assert!(!unmatched.reflect(&mut model));
+        assert_eq!(model.total_signals_processed, 0);
+    }
+
+    #[test]
+    fn outcome_learning_reflects_success_and_failure_once() {
+        for success in [true, false] {
+            let mut model = SelfModel::new();
+            model.mode = CognitiveMode::Autonomous;
+            model.self_mod_stage = SelfModStage::SelectionLive;
+            let mut outcome = record(Some(success));
+            assert!(outcome.reflect(&mut model));
+            assert_eq!(model.total_signals_processed, 1);
+            assert!(model.last_signal.starts_with(if success {
+                "reflection_success:"
+            } else {
+                "reflection_failure:"
+            }));
+            assert!(!outcome.reflect(&mut model));
+            assert_eq!(model.total_signals_processed, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_storage_retains_bounded_observations_without_learning() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::new());
+        pool.close().await; // No connection attempt, and no database is selected.
+        let gate = MotorGate::new(MotorMode::Propose);
+        let command = test_support::cmd("search");
+        let id = command.correlation_id;
+        gate.dispatch("test", "/execution", command).await;
+        let mut model = SelfModel::new();
+        model.mode = CognitiveMode::Autonomous;
+        model.self_mod_stage = SelfModStage::SelectionLive;
+        let model = tokio::sync::Mutex::new(model);
+        for outcome in ["completed", "corrected"] {
+            gate.record_outcome(
+                &pool,
+                &model,
+                MotorOutcome {
+                    correlation_id: id,
+                    outcome: outcome.into(),
+                    success: Some(true),
+                    lesson: None,
+                },
+            )
+            .await;
+        }
+        let snapshot = gate.snapshot();
+        assert_eq!(snapshot["outcomes"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["outcomes"][0]["outcome"], "corrected");
+        assert_eq!(snapshot["outcomes"][0]["origin"]["target"], "/execution");
+        assert_eq!(snapshot["outcomes"][0]["reflected"], false);
+        assert_eq!(model.lock().await.total_signals_processed, 0);
+        for _ in 0..PROPOSAL_CAP {
+            gate.record_outcome(&pool, &model, record(None).callback)
+                .await;
+        }
+        assert_eq!(
+            gate.snapshot()["outcomes"].as_array().unwrap().len(),
+            PROPOSAL_CAP
+        );
+    }
+
+    #[tokio::test]
+    async fn live_commands_keep_bounded_correlation_before_send() {
+        let gate = MotorGate::new(MotorMode::Live);
+        let command = test_support::cmd("search");
+        let id = command.correlation_id;
+        gate.dispatch("test", "", command).await;
+        let origin = gate.origin(id).unwrap();
+        assert_eq!(origin.action, "search");
+        for _ in 0..PROPOSAL_CAP {
+            gate.dispatch("test", "", test_support::cmd("search")).await;
+        }
+        assert!(gate.origin(id).is_none());
+        assert_eq!(gate.origins.lock().unwrap().len(), PROPOSAL_CAP);
     }
 }

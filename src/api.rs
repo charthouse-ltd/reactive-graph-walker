@@ -98,6 +98,7 @@ pub async fn serve(
     // Motor gate FIRST: every outbound action goes through it. Default shadow.
     let motor_mode = crate::motor::MotorMode::from_env_value(std::env::var("RGW_MOTOR_MODE").ok().as_deref());
     let motor_gate = crate::motor::install_gate(motor_mode);
+    motor_gate.restore_outcomes(&pool).await;
     // Tension-driven background activity (spec: docs/superpowers/specs/2026-11-04-…).
     // Default observe: compute + log, change nothing. See /diverger "tension".
     let tension_engine = crate::tension::install(crate::tension::TensionMode::from_env_value(
@@ -284,8 +285,6 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
 /// Motor gate routes. Mounted inside the protected router (behind require_auth).
 fn motor_routes<S: Clone + Send + Sync + 'static>(gate: Arc<crate::motor::MotorGate>) -> Router<S> {
     Router::new()
-        .route("/outcomes", post(outcome_endpoint))
-        .route("/diverger/outcome", post(outcome_endpoint))
         .route("/motor/proposals", get(motor_proposals))
         .route("/motor/proposals/{id}/approve", post(motor_approve))
         .route("/motor/proposals/{id}/reject", post(motor_reject))
@@ -2019,18 +2018,19 @@ mod outcome_tests {
     use super::*;
     #[tokio::test]
     async fn outcomes_validate_uuid_and_bounds_and_retain_callback() {
-        let gate = Arc::new(crate::motor::MotorGate::new(crate::motor::MotorMode::Shadow));
+        let state = super::failure_status_tests::state().await;
+        let gate = &state.motor_gate;
         let id = uuid::Uuid::new_v4();
         let request: OutcomeRequest = serde_json::from_value(serde_json::json!({
             "correlation_id": id, "outcome": "completed", "success": true, "lesson": "use the result"
         })).unwrap();
-        assert_eq!(outcome_endpoint(State(gate.clone()), Json(request)).await.0, StatusCode::ACCEPTED);
+        assert_eq!(outcome_endpoint(State(state.clone()), Json(request)).await.0, StatusCode::ACCEPTED);
         assert_eq!(gate.snapshot()["outcomes"][0]["correlation_id"], id.to_string());
         assert_eq!(gate.snapshot()["outcomes"][0]["success"], true);
         assert!(serde_json::from_value::<OutcomeRequest>(serde_json::json!({"correlation_id":"invalid", "outcome":"ok"})).is_err());
         for (outcome, lesson) in [("".to_string(), "".to_string()), ("ok".into(), "x".repeat(501)), ("x".repeat(501), "".into())] {
             let req = OutcomeRequest { correlation_id: id, outcome, lesson: Some(lesson), success: None };
-            assert_eq!(outcome_endpoint(State(gate.clone()), Json(req)).await.0, StatusCode::BAD_REQUEST);
+            assert_eq!(outcome_endpoint(State(state.clone()), Json(req)).await.0, StatusCode::BAD_REQUEST);
         }
         assert_eq!(gate.snapshot()["outcomes"].as_array().unwrap().len(), 1);
     }
@@ -2045,7 +2045,7 @@ struct OutcomeRequest {
 }
 
 async fn outcome_endpoint(
-    State(gate): State<Arc<crate::motor::MotorGate>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<OutcomeRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if req.correlation_id.is_nil() || req.outcome.trim().is_empty() || req.outcome.chars().count() > 500
@@ -2053,8 +2053,9 @@ async fn outcome_endpoint(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":
             "non-nil correlation_id and outcome (1..500 characters) required; lesson limit is 500"})));
     }
-    gate.record_outcome(crate::motor::MotorOutcome { correlation_id: req.correlation_id,
-        outcome: req.outcome, success: req.success, lesson: req.lesson });
+    state.motor_gate.record_outcome(&state.pool, &state.self_model,
+        crate::motor::MotorOutcome { correlation_id: req.correlation_id,
+            outcome: req.outcome, success: req.success, lesson: req.lesson }).await;
     (StatusCode::ACCEPTED, Json(serde_json::json!({"status":"accepted", "correlation_id":req.correlation_id})))
 }
 
@@ -2168,6 +2169,8 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         // Signal ingest — external events feed into the cognitive loop
         .route("/ingest/signal", post(ingest_signal_endpoint))
         .route("/tom/record", post(tom_record_endpoint))
+        .route("/outcomes", post(outcome_endpoint))
+        .route("/diverger/outcome", post(outcome_endpoint))
         // OpenAI-compatible chat (triggers a walk + paid LLM expression)
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Motor gate: inspect / approve / reject held actions (human only)
