@@ -190,7 +190,7 @@ pub async fn chat_completions(
         None
     };
     let walk_opts = walker::WalkOptions { cue_embedding, ..Default::default() };
-    let (walk_output, _walker_results) = walker::walk_parallel_with(
+    let (walk_output, _walker_results) = walker::try_walk_parallel_with(
         &state.pool,
         &emotion,
         req.rgw_walkers,
@@ -198,7 +198,7 @@ pub async fn chat_completions(
         &self_model,
         walk_opts,
     )
-    .await;
+    .await.map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "walk failed"))?;
 
     let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -307,7 +307,7 @@ pub async fn chat_completions(
         object: "chat.completion".into(),
         created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs(),
         model: "rgw".into(),
         choices: vec![Choice {
@@ -410,7 +410,7 @@ async fn bypass_completion(
         object: "chat.completion".into(),
         created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs(),
         model: "rgw".into(),
         choices: vec![Choice {

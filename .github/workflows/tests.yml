@@ -12,3 +12,29 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked --lib --bins
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: rgw
+          POSTGRES_PASSWORD: rgwtest
+          POSTGRES_DB: rgw_test
+        ports:
+          - 55439:5432
+        options: >-
+          --health-cmd "pg_isready -U rgw -d rgw_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://rgw:rgwtest@127.0.0.1:55439/rgw_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/schema.sql
+      - run: cargo test --locked --tests

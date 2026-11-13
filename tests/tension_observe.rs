@@ -5,10 +5,11 @@ use common::seed_database;
 use std::sync::Arc;
 
 #[tokio::test]
+#[ignore = "requires downloaded embedding model; run explicitly with --ignored"]
 async fn observe_mode_logs_would_fire_and_emits_nothing() -> anyhow::Result<()> {
     rgw::embed::init()?;
     let pool = rgw::db::connect(
-        &std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgresql:///rgw_test?host=/tmp".into()),
+        &std::env::var("DATABASE_URL").expect("DATABASE_URL must explicitly select a throwaway test database"),
     )
     .await?;
     sqlx::raw_sql(include_str!("schema.sql")).execute(&pool).await?;

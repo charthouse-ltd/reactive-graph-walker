@@ -1,186 +1,159 @@
 # RGW — Reactive Graph Walker
 
-A self-propagating cognitive engine with persistent graph memory and LLM expression. The graph drives its own computation through cascading edge activation and parallel walker traversal. No training. No fine-tuning. The graph IS the mind.
+RGW traverses Julian's PostgreSQL memory graph with parallel Rust walkers, maintains a persistent self-model, and can use an LLM to express the result. One process owns one self-model. Julian owns memory documents, embeddings and database migrations.
 
-## Core Concept
+## Running
 
-```
-Signal + SelfModel → (Signal, SelfModel', Noticing)
-```
+Requires Rust 1.88+, PostgreSQL with pgvector, and Julian's schema. The embedding model may download on first startup.
 
-One primitive. Everything else — beliefs, predictions, working memory, emotional modulation, structural self-awareness — emerges from calling this function on different inputs and noticing what it does.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────┐
-│  RGW Cognitive Engine                             │
-│                                                   │
-│  core.rs      — primitive + self-model            │
-│  walker.rs    — parallel graph traversal (rayon)  │
-│  graph.rs     — emotional biasing + learned bias  │
-│  diverger.rs  — self-propagating edge reactor     │
-│  edge_cache.rs — lock-free DashMap edge cache     │
-│  llm.rs       — DeepSeek HTTP client              │
-│  db.rs        — PostgreSQL + pgvector (768-dim)   │
-│  embed.rs     — nomic-embed-text-v1.5             │
-│  provider.rs  — multi-LLM routing                 │
-│  dream.rs     — Monte Carlo dream consolidation   │
-│  metacog.rs   — metacognitive loop                │
-│  episodic.rs  — episodic memory                   │
-│  tools.rs     — tool calling framework            │
-│  speech.rs    — TTS/STT                           │
-│  motor.rs     — commands Julian's body            │
-│  openai.rs    — /v1/chat/completions              │
-│  api.rs       — 14 HTTP endpoints                 │
-└──────────────────────────────────────────────────┘
+```sh
+export DATABASE_URL='postgresql://test-user:test-password@127.0.0.1:5432/test-db'
+export RGW_API_KEY='test-admin-key' # placeholder; use a strong secret outside source control
+cargo build --locked
+cargo run --locked --bin rgw
 ```
 
-## Key Features
+The default bind address is `127.0.0.1:11435`. Send credentials in `X-RGW-Key`. Only `/health` and `/ready` are public. CORS is closed.
 
-### Graph-Based Cognition
-Walkers traverse a knowledge graph in parallel, each with different biases. Convergence = confidence. Divergence = novelty. Every step feeds through the self-model — the walk is self-aware and changes the thinker.
+Startup restores the saved self-model before starting writers. A database or snapshot decoding error stops startup; it never substitutes a fresh model for an unreadable saved row. An absent row permits a fresh model. The configured cognitive mode overrides the saved mode at startup. Self-state is saved periodically and on graceful shutdown.
 
-### Self-Model with Structural Awareness
-- **Beliefs** with algorithmic causal chains (why each belief formed)
-- **Working memory** (PFC-equivalent, 5±2 slots)
-- **Predictive coding** — expects outcomes, learns from errors
-- **Metaplasticity gate** — modulates learning rate from experience
-- **Learned biases** — per-walker emergent profiles (default 6, can spawn variants up to 16) that adapt each session from walk outcomes, each now carrying a **fitness scorecard** (novelty-that-sticks minus dead-ends/repetition; the metacog `approval` signal is held out to keep selection acyclic)
-- **Structural noticings** — the system observes its own architecture (obsession, dead-end clusters, cognitive loops, signal poverty)
+Production defaults are **compliant cognition**, **dream loop disabled**, **critic application disabled**, **motor shadow**, and **tension observe**. These prevent autonomous background graph writes. Explicit requests such as walks, edge creation and pruning can still mutate graph dynamics; compliant mode is not a database read-only role. Walk edge deltas are flushed at the end of that walk.
 
-### Closed-Loop Self-Selection (staged)
-Variation alone is drift; *selection* is what makes self-modification cumulative. RGW is closing that loop on an **acyclic "coherent insight" fitness** — the metacog approval signal is held out of the objective so the bias pool and the metacog tuner can't co-adapt into mutual confirmation — under a **bounded-autonomy** frame: free variation inside a fixed, human-set fitness function.
-- **Implemented (staged, default-inert):** emergent goals + audience model steer live walks (previously computed but bypassed); per-profile fitness scorecards accumulate online; an offline `selection_observe` pass logs three failure-mode detectors (co-adaptation, monoculture, proxy-gaming); and **quality-diversity cull/breed** runs in the dream loop — gated behind `SelfModStage` (default `Observability` = compute-only would-cull/would-breed; promote to `SelectionLive` via the auth-protected `POST /selection/stage`).
-- **Stage 2 (rule trials):** evaluate-then-keep for metacognitive rule changes via dream-replay with rollback. Implemented, gated (RuleTrialsLive + agreement_metric=domain), default off. See [`docs/PROTOCOL-self-selection.md`](docs/PROTOCOL-self-selection.md).
+## HTTP API and scopes
 
-### Tension-driven background activity (staged, default `observe`)
-Between external calls the diverger used to be idle. Now the graph's own unresolved state — open **predictions** and **open questions** on the self-model — releases small, bounded energy pulses into the diverger **after every walk** (no timer, no random noise), and completed spontaneous walks feed their last edge back as the next hop so cascades are multi-hop. Three brakes ship with it: per-node **fatigue**, a **per-cascade budget** (`max_cascade_depth` finally applies), and a **global refilling pool** that caps self-generated work. `RGW_TENSION_MODE` = `off` (today's behaviour) | `observe` (default: compute + log, change nothing) | `brakes` (self-propagation + brakes, no tension) | `live`. Everything is visible under `GET /diverger` → `tension` (pulses, drops by cause, pool, resolution rate, last 50 events). Promotion is a config change gated on pre-registered metrics; see [`docs/superpowers/specs/2026-11-04-tension-driven-activity-design.md`](docs/superpowers/specs/2026-11-04-tension-driven-activity-design.md).
+The existing `RGW_API_KEY` remains a full-access **admin** key. It also approves motor proposals unless `RGW_APPROVE_KEY` is set. Optional read, ingest and approve keys grant only their named scope. Missing or unknown credentials return 401; a recognized key with the wrong scope returns 403. Empty optional keys are disabled. Admin credentials remain mandatory at startup even when scoped keys are configured.
 
-### LLM as Tool (DeepSeek)
-The LLM expresses RGW's state, not the other way around. RGW walks → self-model updates → snapshot sent to DeepSeek → insight returned as a signal → fed back into graph as a node → re-walk. The LLM observes; RGW thinks.
+**Approval policy:** when `RGW_APPROVE_KEY` is set, approval/rejection accepts **only** that key; the admin key gets 403, so approval is separated from everything else. When it is unset, the admin key approves as before (single-key deployments keep working). Read and ingest keys can never approve.
 
-### Edge Cache
-Lock-free DashMap edge cache — O(1) reads during walker scoring. Neighborhoods preloaded before walks. Background write queue flushes to DB. Eliminated N+1 queries and runtime panics from nested tokio runtimes.
+| Method | Path | Scope | Purpose |
+|---|---|---|---|
+| GET | `/health` | public | Liveness, always 200; truthful `db_connected` |
+| GET | `/ready` | public | 200 when DB/schema are ready, otherwise 503; includes `schema_version` |
+| GET | `/self` | read | Full self-model, including audience state |
+| GET | `/stats` | read | Graph statistics |
+| GET | `/metrics` | read | Runtime and LLM metrics |
+| GET | `/recall` | read | Episodes by date/place |
+| GET | `/diverger` | read | Reactor and tension statistics |
+| GET | `/learning` | read | Seeding statistics |
+| GET | `/selection/stats` | read | Selection/trial state |
+| GET | `/metacog/config` | read | Metacognitive configuration |
+| GET | `/tools` | read | Tool catalogue |
+| GET | `/music`, `/music/midi`, `/music/prompt` | read | Mood-derived music parameters, MIDI or prompt |
+| GET | `/v1/models` | read | OpenAI-compatible model listing |
+| GET | `/motor/proposals` | read | Pending/decided proposals, shadow records and recent outcomes |
+| POST | `/ingest/signal` | ingest | External cognitive signal |
+| POST | `/diverger/notify` | ingest | Edge-change notification |
+| POST | `/tom/record` | ingest | Audience interaction |
+| POST | `/diverger/outcome`, `/outcomes` | ingest | Motor outcome callback; 202 |
+| POST | `/motor/proposals/{id}/approve` | approve | Send held proposal; requires `{"confirm":"yes"}` |
+| POST | `/motor/proposals/{id}/reject` | approve | Reject held proposal; optional note |
+| POST | `/walk` | admin | Walk and optional critic |
+| POST | `/v1/chat/completions` | admin | Walk plus LLM expression; non-streaming |
+| GET | `/benchmark` | admin | Runs multiple walks; intentionally not read-scoped |
+| POST | `/edge`, `/prune` | admin | Create edges or decay/delete edges |
+| POST | `/self/mode`, `/self/save` | admin | Change mode or save self-model |
+| POST | `/metacog/config` | admin | Update critic configuration |
+| POST | `/selection/stage`, `/selection/rollback` | admin | Selection controls |
+| POST | `/tools/execute` | admin | Execute a tool; node creation is disabled |
+| POST | `/dream` | admin | Explicit dream cycle; compliant mode suppresses activity |
+| POST | `/music/generate` | admin | Requires separately installed Python/MusicGen |
+| POST | `/speak` | admin | Currently returns 503 |
 
-### Stigmergic Walker Collective
-Walkers leave trails (visited nodes, dead ends, surprise domains). Other walkers read them. No explicit message passing — ant-colony coordination.
+Only the existing OpenAI routes have a `/v1` prefix; general `/v1` aliases are not implemented.
 
-## Quick Start
+## Motor channel and outcomes
 
-```bash
-# Prerequisites: PostgreSQL 16+, pgvector extension
-# Set environment
-export DATABASE_URL=postgresql:///rgw_test?host=/tmp
-export RGW_API_KEY="$(openssl rand -hex 32)"   # REQUIRED: rgw refuses to start without it
-export DEEPSEEK_API_KEY=sk-...
-export RUST_LOG=info,rgw=debug
+Every command receives a UUID `correlation_id`, exposed on its proposal and inside the command sent to `/api/admin/rgw/execute`.
 
-# Run the cascade demo (85-node philosophical graph + DeepSeek colloquy)
-cargo build --release --example cascade
-./target/release/examples/cascade
+| Motor mode | Behavior |
+|---|---|
+| `off` | Drop actions |
+| `shadow` (default) | Retain/log intent without sending |
+| `propose` | Queue up to 100 proposals, expiring after 24 hours; explicit approval sends |
+| `live` | Send immediately |
 
-# Run the digester demo (persistent belief formation)
-cargo build --release --example digester
-./target/release/examples/digester
+Outbound authentication is optional and separate from inbound API keys:
 
-# Run the API server
-./target/release/rgw \
-  --db-url "$DATABASE_URL" \
-  --ollama-url http://localhost:11434 \
-  --julian-url http://localhost:8000 \
-  --port 11435
+- `RGW_JULIAN_BEARER` sends `Authorization: Bearer …`.
+- `RGW_JULIAN_KEY` sends `X-RGW-Key: …`.
+- Both may be configured; neither is sent by default. Julian must support the chosen header.
 
-# Every endpoint except /health requires the X-RGW-Key header
-curl -H "X-RGW-Key: $RGW_API_KEY" http://localhost:11435/self
+Julian's existing callback and the shorter `/outcomes` route accept:
+
+```json
+{
+  "correlation_id": "f0f5b293-7f08-4d2b-8461-5fd76c8ae371",
+  "outcome": "completed",
+  "success": true,
+  "lesson": "Use the result on the next attempt."
+}
 ```
 
-## Cascade Demo Output
-
-The cascade runs a 5-phase cognitive test: warm-up walks → diverger cascade → high-arousal re-walk → self-model report → LLM colloquy.
-
-Example output from Phase 5 (DeepSeek conversation):
-
-```
-╔══ TURN 1: RGW reports its state ══╗
-DeepSeek: "The most striking pattern is a meta-epistemological recursion:
-your system repeatedly shifts focus from other domains back to epistemology..."
-
-╔══ TURN 2: RGW re-explores with new knowledge ══╗
-Beliefs: 1 | Noticings: 28 (+4) | Surprises: 33 (+2)
-
-╔══ TURN 3: RGW reports its evolution ══╗
-DeepSeek reflects: "The system doesn't just process your insight — it re-uses
-its own processing of your insight as a new basis for further exploration.
-Insight → integration → exploration → re-integration. The loop closes."
-```
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/chat/completions` | POST | OpenAI-compatible (walk + LLM express) |
-| `/v1/models` | GET | List available models |
-| `/walk` | POST | Raw graph traversal |
-| `/self` | GET | Self-model state |
-| `/self/save` | POST | Persist self-model to DB |
-| `/diverger` | GET | Reactor engine stats |
-| `/edge` | POST | Create graph edge |
-| `/prune` | POST | Synaptic pruning |
-| `/stats` | GET | Graph topology |
-| `/benchmark` | GET | Performance test |
-| `/health` | GET | Status check (includes `motor_mode`) |
-| `/motor/proposals` | GET | Motor gate: mode, counters, pending/decided proposals, shadow ring |
-| `/motor/proposals/{id}/approve` | POST | Approve and send one proposal (body `{"confirm":"yes"}`) |
-| `/motor/proposals/{id}/reject` | POST | Reject one proposal (optional body `{"note":"..."}`) |
-
-## Motor gate
-
-Every outbound motor action (diverger commands to `JULIAN_URL`, and the `image_generate` /
-`post_social` / `blog_publish` tools via `RGW_MOTOR_URL`) passes through one gate. The mode is
-read once at startup from `RGW_MOTOR_MODE`:
-
-| Mode | Behaviour |
-|------|-----------|
-| `off` | Drop the action (debug log, counted). |
-| `shadow` | **Default.** Nothing is sent. Logged at INFO as `[motor] SHADOW` and kept in a small ring for inspection. |
-| `propose` | Nothing is sent. The action is queued as a proposal (max 100, expires after 24 h) for a human to approve or reject. |
-| `live` | Send immediately (the pre-gate behaviour). |
-
-Unset, empty or unrecognised values fall back to `shadow`, never `live`. Approving a proposal is a
-human action: `POST /motor/proposals/{id}/approve` with the body `{"confirm":"yes"}` (exact,
-case-sensitive) and the `X-RGW-Key` header. It sends exactly once. Held tool calls return
-`success: false` with `metadata.held = true`.
+`success` and `lesson` are optional. The UUID must be non-nil; outcome must contain 1–500 characters and lesson at most 500. Accepted callbacks return 202. They are retained in a bounded, process-local ring (100 entries, latest callback per UUID), visible in `/motor/proposals`. They are **not durable** and do not yet update episodic learning: the existing episodic buffer has no command correlation mapping. Unknown UUIDs are accepted for compatibility with delayed callbacks.
 
 ## Configuration
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `DATABASE_URL` | required | PostgreSQL connection string |
-| `RGW_API_KEY` | **required** | Shared secret. RGW refuses to start if unset/empty. Callers send it as `X-RGW-Key` (all endpoints except `/health`). Generate with `openssl rand -hex 32`. |
-| `DEEPSEEK_API_KEY` | — | DeepSeek API key for LLM expression |
-| `DEEPSEEK_MODEL` | deepseek-chat | Model name (also: deepseek-reasoner) |
-| `RUST_LOG` | info | Log level (rgw=debug for detail) |
-| `WALKER_PORT` | 11435 | HTTP server port |
-| `RGW_MOTOR_MODE` | shadow | Motor gate: `off`, `shadow`, `propose` or `live` (see [Motor gate](#motor-gate)) |
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | required | Explicit PostgreSQL connection URL |
+| `RGW_API_KEY` | required | Full-access admin key; blank/unset fails closed |
+| `RGW_READ_KEY` | unset | GET read routes |
+| `RGW_INGEST_KEY` | unset | Signal, event, audience and outcome writes |
+| `RGW_APPROVE_KEY` | unset | Motor approve/reject |
+| `RGW_COGNITIVE_MODE` | `compliant` | `compliant` or `autonomous`; invalid values stop startup |
+| `RGW_DREAM_ENABLED` | `false` | Start background dream loop; also requires autonomous mode to act |
+| `RGW_CRITIC_APPLY` | `false` | Allow critic mutations; autonomous selection-live/rule-trials-live stages also enable application |
+| `RGW_CRITIC_LLM_INTERVAL` | `50` | Periodic LLM critic calibration interval |
+| `RGW_MOTOR_MODE` | `shadow` | `off`, `shadow`, `propose`, `live` |
+| `JULIAN_URL` | `http://localhost:8000` | Diverger motor target |
+| `RGW_MOTOR_URL` | unset | Motor tool target |
+| `RGW_JULIAN_BEARER` | unset | Outgoing Bearer credential, for both motor targets |
+| `RGW_JULIAN_KEY` | unset | Outgoing X-RGW-Key credential, for both motor targets |
+| `RGW_TENSION_MODE` | `observe` | `off`, `observe`, `brakes`, `live` |
+| `RGW_SEED_MODE` | `shadow` | `fixed`, `shadow`, `query` |
+| `RGW_ENABLE_AUTO_PRUNE` | off | Opt-in destructive node pruning in the dream loop |
+| `RGW_EVAL` | off | `1` enables per-request evaluation arms |
+| `RGW_DETERMINISTIC` | off | `1` enables deterministic walker execution |
+| `RGW_NARRATIVE_EXCLUDE_SOURCE_TYPES` | built-in private-source exclusions | Comma-separated narrative source filters |
+| `WALKER_HOST` / `WALKER_PORT` | `127.0.0.1` / `11435` | Bind address |
+| `WALKER_THREADS` | `0` | Auto-detect CPU threads |
+| `OLLAMA_URL` / `EXPRESSION_MODEL` | `http://localhost:11434` / `qwen3:14b` | Local expression fallback |
+| `DEEPSEEK_API_KEY` | unset | Cloud expression credential |
+| `DEEPSEEK_MODEL` / `DEEPSEEK_REASONER_MODEL` | `deepseek-chat` / `deepseek-reasoner` | Cloud models |
+| `RGW_MAX_CALLS_PER_MIN` | `60` | Process-local successful-call budget |
+| `RGW_MAX_DAILY_USD` | `10` | Process-local estimated spend budget |
+| `DEEPSEEK_MAX_PROMPT_TOKENS` | `2000` | Approximate prompt budget |
+| `RGW_DEDUP_TTL_SECS` | `60` | Completion cache TTL |
+| `RGW_REASONER_COMPLEXITY` | `0.85` | Reasoner routing threshold |
+| `MUSICGEN_PYTHON` | user MusicGen virtualenv | Music generation Python executable |
+| `RUST_LOG` | `info` | Logging filter |
 
-## Performance
+Dream/critic booleans accept `true`/`false` or `1`/`0`; invalid values stop startup. Spend limits are estimates within one process, not distributed hard quotas.
 
-- Binary size: ~26MB (release)
-- Walk rate: 30-50 hops/sec (6 walkers × 6 steps on M1 Pro)
-- Edge cache: lock-free reads (DashMap), batch writes
-- Memory: proportional to graph size
-- Database: PostgreSQL 16 with pgvector (768-dim embeddings)
+## Schema contract and tests
 
-## Design Protocols
+Julian's Alembic migrations remain authoritative. RGW does not migrate production databases. `RGW_SCHEMA_CONTRACT = "julian-rgw-1"` identifies the subset checked by readiness, not an entire Julian migration revision.
 
-Design documents for capabilities that are specified but not yet (fully) implemented. Each follows the same house format: thesis → problem → solution → file-by-file changes → safety invariants → graduated rollout → references.
+Required tables are `memory_vectors` (including `document` and `embedding vector(768)`), `memory_edges`, `runtime_settings` (`value TEXT`, `description`, `category`), and `rgw_episodes`. `tests/schema.sql` mirrors the relevant Julian baseline and episode migration, including NOT NULL columns and cascading edge foreign keys. ORM-only defaults are deliberately absent. Optional knowledge grounding reads `knowledge_vectors`.
 
-- [`docs/PROTOCOL-self-selection.md`](docs/PROTOCOL-self-selection.md) — **closing the evolutionary loop.** RGW *mutates* its biases and rules but historically never *selected* among the mutations (variants bred and never culled; rule changes applied with no evaluation or rollback). **Implemented so far:** emergent goals + audience model steer live walks (fix #3); per-profile fitness scorecards; a compute-only `selection_observe` pass logging three failure-mode detectors; and gated **quality-diversity cull/breed** (`SelfModStage`, default Observability). **Stage 2:** evaluate-then-keep for metacognitive rule changes (dream-replay + rollback), scored by one **acyclic** "coherent insight" fitness. Implemented, gated (RuleTrialsLive + agreement_metric=domain), default off. Framed as **bounded autonomy**: free variation inside a fixed, human-set fitness function.
-- `PROTOCOL-unconscious-walker.md` — an always-on, motor-disconnected third walker mode (Default Mode Network analogue) that consolidates and explores continuously and wakes the conscious walker on salience. (archived; recover with `git show fa03ebf^:PROTOCOL-unconscious-walker.md`)
-- `PROTOCOL-unconscious-v0.md` — minimal read-only Observability implementation of the unconscious walker: computes everything, commits nothing. (archived; recover with `git show fa03ebf^:PROTOCOL-unconscious-v0.md`)
-- `PROTOCOL-compliance-mode.md` — Compliant (deterministic, graph frozen) vs Autonomous (full emotional agency) cognitive modes. (archived; recover with `git show fa03ebf^:PROTOCOL-compliance-mode.md`)
+The `memory_store` tool and legacy `db::create_memory_node` fail cleanly: node creation must go through Julian's content/embedding pipeline.
+
+For a disposable local PostgreSQL instance only:
+
+```sh
+export DATABASE_URL='postgresql://rgw:rgwtest@127.0.0.1:55439/rgw_test'
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/schema.sql
+cargo build --locked
+cargo test --locked --lib --bins
+cargo test --locked --tests
+```
+
+The PR-only CI job uses pgvector/PostgreSQL 16 and the same schema. Synthetic graph tests run offline. Four tests are explicitly ignored because they need downloaded embedding weights: `test_digest_philosophy`, `targets_resolve_from_domain_and_embedding`, `observe_mode_logs_would_fire_and_emits_nothing`, and `a_fresh_embedding_bypasses_the_cache`. Run those individually with `--ignored` when the model is available and a disposable database is explicitly configured.
+
+## Speech: not implemented (TTS macOS-only stub, no STT)
+
+The speech module has a macOS `say` adapter, but the API uses disabled configuration and returns 503. Other speech engines are unimplemented. There is no speech-to-text route.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). RGW is the cognitive engine behind Project Julian and 2wardsmars, and is developed in the open; the personas, their content and the backends that drive them are separate projects.
+MIT — see [LICENSE](LICENSE).

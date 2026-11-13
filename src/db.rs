@@ -82,15 +82,15 @@ pub async fn edges_from(pool: &PgPool, node_id: i32) -> Result<Vec<MemoryEdge>, 
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.iter().map(|r| MemoryEdge {
-        id: r.get("id"),
-        source_id: r.get("source_id"),
-        target_id: r.get("target_id"),
-        edge_type: r.get("edge_type"),
-        weight: r.get("weight"),
-        emotional_charge: r.get("emotional_charge"),
-        traversal_count: r.get("traversal_count"),
-    }).collect())
+    rows.iter().map(|r| Ok(MemoryEdge {
+        id: r.try_get("id")?,
+        source_id: r.try_get("source_id")?,
+        target_id: r.try_get("target_id")?,
+        edge_type: r.try_get("edge_type")?,
+        weight: r.try_get("weight")?,
+        emotional_charge: r.try_get("emotional_charge")?,
+        traversal_count: r.try_get("traversal_count")?,
+    })).collect()
 }
 
 /// Get a node by ID (lightweight — no embedding)
@@ -105,15 +105,15 @@ pub async fn get_node(pool: &PgPool, id: i32) -> Result<Option<MemoryNode>, sqlx
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| MemoryNode {
-        id: r.get("id"),
-        domain: r.get("domain"),
-        valence: r.get("valence"),
-        arousal: r.get("arousal"),
-        importance: r.get("importance"),
-        access_count: r.get("access_count"),
+    row.map(|r| Ok(MemoryNode {
+        id: r.try_get("id")?,
+        domain: r.try_get("domain")?,
+        valence: r.try_get("valence")?,
+        arousal: r.try_get("arousal")?,
+        importance: r.try_get("importance")?,
+        access_count: r.try_get("access_count")?,
         embedding: None,
-    }))
+    })).transpose()
 }
 
 /// Get seed nodes — high importance, recently accessed
@@ -216,7 +216,7 @@ pub async fn similar_node_ids(pool: &PgPool, embedding: &[f32], limit: i64) -> R
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| (r.get("id"), r.get("similarity"))).collect())
+    rows.iter().map(|r| Ok((r.try_get("id")?, r.try_get("similarity")?))).collect()
 }
 
 /// Number of edges touching each id (0 for an id with none, or one that does not exist).
@@ -233,13 +233,13 @@ pub async fn node_degrees(pool: &PgPool, ids: &[i32]) -> Result<std::collections
     .bind(ids)
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    rows
         .iter()
         .map(|r| {
-            let degree: i64 = r.get("degree");
-            (r.get::<i32, _>("id"), degree.max(0) as u32)
+            let degree: i64 = r.try_get("degree")?;
+            Ok((r.try_get::<i32, _>("id")?, degree.max(0) as u32))
         })
-        .collect())
+        .collect()
 }
 
 /// Degree at percentile `pct` (0..1) over all nodes that have an edge; 0 for an empty graph.
@@ -286,7 +286,7 @@ pub async fn create_edge(
     .fetch_one(pool)
     .await?;
 
-    Ok(row.get("id"))
+    row.try_get("id")
 }
 
 /// Synaptic pruning: decay edges that haven't been traversed recently.
@@ -317,49 +317,12 @@ pub async fn prune_edges(pool: &PgPool, decay_per_day: f32, min_weight: f32) -> 
     Ok((decayed, deleted))
 }
 
-// ── Node Creation & Embedding Writes ────────────────────────────
-// RGW must be able to write back to the graph. The walker discovers
-// patterns → embeds them → creates nodes → creates edges.
-// This closes the autonomous growth loop.
-
-/// Create a new memory node with an embedding vector.
-/// Returns the new node ID. This is how the graph GROWS autonomously.
+/// Julian owns memory node content. Retained for source compatibility, but disabled.
 pub async fn create_memory_node(
-    pool: &PgPool,
-    content: &str,
-    domain: &str,
-    embedding: &[f32],
-    importance: f32,
-    valence: f32,
-    arousal: f32,
+    _pool: &PgPool, _content: &str, _domain: &str, _embedding: &[f32],
+    _importance: f32, _valence: f32, _arousal: f32,
 ) -> Result<i32, sqlx::Error> {
-    // pgvector expects the embedding as a formatted string: '[0.1,0.2,...]'
-    let emb_str = format!(
-        "[{}]",
-        embedding.iter()
-            .map(|f| f.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-
-    let row = sqlx::query(
-        "INSERT INTO memory_vectors (document, domain, embedding, importance, valence, arousal, access_count, created_at) \
-         VALUES ($1, $2, $3::vector, $4, $5, $6, 0, NOW()) \
-         RETURNING id"
-    )
-    .bind(content)
-    .bind(domain)
-    .bind(&emb_str)
-    .bind(importance)
-    .bind(valence)
-    .bind(arousal)
-    .fetch_one(pool)
-    .await?;
-
-    let id: i32 = row.get("id");
-    let preview: String = content.chars().take(60).collect();
-    tracing::debug!("[db] Created/updated memory node {}: {} (domain={})", id, preview, domain);
-    Ok(id)
+    Err(sqlx::Error::Protocol("memory node creation is disabled; Julian owns node content".into()))
 }
 
 /// Update an existing node's embedding (memory reconsolidation).
@@ -422,9 +385,7 @@ pub async fn find_similar_nodes(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.iter().map(|r| {
-        (r.get("id"), r.get("similarity"), r.get("content"))
-    }).collect())
+    rows.iter().map(|r| Ok((r.try_get("id")?, r.try_get("similarity")?, r.try_get("content")?))).collect()
 }
 
 /// Update node metadata (importance, access_count, valence, arousal).
@@ -473,7 +434,7 @@ pub async fn prune_nodes(pool: &PgPool, min_importance: f32, days_untouched: i32
 
 /// Save self-model state to database (persistence across restarts)
 pub async fn save_self_model(pool: &PgPool, model: &crate::core::SelfModel) -> Result<(), sqlx::Error> {
-    let json_str = serde_json::to_string(model).unwrap_or_default();
+    let json_str = serde_json::to_string(model).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     sqlx::query(
         "INSERT INTO runtime_settings (key, value, description, category, updated_at) \
          VALUES ('rgw_self_model', $1, 'RGW self-model snapshot', 'rgw', NOW()) \
@@ -493,7 +454,7 @@ pub async fn load_self_model(pool: &PgPool) -> Result<Option<crate::core::SelfMo
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.and_then(|(s,)| serde_json::from_str(&s).ok()))
+    decode_self_model(row.map(|(s,)| s))
 }
 
 /// Get detailed graph stats for API
@@ -505,16 +466,14 @@ pub async fn detailed_stats(pool: &PgPool) -> Result<serde_json::Value, sqlx::Er
          FROM memory_edges GROUP BY edge_type ORDER BY COUNT(*) DESC"
     )
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await?;
 
     let domain_dist: Vec<(String, i64)> = sqlx::query_as(
         "SELECT COALESCE(domain, 'unknown'), COUNT(*)::bigint \
          FROM memory_vectors GROUP BY domain ORDER BY COUNT(*) DESC LIMIT 15"
     )
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await?;
 
     Ok(serde_json::json!({
         "nodes": stats.nodes,
@@ -549,12 +508,12 @@ pub async fn find_knowledge_by_domain(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.iter().map(|r| KnowledgeNode {
-        id: r.get("id"),
-        skill_name: r.get("skill_name"),
-        layer: r.get("layer"),
-        title: r.get("title"),
-    }).collect())
+    rows.iter().map(|r| Ok(KnowledgeNode {
+        id: r.try_get("id")?,
+        skill_name: r.try_get("skill_name")?,
+        layer: r.try_get("layer")?,
+        title: r.try_get("title")?,
+    })).collect()
 }
 
 /// Memory domains that have a semantically-matching RAG skill in
@@ -663,12 +622,12 @@ pub async fn location_as_of(pool: &PgPool, to: &str) -> Result<Option<LocationAs
         .fetch_optional(pool)
         .await?;
 
-    Ok(row.map(|r| LocationAsOf {
-        location: r.get("location"),
-        lat: r.get("lat"),
-        lng: r.get("lng"),
-        occurred_at: r.get("occurred_at"),
-    }))
+    row.map(|r| Ok(LocationAsOf {
+        location: r.try_get("location")?,
+        lat: r.try_get("lat")?,
+        lng: r.try_get("lng")?,
+        occurred_at: r.try_get("occurred_at")?,
+    })).transpose()
 }
 
 /// Episodes occurring in `[from, to]`, chronological, capped at `limit`.
@@ -703,13 +662,13 @@ pub async fn recall_window(
         .fetch_all(pool)
         .await?;
 
-    Ok(rows.iter().map(|r| Episode {
-        occurred_at: r.get("occurred_at"),
-        kind: r.get("kind"),
-        location: r.get("location"),
-        headline: r.get("headline"),
-        detail: r.get("detail"),
-    }).collect())
+    rows.iter().map(|r| Ok(Episode {
+        occurred_at: r.try_get("occurred_at")?,
+        kind: r.try_get("kind")?,
+        location: r.try_get("location")?,
+        headline: r.try_get("headline")?,
+        detail: r.try_get("detail")?,
+    })).collect()
 }
 
 #[cfg(test)]
@@ -779,4 +738,44 @@ mod tests {
     fn none_when_no_episodes() {
         assert_eq!(location_as_of_rule(&[], MAY_3), None);
     }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    #[test]
+    fn malformed_snapshot_is_not_confirmed_empty() {
+        assert!(super::decode_self_model(Some("broken".into())).is_err());
+        assert!(super::decode_self_model(None).unwrap().is_none());
+        let mut model = crate::core::SelfModel::new();
+        model.total_signals_processed = 42;
+        let restored = super::decode_self_model(Some(serde_json::to_string(&model).unwrap())).unwrap().unwrap();
+        assert_eq!(restored.total_signals_processed, 42);
+    }
+}
+
+/// Decode errors must never masquerade as an empty database.
+fn decode_self_model(saved: Option<String>) -> Result<Option<crate::core::SelfModel>, sqlx::Error> {
+    saved.map(|json| serde_json::from_str(&json).map_err(|e| sqlx::Error::Decode(Box::new(e)))).transpose()
+}
+
+/// Startup fails closed on database or decoding errors, before any writer starts.
+pub async fn restore_self_model(pool: &PgPool) -> Result<crate::core::SelfModel, sqlx::Error> {
+    Ok(load_self_model(pool).await?.unwrap_or_default())
+}
+
+/// Version of the columns/types RGW consumes, not Julian's entire Alembic head.
+pub const RGW_SCHEMA_CONTRACT: &str = "julian-rgw-1";
+
+pub async fn schema_ready(pool: &PgPool) -> Result<(), sqlx::Error> {
+    // Zero-row selects check resolution, permissions and required columns without reading data.
+    sqlx::query("SELECT document, embedding FROM memory_vectors LIMIT 0").execute(pool).await?;
+    sqlx::query("SELECT id, source_id, target_id, edge_type, weight, emotional_charge, traversal_count, last_traversed, created_at FROM memory_edges LIMIT 0").execute(pool).await?;
+    sqlx::query("SELECT key, value, description, category, updated_at FROM runtime_settings LIMIT 0").execute(pool).await?;
+    sqlx::query("SELECT occurred_at, kind, location, lat, lng, headline, detail FROM rgw_episodes LIMIT 0").execute(pool).await?;
+    let valid: bool = sqlx::query_scalar(
+        "SELECT (SELECT atttypid = 'text'::regtype FROM pg_attribute WHERE attrelid = 'runtime_settings'::regclass AND attname = 'value' AND NOT attisdropped)
+         AND (SELECT t.typname = 'vector' AND a.atttypmod = 768 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'memory_vectors'::regclass AND a.attname = 'embedding' AND NOT a.attisdropped)")
+        .fetch_one(pool).await?;
+    if !valid { return Err(sqlx::Error::Protocol("incompatible schema contract".into())); }
+    Ok(())
 }

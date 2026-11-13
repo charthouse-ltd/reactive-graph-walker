@@ -35,6 +35,7 @@ use std::time::Duration;
 /// what was said and to whom, building an audience model over time.
 #[derive(Debug, Clone, Serialize)]
 pub struct MotorCommand {
+    pub correlation_id: uuid::Uuid,
     /// What to do
     pub action: String,
     /// Which domain this relates to
@@ -129,6 +130,7 @@ pub enum ProposalStatus {
 /// A motor action waiting for (or past) a human decision.
 #[derive(Debug, Clone, Serialize)]
 pub struct Proposal {
+    pub correlation_id: uuid::Uuid,
     pub id: u64,
     pub created_at: u64,
     /// "diverger" | "tool:<name>"
@@ -208,6 +210,7 @@ pub struct MotorGate {
     shadow: Mutex<VecDeque<ShadowRecord>>,
     next_id: AtomicU64,
     counters: Counters,
+    outcomes: Mutex<VecDeque<MotorOutcome>>,
 }
 
 fn now_secs() -> u64 {
@@ -225,6 +228,7 @@ impl MotorGate {
             shadow: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
             counters: Counters::default(),
+            outcomes: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -293,6 +297,7 @@ impl MotorGate {
                     }
                 }
                 q.push_back(Proposal {
+                    correlation_id: cmd.correlation_id,
                     id,
                     created_at: now_secs(),
                     source: source.to_string(),
@@ -437,6 +442,7 @@ impl MotorGate {
             "pending": pending,
             "decided": decided,
             "shadow": shadow,
+            "outcomes": self.outcomes.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect::<Vec<_>>(),
         })
     }
 
@@ -500,11 +506,9 @@ pub(crate) async fn send(
     if base_url.is_empty() {
         return Err("no motor backend URL configured".into());
     }
-    let url = format!("{}/api/admin/rgw/execute", base_url);
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .json(cmd)
-        .timeout(timeout)
+    let bearer = std::env::var("RGW_JULIAN_BEARER").ok();
+    let key = std::env::var("RGW_JULIAN_KEY").ok();
+    let resp = motor_request(base_url, cmd, timeout, bearer.as_deref(), key.as_deref())
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -542,6 +546,7 @@ pub(crate) mod test_support {
 
     pub fn cmd(action: &str) -> super::MotorCommand {
         super::MotorCommand {
+            correlation_id: uuid::Uuid::new_v4(),
             action: action.into(),
             domain: "test".into(),
             walker_context: String::new(),
@@ -709,5 +714,58 @@ mod tests {
         if GATE.get().is_none() {
             assert_eq!(gate().mode(), MotorMode::Shadow);
         }
+    }
+}
+
+#[cfg(test)]
+mod correlation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn proposal_and_delivery_keep_correlation_and_auth() {
+        let command = test_support::cmd("journal");
+        let correlation = command.correlation_id;
+        let gate = MotorGate::new(MotorMode::Propose);
+        gate.dispatch("test", "http://127.0.0.1:9", command.clone()).await;
+        assert_eq!(gate.snapshot()["pending"][0]["command"]["correlation_id"], correlation.to_string());
+        assert_eq!(gate.snapshot()["pending"][0]["correlation_id"], correlation.to_string());
+        let request = motor_request("http://127.0.0.1:9", &command, Duration::from_secs(1),
+            Some("test-bearer"), Some("test-julian-key")).build().unwrap();
+        assert_eq!(request.headers()["Authorization"], "Bearer test-bearer");
+        assert_eq!(request.headers()["X-RGW-Key"], "test-julian-key");
+        let body: serde_json::Value = serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["correlation_id"], correlation.to_string());
+    }
+}
+
+fn motor_request(base_url: &str, cmd: &MotorCommand, timeout: Duration,
+    bearer: Option<&str>, key: Option<&str>) -> reqwest::RequestBuilder {
+    let mut request = reqwest::Client::new()
+        .post(format!("{}/api/admin/rgw/execute", base_url.trim_end_matches('/')))
+        .json(cmd).timeout(timeout);
+    if let Some(value) = bearer.filter(|s| !s.trim().is_empty()) {
+        request = request.bearer_auth(value);
+    }
+    if let Some(value) = key.filter(|s| !s.trim().is_empty()) {
+        request = request.header("X-RGW-Key", value);
+    }
+    request
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MotorOutcome {
+    pub correlation_id: uuid::Uuid,
+    pub outcome: String,
+    pub success: Option<bool>,
+    pub lesson: Option<String>,
+}
+
+impl MotorGate {
+    /// No episode correlation exists yet. Retain the latest bounded callbacks for inspection.
+    pub fn record_outcome(&self, outcome: MotorOutcome) {
+        tracing::info!(correlation_id = %outcome.correlation_id, "Motor outcome received");
+        let mut outcomes = self.outcomes.lock().unwrap_or_else(|e| e.into_inner());
+        outcomes.retain(|o| o.correlation_id != outcome.correlation_id);
+        outcomes.push_back(outcome);
+        while outcomes.len() > PROPOSAL_CAP { outcomes.pop_front(); }
     }
 }
