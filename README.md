@@ -49,7 +49,7 @@ The existing `RGW_API_KEY` remains a full-access **admin** key. It also approves
 | POST | `/motor/proposals/{id}/reject` | approve | Reject held proposal; optional note |
 | POST | `/walk` | admin | Walk and optional critic |
 | POST | `/v1/chat/completions` | admin | Walk plus LLM expression; non-streaming |
-| GET | `/benchmark` | admin | Runs multiple walks; intentionally not read-scoped |
+| POST | `/benchmark` | admin | Runs multiple walks; GET with an admin key returns 405 |
 | POST | `/edge`, `/prune` | admin | Create edges or decay/delete edges |
 | POST | `/self/mode`, `/self/save` | admin | Change mode or save self-model |
 | POST | `/metacog/config` | admin | Update critic configuration |
@@ -120,6 +120,21 @@ Julian's existing callback and the shorter `/outcomes` route accept:
 | `OLLAMA_URL` / `EXPRESSION_MODEL` | `http://localhost:11434` / `qwen3:14b` | Local expression fallback |
 | `DEEPSEEK_API_KEY` | unset | Cloud expression credential |
 | `DEEPSEEK_MODEL` / `DEEPSEEK_REASONER_MODEL` | `deepseek-chat` / `deepseek-reasoner` | Cloud models |
+| `RGW_MAX_CONCURRENT_WALKS` | `2` | Shared HTTP cap: walk, chat (including bypass), benchmark and dream |
+| `RGW_MAX_CONCURRENT_WORK` | `2` | Shared HTTP cap: signal embedding, tools and motor approval |
+| `RGW_MAX_CONCURRENT_MAINTENANCE` | `1` | Shared HTTP cap: prune, music generation and speech |
+| `RGW_MAX_CONCURRENT_BENCHMARKS` | `1` | Additional benchmark cap; also occupies a walk slot |
+| `RGW_RATE_LIMIT_RPS` | `10` | Tokens refilled per second per key |
+| `RGW_RATE_LIMIT_BURST` | `30` | Token capacity; one token per authenticated POST attempt |
+| `RGW_RATE_LIMIT_CLIENTS` | `1024` | Maximum retained key/client buckets |
+| `RGW_MAX_WALKERS` | `8` | Maximum walkers per HTTP walk/chat/benchmark |
+| `RGW_MAX_STEPS` | `32` | Maximum steps per HTTP walk/chat/benchmark |
+| `RGW_MAX_BODY_BYTES` | `1048576` | Maximum request body size, including streamed bodies |
+| `RGW_MAX_RECALL_LIMIT` | `200` | Recall result ceiling; existing DB ceiling of 200 still applies |
+| `RGW_MAX_ENERGY_NODES` | `10000` | Maximum retained diverger node energies |
+| `RGW_MAX_MUSIC_SECONDS` | `30` | Maximum requested MusicGen duration |
+| `RGW_MAX_COMPLETION_TOKENS` | `4096` | Maximum chat output tokens; absent request value uses 1024 |
+| `RGW_MAX_METACOG_PHASES` | `8` | Maximum phase-order entries in a metacognitive config patch |
 | `RGW_MAX_CALLS_PER_MIN` | `60` | Process-local successful-call budget |
 | `RGW_MAX_DAILY_USD` | `10` | Process-local estimated spend budget |
 | `DEEPSEEK_MAX_PROMPT_TOKENS` | `2000` | Approximate prompt budget |
@@ -129,6 +144,22 @@ Julian's existing callback and the shorter `/outcomes` route accept:
 | `RUST_LOG` | `info` | Logging filter |
 
 Dream/critic booleans accept `true`/`false` or `1`/`0`; invalid values stop startup. Spend limits are estimates within one process, not distributed hard quotas.
+
+## Admission control
+
+Concurrency saturation returns **503 JSON** with `Retry-After: 1`, without waiting for a slot. A benchmark occupies both a benchmark slot and a walk slot. Permits cover the full handler, including downstream calls; disconnecting does not release a slot while admitted work is still running. Background dream/diverger activity retains its existing controls; these HTTP caps do not constitute a global background-work budget.
+
+All authenticated POST routes share one token bucket per exact `X-RGW-Key` value, across routes and connections. Authentication and scope checks run first. Rate exhaustion returns **429 JSON** with a whole-second `Retry-After`; attempts rejected for concurrency or body size also consume a token. The middleware falls back to the socket peer IP only when no key is supplied, ignores forwarding headers, and uses a shared fallback bucket if peer metadata is unavailable. Existing protected routes still reject missing keys. The bounded bucket table evicts only fully replenished entries; a new identity gets 429 while the table is full of active buckets. Limits are process-local and reset on restart.
+
+GET `/health`, `/ready` and `/metrics` bypass concurrency and rate admission. The body ceiling applies to every registered route, even when its handler ignores the body; oversized bodies return **413 JSON**. Auth errors take precedence on protected routes.
+
+Walk and chat counts clamp to `1..=RGW_MAX_WALKERS` and `1..=RGW_MAX_STEPS` before execution in every cognitive and seeding mode. Zero walkers selects the CPU count, still capped; zero steps becomes one. Benchmark configurations use the same clamps. Existing query-plan step limits remain in effect. Recall limits, music duration and chat output tokens are also clamped. Oversized `phase_order` config patches are rejected atomically with 400; mandatory draft/critique validation is unchanged. Values outside their JSON integer types are rejected by the existing extractors, rather than overflowing. Other retrieval top-k and cascade depth values are internal constants, not caller parameters.
+
+Every diverger energy-map insertion is bounded, including notification endpoints, startup seeds and exploration pulses. Nonpositive IDs and new IDs arriving at capacity are dropped; retained IDs continue receiving updates. Entries are not evicted to admit new IDs, so this cap may need tuning for the graph size. Notification acceptance still means queued, not guaranteed activation.
+
+The new configuration values are positive integers, read once at startup; zero, malformed or out-of-range values stop startup without echoing their contents. Defaults accommodate Julian's current 4-walker/5-step calls (including 2/3 callers), 500-character stimuli, 2,000-character bridge content and up to five recall notifications. The client accepts arbitrary `context` objects, so unusually large custom contexts remain subject to the body ceiling.
+
+`/metrics` exposes cumulative `admission_concurrency_rejected`, `admission_rate_rejected`, `admission_body_rejected` and `admission_energy_rejected` counters, without key or client labels.
 
 ## Schema contract and tests
 

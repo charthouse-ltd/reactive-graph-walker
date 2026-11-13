@@ -14,6 +14,11 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+pub static ADMISSION_RATE_REJECTED: AtomicU64 = AtomicU64::new(0);
+pub static ADMISSION_CONCURRENCY_REJECTED: AtomicU64 = AtomicU64::new(0);
+pub static ADMISSION_BODY_REJECTED: AtomicU64 = AtomicU64::new(0);
+pub static ADMISSION_ENERGY_REJECTED: AtomicU64 = AtomicU64::new(0);
+
 /// DeepSeek published pricing, USD per 1M tokens (cache-miss rates).
 /// Used for cost ESTIMATION only; override with env if rates change.
 const CHAT_INPUT_USD_PER_M: f64 = 0.27;
@@ -275,6 +280,11 @@ pub fn record_failure() {
 /// Serializable scorecard snapshot — the numbers PHASE 0/DELIVERABLE want.
 #[derive(Debug, Serialize)]
 pub struct MetricsSnapshot {
+    pub admission_rate_rejected: u64,
+    pub admission_concurrency_rejected: u64,
+    pub admission_body_rejected: u64,
+    pub admission_energy_rejected: u64,
+
     pub calls: u64,
     pub failed_calls: u64,
     pub dedup_hits: u64,
@@ -339,6 +349,10 @@ pub fn snapshot() -> MetricsSnapshot {
     let tom_correct = METRICS.tom_correct.load(Ordering::Relaxed);
 
     MetricsSnapshot {
+        admission_rate_rejected: ADMISSION_RATE_REJECTED.load(Ordering::Relaxed),
+        admission_concurrency_rejected: ADMISSION_CONCURRENCY_REJECTED.load(Ordering::Relaxed),
+        admission_body_rejected: ADMISSION_BODY_REJECTED.load(Ordering::Relaxed),
+        admission_energy_rejected: ADMISSION_ENERGY_REJECTED.load(Ordering::Relaxed),
         calls,
         failed_calls: METRICS.failed_calls.load(Ordering::Relaxed),
         dedup_hits: dedup,

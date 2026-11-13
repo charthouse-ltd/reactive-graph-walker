@@ -30,6 +30,18 @@ struct NodeEnergy {
     fatigue: f32,      // rises on fire, decays with rest; raises this node's threshold
 }
 
+/// Refuse new IDs at capacity; existing nodes can still receive energy.
+fn bounded_energy(nodes: &mut HashMap<i32, NodeEnergy>, id: i32, now: f64,
+    initial: f32, max_nodes: usize) -> Option<&mut NodeEnergy> {
+    if id <= 0 || (!nodes.contains_key(&id) && nodes.len() >= max_nodes) {
+        crate::metrics::ADMISSION_ENERGY_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(nodes.entry(id).or_insert(NodeEnergy {
+        energy: initial, last_fired: 0.0, last_update: now, fatigue: 0.0,
+    }))
+}
+
 /// The reactor's firing threshold right now: the configured base, lowered by
 /// arousal and raised by low energy (the same formula the reactor applies).
 pub(crate) fn dynamic_threshold(base: f32, emo: &EmotionalState) -> f32 {
@@ -242,6 +254,7 @@ pub struct DivergerConfig {
 
     /// Propagation depth limit (how many cascade hops before stopping)
     pub max_cascade_depth: u32,
+    pub max_energy_nodes: usize,
 }
 
 impl Default for DivergerConfig {
@@ -255,6 +268,7 @@ impl Default for DivergerConfig {
             refractory_period: 0.5,
             max_edges_per_second: 100,    // Hard cap: 100 edge changes/sec
             max_walks_per_minute: 60,     // Hard cap: 1 walk/sec average
+            max_energy_nodes: crate::admission::Limits::default().energy_nodes,
             max_cascade_depth: 3,         // Max 3 hops of propagation
         }
     }
@@ -277,12 +291,17 @@ pub struct DivergerStats {
 impl Diverger {
     /// Create a new Diverger engine with shared self-model.
     pub fn new(pool: PgPool, self_model: std::sync::Arc<tokio::sync::Mutex<crate::core::SelfModel>>, julian_url: &str) -> Self {
+        Self::with_energy_limit(pool, self_model, julian_url, crate::admission::Limits::default().energy_nodes)
+    }
+
+    pub fn with_energy_limit(pool: PgPool, self_model: std::sync::Arc<tokio::sync::Mutex<crate::core::SelfModel>>,
+        julian_url: &str, max_energy_nodes: usize) -> Self {
         // Bounded: a burst of edge changes must apply backpressure (drop + count),
         // not grow the heap without limit while the reactor awaits the DB.
         let (edge_tx, edge_rx) = mpsc::channel(EDGE_QUEUE_CAPACITY);
         let sm = self_model.clone();
 
-        let config = DivergerConfig::default();
+        let config = DivergerConfig { max_energy_nodes, ..Default::default() };
         let diverger = Self {
             pool,
             nodes: Arc::new(RwLock::new(HashMap::new())),
@@ -418,12 +437,8 @@ impl Diverger {
                         .as_secs_f64();
 
                     for &nid in &node_ids {
-                        let node = nodes_lock.entry(nid).or_insert(NodeEnergy {
-                            energy: 0.0,
-                            last_fired: 0.0,
-                            last_update: now,
-                            fatigue: 0.0,
-                        });
+                        let Some(node) = bounded_energy(&mut nodes_lock, nid, now, 0.0, config.max_energy_nodes)
+                            else { continue; };
 
                         // Apply energy decay since this node was last updated.
                         // Decay is clocked off last_update, NOT last_fired: a node that
@@ -470,12 +485,8 @@ impl Diverger {
                             .as_secs_f64();
                         let mut nodes_lock = nodes.write().await;
                         for id in pulse_nodes {
-                            let node = nodes_lock.entry(id).or_insert(NodeEnergy {
-                                energy: 0.0,
-                                last_fired: 0.0,
-                                last_update: now,
-                                fatigue: 0.0,
-                            });
+                            let Some(node) = bounded_energy(&mut nodes_lock, id, now, 0.0, config.max_energy_nodes)
+                                else { continue; };
                             node.energy += 0.08;
                             node.last_update = now;
                         }
@@ -803,12 +814,7 @@ impl Diverger {
             .as_secs_f64();
         let mut nodes = self.nodes.write().await;
         for id in node_ids {
-            nodes.entry(id).or_insert(NodeEnergy {
-                energy: initial_energy,
-                last_fired: 0.0,
-                last_update: now,
-                fatigue: 0.0,
-            });
+            bounded_energy(&mut nodes, id, now, initial_energy, self.config.max_energy_nodes);
         }
         tracing::info!("[diverger] Seeded {} nodes with {:.2} energy", nodes.len(), initial_energy);
     }
@@ -816,6 +822,20 @@ impl Diverger {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn energy_map_rejects_new_ids_at_capacity_but_updates_existing_nodes() {
+        let mut nodes = std::collections::HashMap::new();
+        for id in -1..20 {
+            if let Some(node) = super::bounded_energy(&mut nodes, id, 1.0, 0.2, 2) { node.energy += 0.1; }
+        }
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.contains_key(&1) && nodes.contains_key(&2));
+        let node = super::bounded_energy(&mut nodes, 1, 2.0, 0.0, 2).unwrap();
+        node.energy += 0.5;
+        assert!((nodes[&1].energy - 0.8).abs() < 1e-6);
+        assert!(super::bounded_energy(&mut nodes, 99, 3.0, 0.0, 2).is_none());
+    }
+
     #[tokio::test]
     async fn energy_view_headroom_decays_energy_and_raises_threshold_by_fatigue() {
         let view = super::EnergyView::for_test(0.5, 0.01);
