@@ -26,6 +26,7 @@ mod music;
 mod tools;
 mod speech;
 mod api;
+mod admission;
 mod tension;
 mod seeding;
 
