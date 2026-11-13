@@ -21,6 +21,7 @@ pub mod music;
 pub mod tools;
 pub mod speech;
 pub mod api;
+pub mod admission;
 pub mod tension;
 pub mod seeding;
 pub mod evalkit;
