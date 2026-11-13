@@ -143,15 +143,14 @@ pub async fn seed_database(pool: &PgPool) -> anyhow::Result<Vec<i32>> {
         // Generate embedding using fastembed
         let embedding = rgw::embed::embed_text(node.content)?;
 
-        let id = rgw::db::create_memory_node(
-            pool,
-            node.content,
-            node.domain,
-            &embedding,
-            node.importance,
-            node.valence,
-            0.5, // arousal
-        ).await?;
+        let vector = format!("[{}]", embedding.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","));
+        let id: i32 = sqlx::query_scalar(
+            "INSERT INTO memory_vectors (doc_id, document, domain, embedding, importance, valence, arousal,
+             post_id, title, mood, persona, location, source_type, published_at, month, word_count,
+             stored_at, access_count, last_accessed, created_at, updated_at)
+             VALUES ($1, $2, $3, $4::vector, $5, $6, 0.5, 0, '', '', '', '', 'fixture', '', '', 0, 0, 0, 0, NOW(), NOW()) RETURNING id")
+            .bind(format!("philosophy-{i}")).bind(node.content).bind(node.domain).bind(vector)
+            .bind(node.importance).bind(node.valence).fetch_one(pool).await?;
 
         node_ids.push(id);
         println!("  [{:2}] {:30} | domain={:15} | importance={:.1}",

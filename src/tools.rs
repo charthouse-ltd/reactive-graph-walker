@@ -3,7 +3,7 @@
 //! Tools:
 //!   - web_search: search the internet, results become graph nodes
 //!   - web_fetch: scrape a URL, content becomes a graph node
-//!   - memory_store: create a new memory node in the graph
+//!   - memory_store: disabled (Julian owns node content)
 //!   - edge_create: connect two nodes
 //!   - code_exec: REMOVED — was an unauthenticated RCE (python3 -c). Needs a real sandbox before it can return.
 //!   - speech_say: speak text via TTS (future)
@@ -120,7 +120,7 @@ pub fn available_tools() -> Vec<Tool> {
         },
         Tool {
             name: "memory_store".into(),
-            description: "Store a new memory/concept in the graph.".into(),
+            description: "Disabled: Julian owns memory node content and embeddings.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -262,6 +262,7 @@ pub(crate) async fn motor_tool_via(
     }
 
     let cmd = crate::motor::MotorCommand {
+        correlation_id: uuid::Uuid::new_v4(),
         action: action.to_string(),
         domain: params["domain"].as_str().unwrap_or("content").to_string(),
         walker_context: String::new(),
@@ -610,49 +611,13 @@ fn extract_readable_text(html: &str) -> String {
     lines.join("\n")
 }
 
-/// Store a new memory node
-async fn memory_store(params: serde_json::Value, pool: &sqlx::PgPool) -> ToolResult {
-    let content = params["content"].as_str().unwrap_or("");
-    let domain = params["domain"].as_str().unwrap_or("unknown");
-    let importance = params["importance"].as_f64().unwrap_or(5.0) as f32;
-
-    if content.is_empty() {
-        return ToolResult {
-            tool: "memory_store".into(),
-            success: false,
-            content: "Empty content".into(),
-            metadata: serde_json::json!({}),
-        };
-    }
-
-    // Store via direct SQL (nodes are memory_vectors rows)
-    match sqlx::query(
-        "INSERT INTO memory_vectors (doc_id, document, domain, importance, source_type, stored_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, 'rgw_tool', extract(epoch from now()), NOW(), NOW()) \
-         RETURNING id"
-    )
-    .bind(format!("rgw_{}", chrono::Utc::now().timestamp()))
-    .bind(content)
-    .bind(domain)
-    .bind(importance)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(row) => {
-            let id: i32 = row.get("id");
-            ToolResult {
-                tool: "memory_store".into(),
-                success: true,
-                content: format!("Stored as node {} (domain: {})", id, domain),
-                metadata: serde_json::json!({"node_id": id, "domain": domain}),
-            }
-        }
-        Err(e) => ToolResult {
-            tool: "memory_store".into(),
-            success: false,
-            content: format!("Store failed: {}", e),
-            metadata: serde_json::json!({}),
-        },
+/// Node content is owned by Julian and must go through its ingestion pipeline.
+async fn memory_store(_params: serde_json::Value, _pool: &sqlx::PgPool) -> ToolResult {
+    ToolResult {
+        tool: "memory_store".into(),
+        success: false,
+        content: "memory_store is disabled; Julian owns memory node content and embeddings".into(),
+        metadata: serde_json::json!({"disabled": true}),
     }
 }
 
@@ -692,7 +657,6 @@ mod urlencoding {
     }
 }
 
-use sqlx::Row;
 
 #[cfg(test)]
 mod tests {

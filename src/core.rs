@@ -1532,3 +1532,24 @@ mod tests {
         assert!(loaded.unwrap().rule_rollback_entries.is_empty());
     }
 }
+
+#[cfg(test)]
+mod production_mode_tests {
+    use super::*;
+    #[test]
+    fn cognitive_mode_defaults_safe_and_rejects_typos() {
+        assert_eq!(CognitiveMode::from_env_value(None).unwrap(), CognitiveMode::Compliant);
+        assert_eq!(CognitiveMode::from_env_value(Some("autonomous")).unwrap(), CognitiveMode::Autonomous);
+        assert!(CognitiveMode::from_env_value(Some("automous")).is_err());
+    }
+}
+
+impl CognitiveMode {
+    pub fn from_env_value(value: Option<&str>) -> anyhow::Result<Self> {
+        match value.unwrap_or("compliant").trim().to_ascii_lowercase().as_str() {
+            "compliant" => Ok(Self::Compliant),
+            "autonomous" => Ok(Self::Autonomous),
+            _ => anyhow::bail!("RGW_COGNITIVE_MODE must be compliant or autonomous"),
+        }
+    }
+}

@@ -127,6 +127,7 @@ async fn run_walks(pool: &PgPool) -> anyhow::Result<()> {
 // ── Main ────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "requires downloaded embedding model; run explicitly with --ignored"]
 async fn test_digest_philosophy() -> anyhow::Result<()> {
     // Initialize tracing for visibility
     tracing_subscriber::fmt()
@@ -142,7 +143,7 @@ async fn test_digest_philosophy() -> anyhow::Result<()> {
 
     // Connect to database
     let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql:///rgw_test?host=/tmp".to_string());
+        .expect("DATABASE_URL must explicitly select a throwaway test database");
     println!("Connecting to: {}", db_url);
     let pool = rgw::db::connect(&db_url).await?;
 
@@ -173,14 +174,7 @@ async fn test_digest_philosophy() -> anyhow::Result<()> {
 /// Hebbian). Uses two real edges well below the 1.0 cap.
 #[tokio::test]
 async fn edge_flush_applies_per_edge_deltas() -> anyhow::Result<()> {
-    rgw::embed::init()?;
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql:///rgw_test?host=/tmp".to_string());
-    let pool = rgw::db::connect(&db_url).await?;
-    sqlx::raw_sql(include_str!("schema.sql")).execute(&pool).await?;
-    if rgw::db::graph_stats(&pool).await?.nodes == 0 {
-        seed_database(&pool).await?;
-    }
+    let pool = common::fixture::fixture_pool("phase1_edge_flush").await?;
     let rows: Vec<(i32, f32)> = sqlx::query_as(
         "SELECT id, weight::float4 FROM memory_edges WHERE weight < 0.8 ORDER BY id LIMIT 2",
     )
@@ -213,10 +207,11 @@ async fn edge_flush_applies_per_edge_deltas() -> anyhow::Result<()> {
 /// importance; an open question maps by embedding similarity. Energy is split
 /// across an item's targets, never multiplied.
 #[tokio::test]
+#[ignore = "requires downloaded embedding model; run explicitly with --ignored"]
 async fn targets_resolve_from_domain_and_embedding() -> anyhow::Result<()> {
     rgw::embed::init()?;
     let pool = rgw::db::connect(
-        &std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgresql:///rgw_test?host=/tmp".into()),
+        &std::env::var("DATABASE_URL").expect("DATABASE_URL must explicitly select a throwaway test database"),
     )
     .await?;
     sqlx::raw_sql(include_str!("schema.sql")).execute(&pool).await?;
