@@ -11,7 +11,9 @@ async fn candidates_are_ranked_by_cosine_with_degrees() -> anyhow::Result<()> {
     let ids: Vec<i32> = cands.iter().take(5).map(|c| c.id).collect();
     assert_eq!(ids, vec![B1, B2, B3, B4, HUB]);
     assert!((cands[0].cos - 1.0).abs() < 1e-4);
-    assert!((cands[4].cos - 0.7071).abs() < 1e-3);
+    #[allow(clippy::approx_constant)] // Preserve the rounded fixture expectation and its tolerance.
+    let expected_cos = 0.7071;
+    assert!((cands[4].cos - expected_cos).abs() < 1e-3);
     let deg = |id: i32| cands.iter().find(|c| c.id == id).unwrap().degree;
     assert_eq!((deg(B1), deg(HUB), deg(B4)), (3, 4, 1));
     Ok(())

@@ -5,6 +5,9 @@
 //! Parallel walkers with emotional biasing. Convergence = confidence.
 //! Divergence = novelty. The walk changes the graph. The graph IS the mind.
 
+// The binary recompiles library modules and intentionally uses only part of their public API.
+#![allow(dead_code)]
+
 mod core;
 mod embed;
 mod db;

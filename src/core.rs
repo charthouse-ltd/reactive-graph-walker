@@ -938,10 +938,14 @@ struct Snapshot {
     arousal: f32,
     energy: f32,
     focus: String,
+    #[allow(dead_code)] // Preserve captured snapshot data without changing observation behavior.
     focus_intensity: f32,
+    #[allow(dead_code)] // Preserve captured snapshot data without changing observation behavior.
     top_attention: Option<(String, f32)>,
+    #[allow(dead_code)] // Preserve captured snapshot data without changing observation behavior.
     dead_ends_total: u32,
     surprise_count: u32,
+    #[allow(dead_code)] // Preserve captured snapshot data without changing observation behavior.
     last_belief_formed: f64,
 }
 
@@ -1343,12 +1347,10 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
     if s.chars().count() <= max_chars {
         return s;
     }
-    let mut char_count = 0;
-    for (i, _) in s.char_indices() {
+    for (char_count, (i, _)) in s.char_indices().enumerate() {
         if char_count >= max_chars {
             return &s[..i];
         }
-        char_count += 1;
     }
     s
 }

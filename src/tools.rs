@@ -38,10 +38,13 @@ pub struct ToolRegistry {
     executors: Vec<ToolExecutor>,
 }
 
+pub type ToolFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<ToolResult>> + Send>>;
+pub type ToolCallback = dyn Fn(serde_json::Value) -> ToolFuture + Send + Sync;
+
 pub struct ToolExecutor {
     pub name: String,
     pub description: String,
-    pub execute: Arc<dyn Fn(serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<ToolResult>> + Send>> + Send + Sync>,
+    pub execute: Arc<ToolCallback>,
 }
 
 impl ToolRegistry {

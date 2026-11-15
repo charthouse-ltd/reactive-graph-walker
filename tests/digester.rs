@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::time::Instant;
 
 use sqlx::PgPool;
 
@@ -28,7 +27,7 @@ use common::seed_database;
 // ── Walking ─────────────────────────────────────────────────────
 
 async fn run_walks(pool: &PgPool) -> anyhow::Result<()> {
-    use rgw::core::{self, SelfModel};
+    use rgw::core::SelfModel;
     use rgw::graph::EmotionalState;
     use rgw::walker;
 

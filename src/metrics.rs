@@ -427,7 +427,7 @@ mod tests {
         let before = snapshot().calls;
         record_call("deepseek-chat", 100, 50);
         let after = snapshot();
-        assert!(after.calls >= before + 1, "a recorded call must increment the counter");
+        assert!(after.calls > before, "a recorded call must increment the counter");
         assert!(after.total_tokens >= 150);
     }
 }

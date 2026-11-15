@@ -261,7 +261,7 @@ pub fn generate_midi(params: &MusicParams) -> Vec<u8> {
             let note = params.scale[new_idx];
             let note_ticks = ticks_per_beat / (notes_this_beat as u32);
             let velocity = (params.velocity as i32 + rng.random_range(-10..=10))
-                .max(30).min(127) as u8;
+                .clamp(30, 127) as u8;
 
             midi.note_on(current_tick + sub as u32 * note_ticks, note, velocity);
             midi.note_off(current_tick + sub as u32 * note_ticks + note_ticks - 10, note);

@@ -1906,7 +1906,7 @@ pub fn format_audience_context(sm: &SelfModel, audience_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{self, SelfModel, CognitiveMode, Noticing, AudienceBeliefs};
+    use crate::core::{self, SelfModel, CognitiveMode, AudienceBeliefs};
     use crate::graph::{WalkOutput, WalkerResult, WalkerBias};
     use std::collections::HashMap;
 
@@ -2142,9 +2142,9 @@ mod tests {
 
         assert_eq!(diagnosis.primary_diagnosis, DiagnosisLabel::BreakLoop);
         assert!(diagnosis.is_stuck);
-        assert!(diagnosis.algorithmic_adjustments.attention_deltas.len() > 0);
+        assert!(!diagnosis.algorithmic_adjustments.attention_deltas.is_empty());
         // Should have negative attention deltas (reduce saturated domains)
-        for (_, delta) in &diagnosis.algorithmic_adjustments.attention_deltas {
+        for delta in diagnosis.algorithmic_adjustments.attention_deltas.values() {
             assert!(*delta < 0.0, "Expected negative attention delta for BreakLoop");
         }
     }

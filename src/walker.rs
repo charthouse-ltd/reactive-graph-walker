@@ -177,6 +177,7 @@ fn restart_at_seed(result: &mut WalkerResult, plan: &crate::seeding::SeedPlan, r
 /// Now accepts a shared WalkerCollective for inter-walker stigmergy.
 /// Walkers leave trails (visited nodes, dead ends, surprises) and
 /// read each other's trails to diversify exploration.
+#[allow(clippy::too_many_arguments)] // Preserve the existing caller-facing API.
 pub fn walk_single(
     cache: &EdgeCache,
     seed_id: i32,

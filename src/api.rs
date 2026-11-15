@@ -1185,7 +1185,7 @@ pub(crate) type ModeError = (StatusCode, &'static str);
 /// nor when the query decided the result and no walker ran. An empty fixed walk still
 /// reaches the critic, as before.
 pub(crate) fn critic_applies(arm_present: bool, seed_mode: &str, n_results: usize) -> bool {
-    !arm_present && !(seed_mode == "query" && n_results == 0)
+    !(arm_present || seed_mode == "query" && n_results == 0)
 }
 
 /// The eval arm of a request: `Ok(None)` when none was sent. An arm sent without
@@ -1996,8 +1996,7 @@ impl ApiKeys {
         let admin_allowed = admin && !(scope == Scope::Approve && self.approve.is_some());
         if admin_allowed || match scope { Scope::Read => read, Scope::Ingest => ingest,
             Scope::Approve => approve, Scope::Admin => false } { Ok(()) }
-        else if admin { Err(StatusCode::FORBIDDEN) }
-        else if read || ingest || approve { Err(StatusCode::FORBIDDEN) }
+        else if admin || read || ingest || approve { Err(StatusCode::FORBIDDEN) }
         else { Err(StatusCode::UNAUTHORIZED) }
     }
 }

@@ -257,6 +257,7 @@ struct DreamConnection {
     source_domain: String,
     target_domain: String,
     walk_weight: f32,
+    #[allow(dead_code)] // Retain walk provenance in the debug representation.
     via_noise: bool,
 }
 
@@ -265,6 +266,7 @@ struct DreamWalkResult {
     node_path: Vec<i32>,
     domains_path: Vec<String>,
     total_weight: f32,
+    #[allow(dead_code)] // Retain the walk summary in the debug representation.
     surprises: usize,
     /// Number of steps that landed on a domain with verified knowledge (compendium match)
     knowledge_anchors: usize,
