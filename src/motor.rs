@@ -325,23 +325,21 @@ impl MotorGate {
                 DispatchOutcome::Queued(id)
             }
             MotorMode::Live => match send(base_url, &cmd, timeout).await {
-                Ok((status, body)) if (200..300).contains(&status) => {
-                    self.counters.sent.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(
-                        "[motor] Sent: {} from {} (domain={}, confidence={:.0}%)",
-                        cmd.action, source, cmd.domain, cmd.confidence * 100.0
-                    );
-                    DispatchOutcome::Sent(status, body)
-                }
-                Ok((status, body)) => {
-                    self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("[motor] Backend returned {} for {} from {}", status, cmd.action, source);
-                    DispatchOutcome::SendFailed(format!(
-                        "HTTP {}: {}",
-                        status,
-                        crate::core::safe_truncate(&body, 200)
-                    ))
-                }
+                Ok((status, body)) => match delivery(status, &body) {
+                    Ok(()) => {
+                        self.counters.sent.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            "[motor] Sent: {} from {} (domain={}, confidence={:.0}%)",
+                            cmd.action, source, cmd.domain, cmd.confidence * 100.0
+                        );
+                        DispatchOutcome::Sent(status, body)
+                    }
+                    Err(reason) => {
+                        self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("[motor] Backend did not execute {} from {}: {}", cmd.action, source, reason);
+                        DispatchOutcome::SendFailed(reason)
+                    }
+                },
                 Err(e) => {
                     self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!("[motor] Failed to reach backend for {}: {}", cmd.action, e);
@@ -384,17 +382,16 @@ impl MotorGate {
         self.counters.approved.fetch_add(1, Ordering::Relaxed);
 
         let (status, result) = match send(&target, &cmd, timeout).await {
-            Ok((code, _)) if (200..300).contains(&code) => {
-                self.counters.sent.fetch_add(1, Ordering::Relaxed);
-                (ProposalStatus::ApprovedSent, format!("HTTP {}", code))
-            }
-            Ok((code, body)) => {
-                self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
-                (
-                    ProposalStatus::ApprovedSendFailed,
-                    format!("HTTP {}: {}", code, crate::core::safe_truncate(&body, 200)),
-                )
-            }
+            Ok((code, body)) => match delivery(code, &body) {
+                Ok(()) => {
+                    self.counters.sent.fetch_add(1, Ordering::Relaxed);
+                    (ProposalStatus::ApprovedSent, format!("HTTP {}", code))
+                }
+                Err(reason) => {
+                    self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                    (ProposalStatus::ApprovedSendFailed, reason)
+                }
+            },
             Err(e) => {
                 self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
                 (ProposalStatus::ApprovedSendFailed, e)
@@ -509,6 +506,32 @@ pub fn gate() -> &'static MotorGate {
     }
 }
 
+/// Whether a backend response means the action was taken on.
+///
+/// A non-2xx is a failure. A 2xx is a failure only when its JSON body carries an
+/// explicit `"status"` of `"error"` or `"unknown"`: Julian's router answers
+/// HTTP 200 with `"unknown"` for an action it has no handler for and `"error"`
+/// when the handler raised. Every other body (no JSON, no `status`, or any
+/// other value such as `"ok"` or `"skipped"`) keeps the plain 2xx meaning.
+fn delivery(status: u16, body: &str) -> Result<(), String> {
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {}: {}", status, crate::core::safe_truncate(body, 200)));
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else { return Ok(()) };
+    let Some(reported) = value.get("status").and_then(|s| s.as_str()) else { return Ok(()) };
+    let reported = reported.trim().to_ascii_lowercase();
+    if !matches!(reported.as_str(), "error" | "unknown") {
+        return Ok(());
+    }
+    let detail = value.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+    Err(format!(
+        "HTTP {} but backend status={}: {}",
+        status,
+        reported,
+        crate::core::safe_truncate(detail, 200)
+    ))
+}
+
 /// POST a motor command. Crate-private: only MotorGate calls this.
 /// Returns the HTTP status and body for any HTTP response, or an error string.
 pub(crate) async fn send(
@@ -546,6 +569,28 @@ pub(crate) mod test_support {
                 async move {
                     h.fetch_add(1, Ordering::SeqCst);
                     "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), hits, handle)
+    }
+
+    /// Capture server answering every POST with HTTP 200 and the given body.
+    pub async fn spawn_reply(body: &'static str) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = axum::Router::new().route(
+            "/api/admin/rgw/execute",
+            axum::routing::post(move || {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    body
                 }
             }),
         );
@@ -623,6 +668,58 @@ mod tests {
         assert_eq!(live.counter("sent"), 1);
 
         server.abort();
+    }
+
+    #[test]
+    fn delivery_fails_only_on_non_2xx_or_an_explicit_refusal() {
+        for body in ["", "ok", "[1]", r#"{"result":1}"#, r#"{"status":"ok","action":"journal"}"#,
+            r#"{"status":"skipped","action":"tweet"}"#, r#"{"status":"draft"}"#, r#"{"status":7}"#] {
+            assert_eq!(delivery(200, body), Ok(()), "{body}");
+        }
+        for (body, word) in [(r#"{"status":"unknown","action":"image_generate","detail":"Unrecognized action."}"#, "unknown"),
+            (r#"{"status":"error","detail":"boom"}"#, "error"), (r#"{"status":" ERROR "}"#, "error")] {
+            let reason = delivery(200, body).unwrap_err();
+            assert!(reason.contains(&format!("status={word}")), "{reason}");
+        }
+        assert!(delivery(200, r#"{"status":"unknown","detail":"Unrecognized action."}"#)
+            .unwrap_err().contains("Unrecognized action."));
+        assert_eq!(delivery(401, "denied"), Err("HTTP 401: denied".into()));
+        assert!(delivery(500, r#"{"status":"ok"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_200_refusal_is_not_recorded_as_sent() {
+        let (url, hits, server) =
+            super::test_support::spawn_reply(r#"{"status":"unknown","action":"image_generate","detail":"Unrecognized action."}"#).await;
+
+        let live = MotorGate::new(MotorMode::Live);
+        let DispatchOutcome::SendFailed(reason) = live.dispatch("tool:image_generate", &url, cmd("image_generate")).await
+        else { panic!("an unhandled action must not be Sent") };
+        assert!(reason.contains("status=unknown"), "{reason}");
+        assert_eq!((live.counter("sent"), live.counter("send_failed")), (0, 1));
+
+        let propose = MotorGate::new(MotorMode::Propose);
+        let DispatchOutcome::Queued(id) = propose.dispatch("diverger", &url, cmd("image_generate")).await
+        else { panic!("expected Queued") };
+        let decided = propose.approve(id).await.unwrap();
+        assert_eq!(decided.status, ProposalStatus::ApprovedSendFailed);
+        assert!(decided.send_result.unwrap().contains("status=unknown"));
+        assert_eq!((propose.counter("sent"), propose.counter("send_failed")), (0, 1));
+
+        let tool = crate::tools::motor_tool_via(&live, &url, "image_generate", serde_json::json!({"prompt": "x"})).await;
+        assert!(!tool.success, "the tool must not report success for an action that did nothing");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_200_skip_or_ok_is_still_sent() {
+        for body in [r#"{"status":"skipped","action":"tweet","detail":"disabled"}"#, r#"{"status":"ok"}"#] {
+            let (url, _hits, server) = super::test_support::spawn_reply(body).await;
+            let live = MotorGate::new(MotorMode::Live);
+            assert!(matches!(live.dispatch("diverger", &url, cmd("tweet")).await, DispatchOutcome::Sent(200, _)));
+            server.abort();
+        }
     }
 
     #[tokio::test]
