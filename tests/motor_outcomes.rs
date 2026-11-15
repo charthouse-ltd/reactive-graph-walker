@@ -239,6 +239,7 @@ async fn restore_is_bounded_and_skips_malformed_motor_rows() -> anyhow::Result<(
         "read at most 100 rows, skip the malformed one"
     );
     assert_eq!(outcomes.last().unwrap()["received_at"], 104);
+    assert!(gate.consolidate_episodes().episodes.is_empty(), "unmatched callbacks are not verified action evidence");
     Ok(())
 }
 
@@ -264,6 +265,8 @@ async fn recall_serves_autobiography_but_never_motor_outcome_rows() -> anyhow::R
         "SELECT count(*) FROM rgw_episodes WHERE kind = 'motor_outcome'").fetch_one(&pool).await?;
     assert_eq!(stored, 1, "the outcome is still stored for inspection and idempotency");
 
+    sqlx::query("INSERT INTO rgw_episodes (occurred_at, kind, location, headline, source_type, source_ref) VALUES (NOW(), 'action_outcome', 'Lisbon', 'skipped', 'action_outcome', 'walk:test')").execute(&pool).await?;
+
     for place in [None, Some("Lisbon")] {
         let episodes = rgw::db::recall_window(&pool, "-infinity", "infinity", place, 50).await?;
         assert_eq!(episodes.len(), 1);
@@ -273,5 +276,43 @@ async fn recall_serves_autobiography_but_never_motor_outcome_rows() -> anyhow::R
             assert!(!served.contains(internal), "recall leaked {internal}");
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn verified_memory_survives_restart_and_dreams_never_write_episodes() -> anyhow::Result<()> {
+    let pool = common::fixture::fixture_pool("episodic_dream").await?;
+    let gate = Arc::new(MotorGate::new(MotorMode::Propose));
+    let model = Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
+    for i in 0..3 {
+        let id = uuid::Uuid::new_v4();
+        gate.dispatch("test", "/execution", MotorCommand {
+            correlation_id: id, action: "search".into(), domain: "science".into(),
+            walker_context: String::new(), expression_seeds: vec![], confidence: 0.8,
+            novelty: 0.5, search_query: None, params: None, audience_id: None,
+        }).await;
+        let callback = rgw::motor::MotorOutcome {
+            correlation_id: id, outcome: format!("verified {i}"), success: Some(false),
+            lesson: Some("retry differently".into()),
+        };
+        gate.record_outcome(&pool, &model, callback.clone()).await;
+        gate.record_outcome(&pool, &model, callback).await;
+    }
+    let context = gate.consolidate_episodes();
+    assert_eq!(context.episodes.len(), 3);
+    assert_eq!(context.lessons.len(), 1);
+    assert_eq!(context.lessons[0].evidence_count, 3);
+    assert!(context.lessons[0].confidence > 0.9);
+    let restored = Arc::new(MotorGate::new(MotorMode::Off));
+    restored.restore_outcomes(&pool).await;
+    assert_eq!(restored.consolidate_episodes().episodes.len(), 3);
+    model.lock().await.mode = rgw::core::CognitiveMode::Autonomous;
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM rgw_episodes").fetch_one(&pool).await?;
+    let report = rgw::dream::dream(&pool, &model, &restored, rgw::dream::DreamConfig { n_walks: 2, steps: 1, noise_magnitude: 0.0, ..Default::default() }).await;
+    assert_eq!(report.walks_completed, 2);
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM rgw_episodes").fetch_one(&pool).await?;
+    assert_eq!(before, after);
+    assert_eq!(restored.consolidate_episodes().lessons[0].evidence_count, 3);
+    assert!(rgw::db::recall_window(&pool, "-infinity", "infinity", None, 50).await?.is_empty());
     Ok(())
 }

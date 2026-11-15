@@ -122,7 +122,7 @@ pub async fn serve(
 
     // Dreaming requires explicit operator opt-in.
     if dream_enabled {
-        crate::dream::start_dream_loop(pool.clone(), self_model.clone());
+        crate::dream::start_dream_loop(pool.clone(), self_model.clone(), motor_gate.clone());
     }
 
     // Seed initial energy from high-importance nodes
@@ -920,7 +920,7 @@ async fn dream_endpoint(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::dream::DreamReport> {
     let config = crate::dream::DreamConfig::default();
-    let report = crate::dream::dream(&state.pool, &state.self_model, config).await;
+    let report = crate::dream::dream(&state.pool, &state.self_model, &state.motor_gate, config).await;
     Json(report)
 }
 

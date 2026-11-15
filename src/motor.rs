@@ -211,6 +211,7 @@ pub struct MotorGate {
     next_id: AtomicU64,
     counters: Counters,
     outcomes: Mutex<VecDeque<OutcomeRecord>>,
+    episodic: Mutex<crate::episodic::EpisodicMemory>,
     origins: Mutex<VecDeque<(uuid::Uuid, MotorOrigin)>>,
     // Serialize callback read/update/learning, without holding a std mutex across I/O.
     outcome_writer: tokio::sync::Mutex<()>,
@@ -232,6 +233,7 @@ impl MotorGate {
             next_id: AtomicU64::new(1),
             counters: Counters::default(),
             outcomes: Mutex::new(VecDeque::new()),
+            episodic: Mutex::new(crate::episodic::EpisodicMemory::new()),
             origins: Mutex::new(VecDeque::new()),
             outcome_writer: tokio::sync::Mutex::new(()),
         }
@@ -960,7 +962,27 @@ impl MotorGate {
             .map(|(_, origin)| origin.clone())
     }
 
+    /// Internal context only. This neither reflects into the self-model nor writes episodes.
+    pub fn consolidate_episodes(&self) -> crate::episodic::EpisodicMemory {
+        let mut memory = self.episodic.lock().unwrap_or_else(|e| e.into_inner());
+        memory.consolidate();
+        memory.clone()
+    }
+
     fn retain_outcome(&self, outcome: OutcomeRecord) {
+        // TODO: walk-id outcomes and path reinforcement need an explicit contract.
+        // An unmatched callback has no verified action/domain; never infer an origin.
+        if let Some(origin) = &outcome.origin {
+            self.episodic.lock().unwrap_or_else(|e| e.into_inner()).record(crate::episodic::Episode {
+                source_ref: outcome.callback.correlation_id.to_string(),
+                timestamp: outcome.received_at as f64,
+                stimulus: "verified motor callback".into(), domain: origin.domain.clone(),
+                walker_summary: String::new(), critique: String::new(), action: origin.action.clone(),
+                outcome: outcome.callback.outcome.clone(), success: outcome.callback.success,
+                lesson: outcome.callback.lesson.clone().unwrap_or_default(),
+                valence: 0.0, arousal: 0.0, energy: 0.0,
+            });
+        }
         let mut outcomes = self.outcomes.lock().unwrap_or_else(|e| e.into_inner());
         outcomes.retain(|o| o.callback.correlation_id != outcome.callback.correlation_id);
         outcomes.push_back(outcome);
@@ -969,8 +991,9 @@ impl MotorGate {
         }
     }
 
-    /// Rehydrate inspection only, before serving requests; never replay learning at startup.
+    /// Rehydrate inspection and internal episodic context; never replay self-model reflection.
     pub async fn restore_outcomes(&self, pool: &sqlx::PgPool) {
+        let _writer = self.outcome_writer.lock().await;
         match tokio::time::timeout(
             Duration::from_millis(750),
             crate::db::recent_motor_outcomes(pool),
