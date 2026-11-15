@@ -404,156 +404,214 @@ async fn web_fetch(params: serde_json::Value) -> ToolResult {
         };
     }
 
-    // Block SSRF: only http/https to publicly-routable hosts.
-    if let Err(reason) = validate_public_url(url).await {
-        return ToolResult {
-            tool: "web_fetch".into(),
-            success: false,
-            content: format!("Blocked URL: {}", reason),
-            metadata: serde_json::json!({"url": url, "blocked": true}),
-        };
-    }
-
-    // Build the client without unwrap(): a builder failure must not panic the
-    // request handler. No fallback to Client::new(): a default client follows
-    // redirects unguarded, so every redirect hop is checked here instead.
-    let client = match reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; RGW/1.0)")
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
-                return attempt.error("too many redirects");
-            }
-            if redirect_target_blocked(attempt.url()) {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
+    // Block SSRF: only http/https to publicly-routable hosts, on every hop.
+    let resp = match guarded_get(url, system_resolve, |addr| ip_is_internal(addr.ip())).await {
+        Ok(resp) => resp,
+        Err(FetchError::Blocked(reason)) => {
             return ToolResult {
                 tool: "web_fetch".into(),
                 success: false,
-                content: format!("HTTP client build failed: {}", e),
+                content: format!("Blocked URL: {}", reason),
+                metadata: serde_json::json!({"url": url, "blocked": true}),
+            };
+        }
+        Err(FetchError::Failed(reason)) => {
+            return ToolResult {
+                tool: "web_fetch".into(),
+                success: false,
+                content: format!("Fetch failed: {}", reason),
                 metadata: serde_json::json!({"url": url}),
             };
         }
     };
 
-    match client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            match resp.text().await {
-                Ok(body) => {
-                    // Extract readable text from HTML
-                    let content = extract_readable_text(&body);
-                    let content = if content.chars().count() > 3000 {
-                        format!("{}...", crate::core::safe_truncate(&content, 3000))
-                    } else {
-                        content
-                    };
-                    ToolResult {
-                        tool: "web_fetch".into(),
-                        success: status < 400 && !content.is_empty(),
-                        content,
-                        metadata: serde_json::json!({"url": url, "status": status, "raw_len": body.len()}),
-                    }
-                }
-                Err(e) => ToolResult {
-                    tool: "web_fetch".into(),
-                    success: false,
-                    content: format!("Failed to read body: {}", e),
-                    metadata: serde_json::json!({"url": url}),
-                },
+    let status = resp.status().as_u16();
+    match resp.text().await {
+        Ok(body) => {
+            // Extract readable text from HTML
+            let content = extract_readable_text(&body);
+            let content = if content.chars().count() > 3000 {
+                format!("{}...", crate::core::safe_truncate(&content, 3000))
+            } else {
+                content
+            };
+            ToolResult {
+                tool: "web_fetch".into(),
+                success: status < 400 && !content.is_empty(),
+                content,
+                metadata: serde_json::json!({"url": url, "status": status, "raw_len": body.len()}),
             }
         }
         Err(e) => ToolResult {
             tool: "web_fetch".into(),
             success: false,
-            content: format!("Fetch failed: {}", e),
+            content: format!("Failed to read body: {}", e),
             metadata: serde_json::json!({"url": url}),
         },
     }
 }
 
-/// SSRF guard for outbound fetches: require http/https and reject any URL whose
-/// host resolves to a loopback/private/link-local address (blocks internal
-/// services and cloud metadata endpoints like 169.254.169.254).
-/// Note: validates at request time; this is not full DNS-rebinding protection.
-async fn validate_public_url(raw: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(raw).map_err(|e| format!("invalid URL ({})", e))?;
-    match parsed.scheme() {
+/// Redirect hops `web_fetch` follows before giving up.
+const FETCH_MAX_REDIRECTS: usize = 5;
+
+/// Why a guarded fetch did not produce a response.
+#[derive(Debug, PartialEq, Eq)]
+enum FetchError {
+    /// The SSRF guard refused a hop; nothing was sent to that hop.
+    Blocked(String),
+    /// Transport or client failure.
+    Failed(String),
+}
+
+/// Production resolver: the system's DNS answers for `host:port`.
+async fn system_resolve(host: String, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
+    tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map(|addrs| addrs.collect())
+        .map_err(|e| e.to_string())
+}
+
+/// SSRF-guarded GET. For the first URL and for every redirect hop:
+///
+/// 1. the scheme must be http/https and the name must not be an internal one;
+/// 2. the host is resolved **once**, and every answer must pass `blocked`;
+/// 3. the connection is pinned to exactly those vetted answers, so a second DNS
+///    answer (rebinding) cannot change where the request goes.
+///
+/// Redirects are never followed by the HTTP client; each `Location` goes through
+/// the same three steps, so a public name that resolves to an internal address
+/// on a later hop is refused before any request is sent to it. Proxies are not
+/// used: a proxy would resolve the name itself and defeat the pin.
+///
+/// `resolve` and `blocked` are parameters so tests can prove this without DNS.
+async fn guarded_get<R, Fut, B>(raw: &str, resolve: R, blocked: B) -> Result<reqwest::Response, FetchError>
+where
+    R: Fn(String, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<std::net::SocketAddr>, String>>,
+    B: Fn(&std::net::SocketAddr) -> bool,
+{
+    let mut url = reqwest::Url::parse(raw).map_err(|e| FetchError::Blocked(format!("invalid URL ({})", e)))?;
+    for _hop in 0..=FETCH_MAX_REDIRECTS {
+        let pin = vet_hop(&url, &resolve, &blocked).await.map_err(FetchError::Blocked)?;
+        let mut builder = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; RGW/1.0)")
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if let Some((host, addrs)) = &pin {
+            builder = builder.resolve_to_addrs(host, addrs);
+        }
+        // No unwrap() and no fallback to Client::new(): a default client would
+        // follow redirects unguarded and resolve names itself.
+        let client = builder.build().map_err(|e| FetchError::Failed(format!("HTTP client build failed: {}", e)))?;
+        let resp = client
+            .get(url.clone())
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| FetchError::Failed(e.to_string()))?;
+        let location = if resp.status().is_redirection() {
+            resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_owned)
+        } else {
+            None
+        };
+        match location {
+            Some(next) => {
+                url = url.join(&next).map_err(|e| FetchError::Blocked(format!("invalid redirect target ({})", e)))?;
+            }
+            None => return Ok(resp),
+        }
+    }
+    Err(FetchError::Failed("too many redirects".into()))
+}
+
+/// Vet one hop. `Ok(Some((host, addrs)))` is a name with the vetted answers to
+/// pin; `Ok(None)` is a literal public IP (nothing to resolve). `Err` is the reason.
+async fn vet_hop<R, Fut, B>(
+    url: &reqwest::Url,
+    resolve: &R,
+    blocked: &B,
+) -> Result<Option<(String, Vec<std::net::SocketAddr>)>, String>
+where
+    R: Fn(String, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<std::net::SocketAddr>, String>>,
+    B: Fn(&std::net::SocketAddr) -> bool,
+{
+    match url.scheme() {
         "http" | "https" => {}
         other => return Err(format!("scheme '{}' not allowed", other)),
     }
-    let host = parsed.host_str().ok_or_else(|| "URL has no host".to_string())?;
-    let host_l = host.to_ascii_lowercase();
-    if host_l == "localhost" || host_l.ends_with(".localhost") || host_l.ends_with(".internal") {
+    let host = url.host_str().ok_or_else(|| "URL has no host".to_string())?;
+    let name = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if name == "localhost" || name.ends_with(".localhost") || name.ends_with(".internal") {
         return Err("internal host blocked".into());
     }
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+    let port = url.port_or_known_default().unwrap_or(80);
+    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
+        return if blocked(&std::net::SocketAddr::new(ip, port)) {
+            Err("private/loopback address blocked".into())
+        } else {
+            Ok(None)
+        };
+    }
+    let addrs = resolve(host.to_string(), port)
         .await
-        .map_err(|e| format!("DNS resolution failed ({})", e))?
-        .collect();
+        .map_err(|e| format!("DNS resolution failed ({})", e))?;
     if addrs.is_empty() {
         return Err("host did not resolve".into());
     }
-    for addr in &addrs {
-        if ip_is_internal(addr.ip()) {
-            return Err("resolves to a private/loopback address".into());
-        }
+    // One internal answer is enough to refuse: the client could pick any of them.
+    if addrs.iter().any(blocked) {
+        return Err("resolves to a private/loopback address".into());
     }
-    Ok(())
+    Ok(Some((host.to_string(), addrs)))
 }
 
-/// True if the IP is loopback/private/link-local/unspecified (not publicly routable).
+/// True if the IP is not publicly routable. IPv4 is a denylist of the special
+/// ranges (loopback, private, link-local, unspecified, multicast, reserved,
+/// benchmarking). IPv6 is an allowlist: only global unicast `2000::/3` outside
+/// its special-purpose sub-ranges is public; IPv4-mapped, NAT64 and 6to4
+/// addresses are judged by the IPv4 address they embed.
 fn ip_is_internal(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
-                || v4.octets()[0] == 0
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // CGNAT 100.64/10
+                || v4.is_multicast() // 224.0.0.0/4
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT 100.64/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments 192.0.0.0/24
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking 198.18.0.0/15
+                || o[0] >= 240 // reserved 240.0.0.0/4
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return ip_is_internal(IpAddr::V4(v4));
             }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+            let s = v6.segments();
+            let embedded = |hi: u16, lo: u16| IpAddr::V4(Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8));
+            // Well-known NAT64 64:ff9b::/96 reaches the embedded IPv4 address.
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return ip_is_internal(embedded(s[6], s[7]));
+            }
+            // Allowlist: only global unicast 2000::/3 can be public. Everything
+            // else (::/128, ::1, IPv4-compatible, local-use NAT64 64:ff9b:1::/48,
+            // unique-local, site-local, link-local, multicast, unassigned) is internal.
+            if (s[0] & 0xe000) != 0x2000 {
+                return true;
+            }
+            // Special-purpose ranges inside 2000::/3.
+            if s[0] == 0x2002 {
+                return ip_is_internal(embedded(s[1], s[2])); // 6to4 2002:a.b.c.d::/48
+            }
+            (s[0] == 0x2001 && (s[1] & 0xfe00) == 0) // IETF protocol assignments 2001::/23 (Teredo, ORCHID, ...)
+                || (s[0] == 0x2001 && s[1] == 0xdb8) // documentation 2001:db8::/32
+                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0) // documentation 3fff::/20
         }
-    }
-}
-
-/// Sync check for redirect hops (no DNS here): blocks non-http(s) schemes,
-/// localhost/.internal names and literal internal IPs. A public name that
-/// resolves internally on a redirect hop is NOT caught (documented residual).
-fn redirect_target_blocked(u: &reqwest::Url) -> bool {
-    if !matches!(u.scheme(), "http" | "https") {
-        return true;
-    }
-    let Some(host) = u.host_str() else { return true };
-    let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
-    if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".internal") {
-        return true;
-    }
-    match h.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip_is_internal(ip),
-        Err(_) => false,
     }
 }
 
@@ -684,22 +742,144 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn validate_public_url_rejects_bad_targets_without_network() {
-        for u in ["file:///etc/passwd", "ftp://example.com/", "http://localhost/",
-                  "http://x.localhost/", "http://metadata.google.internal/",
-                  "http://127.0.0.1:11435/self", "http://169.254.169.254/latest/meta-data/",
-                  "http://[::1]/", "not a url"] {
-            assert!(validate_public_url(u).await.is_err(), "{u} should be blocked");
+    #[test]
+    fn ssrf_ip_classification_covers_reserved_and_embedded_ranges() {
+        use std::net::IpAddr;
+        for s in ["224.0.0.1", "239.255.255.250", "192.0.0.8", "198.18.0.1", "198.19.255.254",
+                  "240.0.0.1", "255.255.255.255", "::", "::10.0.0.1", "::127.0.0.1", "::8.8.8.8",
+                  "64:ff9b::a00:1", "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "64:ff9b:1::808:808",
+                  "2002:a00:1::1", "2002:7f00:1::", "ff02::1", "ff05::2", "fec0::1", "fc00::1",
+                  "fe80::1", "2001::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:db8::1",
+                  "2001:10::1", "2001:20::1", "2001:1ff::1", "3fff::1", "100::1", "4000::1", "e000::1"] {
+            assert!(ip_is_internal(s.parse::<IpAddr>().unwrap()), "{s} should be internal");
+        }
+        for s in ["192.0.1.1", "198.17.255.255", "198.20.0.1", "223.255.255.254", "100.128.0.1",
+                  "64:ff9b::808:808", "2002:808:808::1", "2a00:1450:4001::200e",
+                  "2606:4700:4700::1111", "2001:4860:4860::8888", "2001:200::1", "3ffe::1"] {
+            assert!(!ip_is_internal(s.parse::<IpAddr>().unwrap()), "{s} should be public");
         }
     }
 
-    #[test]
-    fn redirect_hops_to_internal_are_blocked() {
-        for u in ["http://127.0.0.1/", "http://169.254.169.254/", "http://[::1]/",
-                  "http://localhost/", "http://db.internal/", "file:///etc/passwd"] {
-            assert!(redirect_target_blocked(&reqwest::Url::parse(u).unwrap()), "{u}");
+    /// A resolver that must not be reached.
+    async fn no_dns(host: String, _port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
+        panic!("{host} must be refused before any DNS lookup")
+    }
+
+    #[tokio::test]
+    async fn guarded_get_rejects_bad_targets_without_network() {
+        for u in ["file:///etc/passwd", "ftp://example.com/", "http://localhost/",
+                  "http://x.localhost/", "http://metadata.google.internal/",
+                  "http://127.0.0.1:11435/self", "http://169.254.169.254/latest/meta-data/",
+                  "http://[::1]/", "http://[::ffff:10.0.0.1]/", "http://[64:ff9b::a9fe:a9fe]/", "not a url"] {
+            let result = guarded_get(u, no_dns, |addr| ip_is_internal(addr.ip())).await;
+            assert!(matches!(result, Err(FetchError::Blocked(_))), "{u} should be blocked");
         }
-        assert!(!redirect_target_blocked(&reqwest::Url::parse("https://example.com/").unwrap()));
+    }
+
+    /// One loopback server per test. `/start` redirects to `location`; every
+    /// other path answers 200 "reached". Returns its port and a hit counter.
+    async fn spawn_site(location: Option<String>) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let h = h.clone();
+            let location = location.clone();
+            async move {
+                use axum::response::IntoResponse;
+                h.fetch_add(1, Ordering::SeqCst);
+                match location {
+                    Some(to) if uri.path() == "/start" => {
+                        (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, to)]).into_response()
+                    }
+                    _ => "reached".into_response(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (port, hits)
+    }
+
+    fn loopback(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[tokio::test]
+    async fn redirect_to_a_name_that_resolves_internally_is_refused_before_any_request() {
+        use std::sync::atomic::Ordering;
+        // `inner` stands for an internal service; the policy below marks its address internal.
+        let (inner_port, inner_hits) = spawn_site(None).await;
+        let (public_port, public_hits) =
+            spawn_site(Some(format!("http://intranet.test:{inner_port}/secret"))).await;
+        let lookups = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = lookups.clone();
+        // Both names are ordinary hostnames; only DNS says where they lead.
+        let resolve = move |host: String, port: u16| {
+            seen.lock().unwrap().push(host);
+            async move { Ok(vec![loopback(port)]) }
+        };
+        let result = guarded_get(
+            &format!("http://public.test:{public_port}/start"),
+            resolve,
+            |addr| addr.port() == inner_port,
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), FetchError::Blocked("resolves to a private/loopback address".into()));
+        assert_eq!(public_hits.load(Ordering::SeqCst), 1, "the first hop is fetched");
+        assert_eq!(inner_hits.load(Ordering::SeqCst), 0, "the internal hop must never receive a request");
+        assert_eq!(*lookups.lock().unwrap(), ["public.test", "intranet.test"], "every hop is resolved and vetted");
+    }
+
+    #[tokio::test]
+    async fn the_vetted_dns_answer_is_pinned_for_the_connection() {
+        use std::sync::atomic::Ordering;
+        let (port, hits) = spawn_site(None).await;
+        let (inner_port, inner_hits) = spawn_site(None).await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        // A rebinding name: the first answer is the vetted address, every later
+        // answer is the internal one. `.test` never resolves through real DNS, so
+        // the request can only succeed over the pinned first answer.
+        let resolve = move |_host: String, _port: u16| {
+            let first = c.fetch_add(1, Ordering::SeqCst) == 0;
+            async move { Ok(vec![loopback(if first { port } else { inner_port })]) }
+        };
+        let resp = guarded_get(&format!("http://rebind.test:{port}/page"), resolve, |addr| addr.port() == inner_port)
+            .await
+            .expect("the vetted address is reachable");
+        assert_eq!(resp.text().await.unwrap(), "reached");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "resolved once; the client must not resolve again");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(inner_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn public_redirects_are_followed_hop_by_hop_and_bounded() {
+        use std::sync::atomic::Ordering;
+        let (final_port, final_hits) = spawn_site(None).await;
+        let (first_port, _) = spawn_site(Some(format!("http://second.test:{final_port}/page"))).await;
+        let resolve = |_host: String, port: u16| async move { Ok(vec![loopback(port)]) };
+        let resp = guarded_get(&format!("http://first.test:{first_port}/start"), resolve, |_| false)
+            .await
+            .expect("a redirect between public hosts is followed");
+        assert_eq!(resp.text().await.unwrap(), "reached");
+        assert_eq!(final_hits.load(Ordering::SeqCst), 1);
+
+        // A relative Location is resolved against the current hop; a loop ends.
+        let (loop_port, loop_hits) = spawn_site(Some("/start".into())).await;
+        let result = guarded_get(&format!("http://loop.test:{loop_port}/start"), resolve, |_| false).await;
+        assert_eq!(result.unwrap_err(), FetchError::Failed("too many redirects".into()));
+        assert_eq!(loop_hits.load(Ordering::SeqCst), FETCH_MAX_REDIRECTS + 1);
+
+        // A redirect to a literal internal address or a non-http scheme is refused.
+        for target in ["http://169.254.169.254/latest/meta-data/", "file:///etc/passwd", "http://localhost/"] {
+            let (port, _) = spawn_site(Some(target.into())).await;
+            let result = guarded_get(&format!("http://hop.test:{port}/start"), resolve, |addr| ip_is_internal(addr.ip()) && addr.port() != port).await;
+            assert!(matches!(result, Err(FetchError::Blocked(_))), "{target}");
+        }
     }
 }
