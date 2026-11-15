@@ -257,7 +257,13 @@ pub fn validate_api_key(v: Option<&str>) -> Result<(), String> {
 async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {
     let keys = ApiKeys::from_env();
     let presented = req.headers().get("X-RGW-Key").and_then(|v| v.to_str().ok());
-    keys.authorize(presented, route_scope(req.method().as_str(), req.uri().path()))?;
+    let scope = route_scope(req.method().as_str(), req.uri().path());
+    let role = keys.authorize(presented, scope)?;
+    if operator_action(scope, req.uri().path()) {
+        // Audit trail: which configured key authorised it, never the key itself.
+        tracing::info!(key = role.as_str(), method = %req.method(), path = req.uri().path(),
+            "[auth] operator action authorised");
+    }
     Ok(next.run(req).await)
 }
 
@@ -1948,13 +1954,41 @@ mod scope_tests {
             assert_eq!(keys.authorize(Some("invalid"), scope), Err(StatusCode::UNAUTHORIZED));
             for (key, owned) in [("test-read-key", Scope::Read), ("test-ingest-key", Scope::Ingest),
                 ("test-approve-key", Scope::Approve)] {
-                assert_eq!(keys.authorize(Some(key), scope), if owned == scope { Ok(()) } else { Err(StatusCode::FORBIDDEN) });
+                assert_eq!(keys.authorize(Some(key), scope).map(|_| ()), if owned == scope { Ok(()) } else { Err(StatusCode::FORBIDDEN) });
             }
         }
         let legacy = ApiKeys { admin: Some("test-admin-key".into()), read: None, ingest: None, approve: None };
         assert!(legacy.authorize(Some("test-admin-key"), Scope::Approve).is_ok(), "single-key deployments keep working");
         let absent = ApiKeys { admin: None, ..keys };
         assert_eq!(absent.authorize(Some("test-read-key"), Scope::Read), Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn operator_actions_are_attributed_to_the_key_that_authorised_them() {
+        let split = ApiKeys { admin: Some("test-admin-key".into()), read: Some("test-read-key".into()),
+            ingest: Some("test-ingest-key".into()), approve: Some("test-approve-key".into()) };
+        assert_eq!(split.authorize(Some("test-admin-key"), Scope::Admin), Ok(KeyRole::Admin));
+        assert_eq!(split.authorize(Some("test-admin-key"), Scope::Read), Ok(KeyRole::Admin));
+        assert_eq!(split.authorize(Some("test-read-key"), Scope::Read), Ok(KeyRole::Read));
+        assert_eq!(split.authorize(Some("test-ingest-key"), Scope::Ingest), Ok(KeyRole::Ingest));
+        assert_eq!(split.authorize(Some("test-approve-key"), Scope::Approve), Ok(KeyRole::Approve));
+        let legacy = ApiKeys { admin: Some("test-admin-key".into()), read: None, ingest: None, approve: None };
+        assert_eq!(legacy.authorize(Some("test-admin-key"), Scope::Approve), Ok(KeyRole::Admin),
+            "without an approve key the log shows that the admin key approved");
+        for role in [KeyRole::Admin, KeyRole::Read, KeyRole::Ingest, KeyRole::Approve] {
+            assert!(!role.as_str().contains("test-"), "the label is a role name, never key material");
+        }
+
+        for (method, path) in [("POST", "/motor/proposals/7/approve"), ("POST", "/motor/proposals/7/reject"),
+            ("POST", "/self/mode"), ("POST", "/self/save"), ("POST", "/selection/stage"),
+            ("POST", "/selection/rollback"), ("POST", "/metacog/config"), ("POST", "/prune"),
+            ("POST", "/dream"), ("POST", "/edge"), ("POST", "/tools/execute"), ("POST", "/benchmark")] {
+            assert!(operator_action(route_scope(method, path), path), "{method} {path}");
+        }
+        for (method, path) in [("POST", "/walk"), ("POST", "/v1/chat/completions"), ("GET", "/self"),
+            ("GET", "/metacog/config"), ("POST", "/ingest/signal"), ("POST", "/outcomes")] {
+            assert!(!operator_action(route_scope(method, path), path), "{method} {path}");
+        }
     }
 }
 
@@ -1973,6 +2007,26 @@ fn route_scope(method: &str, path: &str) -> Scope {
     } else { Scope::Admin }
 }
 
+/// Which configured key authorised a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyRole { Admin, Read, Ingest, Approve }
+
+impl KeyRole {
+    fn as_str(self) -> &'static str {
+        match self { Self::Admin => "admin", Self::Read => "read", Self::Ingest => "ingest", Self::Approve => "approve" }
+    }
+}
+
+/// Requests that change what the instance is allowed to do or decide a motor
+/// proposal: approvals, and every admin route except routine cognition.
+fn operator_action(scope: Scope, path: &str) -> bool {
+    match scope {
+        Scope::Approve => true,
+        Scope::Admin => !matches!(path, "/walk" | "/v1/chat/completions"),
+        Scope::Read | Scope::Ingest => false,
+    }
+}
+
 struct ApiKeys {
     admin: Option<String>,
     read: Option<String>,
@@ -1987,7 +2041,7 @@ impl ApiKeys {
             ingest: key("RGW_INGEST_KEY"), approve: key("RGW_APPROVE_KEY") }
     }
 
-    fn authorize(&self, presented: Option<&str>, scope: Scope) -> Result<(), StatusCode> {
+    fn authorize(&self, presented: Option<&str>, scope: Scope) -> Result<KeyRole, StatusCode> {
         if self.admin.is_none() { return Err(StatusCode::UNAUTHORIZED); }
         let presented = presented.ok_or(StatusCode::UNAUTHORIZED)?;
         let matches = |key: &Option<String>| key.as_ref()
@@ -2000,10 +2054,14 @@ impl ApiKeys {
         // Once a dedicated approve key is configured, approval is separated:
         // the admin key can no longer approve or reject motor proposals.
         let admin_allowed = admin && !(scope == Scope::Approve && self.approve.is_some());
-        if admin_allowed || match scope { Scope::Read => read, Scope::Ingest => ingest,
-            Scope::Approve => approve, Scope::Admin => false } { Ok(()) }
-        else if admin || read || ingest || approve { Err(StatusCode::FORBIDDEN) }
-        else { Err(StatusCode::UNAUTHORIZED) }
+        match scope {
+            _ if admin_allowed => Ok(KeyRole::Admin),
+            Scope::Read if read => Ok(KeyRole::Read),
+            Scope::Ingest if ingest => Ok(KeyRole::Ingest),
+            Scope::Approve if approve => Ok(KeyRole::Approve),
+            _ if admin || read || ingest || approve => Err(StatusCode::FORBIDDEN),
+            _ => Err(StatusCode::UNAUTHORIZED),
+        }
     }
 }
 

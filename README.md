@@ -25,6 +25,8 @@ The existing `RGW_API_KEY` remains a full-access **admin** key. It also approves
 
 **Approval policy:** when `RGW_APPROVE_KEY` is set, approval/rejection accepts **only** that key; the admin key gets 403, so approval is separated from everything else. When it is unset, the admin key approves as before (single-key deployments keep working). Read and ingest keys can never approve.
 
+**Audit log:** approvals, rejections and every admin route except `/walk` and `/v1/chat/completions` log one INFO line with the method, the path and the role of the key that authorised the request (`admin`, `approve`). The key itself is never logged. The line is written when the request is authorised, before the handler runs.
+
 | Method | Path | Scope | Purpose |
 |---|---|---|---|
 | GET | `/health` | public | Liveness, always 200; truthful `db_connected` |
