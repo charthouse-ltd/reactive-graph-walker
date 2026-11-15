@@ -118,31 +118,16 @@ async fn main() -> anyhow::Result<()> {
         stats.edges as f64 / stats.nodes.max(1) as f64
     );
 
-    // Restore self-model from last session (consciousness continuity)
-    match db::load_self_model(&pool).await {
-        Ok(Some(sm)) => {
-            tracing::info!(
-                "[rgw] Self-model restored: {} signals processed, v={:.2} a={:.2} e={:.2}",
-                sm.total_signals_processed, sm.valence, sm.arousal, sm.energy
-            );
-        }
-        Ok(None) => {
-            tracing::info!("[rgw] No previous self-model found. Starting fresh.");
-        }
-        Err(e) => {
-            tracing::warn!("[rgw] Self-model restore failed (starting fresh): {}", e);
-        }
-    }
-
-    // Note: periodic self-model persistence runs inside api::serve (it owns the
-    // self_model). A no-op placeholder loop used to live here; removed as dead code.
+    // Fail closed before starting writers if restoration is uncertain.
+    let self_model = db::restore_self_model(&pool).await?;
+    tracing::info!(signals = self_model.total_signals_processed, "Self-model restored (or confirmed empty)");
 
     // Start HTTP server
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("Listening on {}", addr);
     tracing::info!("Expression: {} via {}", args.expression_model, args.ollama_url);
     tracing::info!("Motor cortex: Julian at {}", args.julian_url);
-    api::serve(pool, &addr, &args.ollama_url, &args.expression_model, &args.julian_url).await?;
+    api::serve(pool, self_model, &addr, &args.ollama_url, &args.expression_model, &args.julian_url).await?;
 
     Ok(())
 }

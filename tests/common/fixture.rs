@@ -1,11 +1,6 @@
 //! A small graph in its own Postgres schema, with synthetic embeddings.
 //!
-//! The shared `rgw_test` database already holds other tests' nodes, and
-//! `seed_database` cannot seed a fresh one (it writes a `document` column the
-//! test schema does not have). Tests that need exact ids and exact cosines use
-//! this fixture instead: every connection of the returned pool has
-//! `search_path = <schema>, public`, so the unqualified table names in `src/`
-//! resolve inside the schema. No embedding model is needed to build it.
+//! Each test uses an isolated schema and synthetic embeddings, without downloads.
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -47,7 +42,7 @@ fn vector_literal(v: &[f32]) -> String {
 }
 
 fn base_url() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgresql:///rgw_test?host=/tmp".into())
+    std::env::var("DATABASE_URL").expect("DATABASE_URL must explicitly select a throwaway test database")
 }
 
 /// A pool whose connections use `search_path = <schema>, public`. Drops and
@@ -93,8 +88,8 @@ pub async fn fixture_pool(schema: &str) -> anyhow::Result<PgPool> {
     ];
     for (id, domain, importance, access_count, emb) in &nodes {
         sqlx::query(
-            "INSERT INTO memory_vectors (id, content, domain, embedding, importance, access_count) \
-             VALUES ($1, $2, $3, $4::vector, $5, $6)",
+            "INSERT INTO memory_vectors (id, document, domain, embedding, importance, access_count, doc_id, post_id, title, mood, persona, location, source_type, published_at, month, word_count, stored_at, last_accessed, valence, arousal, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4::vector, $5, $6, $1::text, 0, '', '', '', '', 'fixture', '', '', 0, 0, 0, 0, 0.5, NOW(), NOW())",
         )
         .bind(id)
         .bind(format!("fixture node {id} in {domain}"))
@@ -124,7 +119,7 @@ pub async fn fixture_pool(schema: &str) -> anyhow::Result<PgPool> {
         (LONE, A3, "related", 0.2),
     ];
     for (s, t, ty, w) in &edges {
-        sqlx::query("INSERT INTO memory_edges (source_id, target_id, edge_type, weight) VALUES ($1, $2, $3, $4)")
+        sqlx::query("INSERT INTO memory_edges (source_id, target_id, edge_type, weight, emotional_charge, traversal_count, last_traversed, created_at) VALUES ($1, $2, $3, $4, 0, 0, NOW(), NOW())")
             .bind(s)
             .bind(t)
             .bind(ty)

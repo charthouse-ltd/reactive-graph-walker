@@ -518,6 +518,24 @@ pub async fn walk_parallel_with(
     self_model: &std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
     opts: WalkOptions,
 ) -> (WalkOutput, Vec<WalkerResult>) {
+    match try_walk_parallel_with(pool, _emotion, n_walkers, steps, self_model, opts).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "walk failed");
+            (empty_output(), Vec::new())
+        }
+    }
+}
+
+/// Fallible walk entry point used by HTTP handlers.
+pub async fn try_walk_parallel_with(
+    pool: &PgPool,
+    _emotion: &EmotionalState,
+    n_walkers: usize,
+    steps: usize,
+    self_model: &std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
+    opts: WalkOptions,
+) -> anyhow::Result<(WalkOutput, Vec<WalkerResult>)> {
     let start = Instant::now();
 
     let deterministic = opts.seed.is_some() || crate::seeding::deterministic_env();
@@ -586,7 +604,7 @@ pub async fn walk_parallel_with(
         let mut output = vector_output(&cands, first_domain);
         output.seed_mode = mode_label.to_string();
         output.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        return (output, Vec::new());
+        return Ok((output, Vec::new()));
     }
     // A plan that reaches this point is at or above the floor, so it has seeds.
     let plan = plan.filter(|p| !p.seeds.is_empty());
@@ -599,8 +617,8 @@ pub async fn walk_parallel_with(
         let seed_ids: Vec<i32> = p.seeds.iter().map(|s| s.0).collect();
         let cache = EdgeCache::new(pool.clone());
         let k = seed_ids.len().min(crate::seeding::SEED_TOP_K);
-        let _ = cache.preload_radius(&seed_ids[..k]).await;
-        let _ = cache.preload_batch(&seed_ids[k..]).await;
+        cache.preload_radius(&seed_ids[..k]).await?;
+        cache.preload_batch(&seed_ids[k..]).await?;
         let neighbours = |node: i32| -> Vec<(i32, f32)> {
             cache
                 .try_get(node)
@@ -621,7 +639,7 @@ pub async fn walk_parallel_with(
             total_ms: start.elapsed().as_secs_f64() * 1000.0,
             ..empty_output()
         };
-        return (output, Vec::new());
+        return Ok((output, Vec::new()));
     }
 
     // Signal: walk session starting
@@ -635,13 +653,13 @@ pub async fn walk_parallel_with(
     // Get seed nodes
     let seeds: Vec<i32> = match &plan {
         Some(p) => p.seeds.iter().map(|s| s.0).collect(),
-        None => db::seed_nodes(pool, (n_walkers * 2) as i32).await.unwrap_or_default(),
+        None => db::seed_nodes(pool, (n_walkers * 2) as i32).await?,
     };
 
     if seeds.is_empty() {
         let mut output = empty_output();
         output.seed_mode = mode_label.to_string();
-        return (output, Vec::new());
+        return Ok((output, Vec::new()));
     }
 
     // Assign biases — mode-dependent
@@ -666,11 +684,11 @@ pub async fn walk_parallel_with(
         // Radius 1 around the strongest seeds; the wide seeds get their own edges only.
         Some(_) => {
             let k = seeds.len().min(crate::seeding::SEED_TOP_K);
-            let _ = cache.preload_radius(&seeds[..k]).await;
-            let _ = cache.preload_batch(&seeds[k..]).await;
+            cache.preload_radius(&seeds[..k]).await?;
+            cache.preload_batch(&seeds[k..]).await?;
         }
         None => {
-            let _ = cache.preload_radius(&seeds).await;
+            cache.preload_radius(&seeds).await?;
         }
     }
 
@@ -727,7 +745,7 @@ pub async fn walk_parallel_with(
         let base_sm = base_sm.clone();
         let collective = Arc::clone(&collective);
         let knowledge_domains = knowledge_domains.clone();
-        tokio::task::spawn_blocking(move || {
+        join_worker(tokio::task::spawn_blocking(move || {
             let run = |(i, (seed, bias, profile)): (usize, &(i32, WalkerBias, Option<usize>))| {
                 let mut sm = base_sm.clone();  // Each walker gets its own copy
                 let collective = Arc::clone(&collective);
@@ -748,16 +766,12 @@ pub async fn walk_parallel_with(
                 configs.par_iter().enumerate().map(run).collect()
             };
             results
-        })
-        .await
-        .expect("walker pool panicked")
+        })).await?
     };
     let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
 
     // ── Flush edge cache writes to DB ──
-    if let Err(e) = cache.flush().await {
-        tracing::warn!("[walker] edge flush failed (deltas re-queued): {}", e);
-    }
+    cache.flush().await?;
 
     // Stage 2 replay buffer: session-mean intrinsic fitness (Autonomous only; set below).
     let mut session_fitness: Option<f32> = None;
@@ -926,7 +940,7 @@ pub async fn walk_parallel_with(
     crate::metrics::record_walk_session(output.novelty_score, repeated);
 
     // Return both output and walker results for post-walk analysis
-    (output, walker_results)
+    Ok((output, walker_results))
 }
 
 /// Fold a single background (Diverger) walk's self-model changes back into the
@@ -2304,4 +2318,17 @@ mod tests {
         assert!(cue_needed(SeedMode::Fixed, Some(EvalArm::Query)));
         assert!(!cue_needed(SeedMode::Query, Some(EvalArm::Fixed)), "the fixed arm walks as before");
     }
+}
+
+#[cfg(test)]
+mod request_error_tests {
+    #[tokio::test]
+    async fn panicking_worker_returns_an_error() {
+        let worker = tokio::task::spawn_blocking(|| -> () { panic!("test worker failure") });
+        assert!(super::join_worker(worker).await.is_err());
+    }
+}
+
+async fn join_worker<T>(worker: tokio::task::JoinHandle<T>) -> anyhow::Result<T> {
+    worker.await.map_err(|_| anyhow::anyhow!("walker worker failed"))
 }

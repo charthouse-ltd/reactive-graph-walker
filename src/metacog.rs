@@ -790,6 +790,9 @@ pub fn run_critic(
     walker_results: &[WalkerResult],
     sm: &mut SelfModel,
 ) -> CriticDiagnosis {
+    if !critic_enabled(sm) {
+        return diagnose_session(&build_session_summary(output, walker_results, sm), sm);
+    }
     sm.last_critic_run = crate::core::now();
 
     let summary = build_session_summary(output, walker_results, sm);
@@ -817,6 +820,9 @@ pub async fn run_llm_critic(
     sm: &mut SelfModel,
     llm_response: &str,
 ) -> CriticAdjustment {
+    if !critic_enabled(sm) {
+        return parse_critic_response(llm_response, &diagnosis.algorithmic_adjustments);
+    }
     sm.critic_sessions_since_llm = 0;
 
     let adjustment = parse_critic_response(llm_response, &diagnosis.algorithmic_adjustments);
@@ -1935,7 +1941,7 @@ mod tests {
         sm
     }
 
-    fn test_walk_output() -> WalkOutput {
+    pub(super) fn test_walk_output() -> WalkOutput {
         WalkOutput {
             recommended_action: "express".into(),
             primary_domain: "markets".into(),
@@ -3444,5 +3450,51 @@ mod tests {
         let (mut keep, _) = accepted_sm();
         on_metric_change(&mut keep, AgreementMetric::Domain);
         assert!(keep.rule_regression_watch.is_some());
+    }
+}
+
+#[cfg(test)]
+mod inert_critic_tests {
+    #[test]
+    fn observability_critic_does_not_change_self_model() {
+        let mut sm = crate::core::SelfModel::new();
+        let before = serde_json::to_value(&sm).unwrap();
+        let output = super::tests::test_walk_output();
+        super::run_critic(&output, &[], &mut sm);
+        assert_eq!(serde_json::to_value(&sm).unwrap(), before);
+    }
+}
+
+static CRITIC_APPLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn configure_critic(enabled: bool) {
+    CRITIC_APPLY.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn critic_enabled(sm: &SelfModel) -> bool {
+    critic_application_allowed(sm, CRITIC_APPLY.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn critic_application_allowed(sm: &SelfModel, explicitly_enabled: bool) -> bool {
+    explicitly_enabled
+        || (sm.mode == CognitiveMode::Autonomous
+            && matches!(sm.self_mod_stage, SelfModStage::SelectionLive | SelfModStage::RuleTrialsLive))
+}
+
+#[cfg(test)]
+mod critic_gate_tests {
+    use super::*;
+    #[test]
+    fn only_explicit_enable_or_autonomous_live_stage_allows_critic() {
+        let mut sm = SelfModel::new();
+        for mode in [CognitiveMode::Compliant, CognitiveMode::Autonomous] {
+            sm.mode = mode.clone();
+            for stage in [SelfModStage::Observability, SelfModStage::SelectionLive, SelfModStage::RuleTrialsLive] {
+                sm.self_mod_stage = stage;
+                assert!(critic_application_allowed(&sm, true));
+                assert_eq!(critic_application_allowed(&sm, false),
+                    mode == CognitiveMode::Autonomous && stage != SelfModStage::Observability);
+            }
+        }
     }
 }

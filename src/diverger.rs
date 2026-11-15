@@ -704,6 +704,7 @@ impl Diverger {
 
                                 if action != "nothing" && !julian_url.is_empty() {
                                     let cmd = crate::motor::MotorCommand {
+        correlation_id: uuid::Uuid::new_v4(),
                                         action: action.to_string(),
                                         domain: domains.first().cloned().unwrap_or_default(),
                                         walker_context: format!(
