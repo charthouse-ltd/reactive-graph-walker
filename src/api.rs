@@ -106,6 +106,12 @@ pub async fn serve(
     ));
     tracing::info!(motor_mode = motor_gate.mode().as_str(), tension_mode = ?crate::tension::mode(),
         seed_mode = ?crate::seeding::seed_mode(), "Effective graph and motor modes");
+    if crate::motor::missing_send_credential(motor_gate.mode(),
+        std::env::var("RGW_JULIAN_BEARER").ok().as_deref(), std::env::var("RGW_JULIAN_KEY").ok().as_deref()) {
+        tracing::warn!(motor_mode = motor_gate.mode().as_str(),
+            "[motor] This mode can send, but neither RGW_JULIAN_BEARER nor RGW_JULIAN_KEY is set; \
+             a backend that requires authentication will reject every motor command");
+    }
 
     // Create the Diverger with shared self-model + Julian URL for motor commands
     let diverger = Diverger::with_energy_limit(pool.clone(), self_model.clone(), julian_url, admission.limits.energy_nodes);

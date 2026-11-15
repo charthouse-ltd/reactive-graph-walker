@@ -490,6 +490,14 @@ impl MotorGate {
     }
 }
 
+/// True when the mode can send (`live`, or `propose` once approved) but no
+/// outbound credential is configured. A backend that requires authentication
+/// then rejects every command, which is worth saying once at startup.
+pub fn missing_send_credential(mode: MotorMode, bearer: Option<&str>, key: Option<&str>) -> bool {
+    let set = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
+    matches!(mode, MotorMode::Live | MotorMode::Propose) && !set(bearer) && !set(key)
+}
+
 static GATE: OnceLock<Arc<MotorGate>> = OnceLock::new();
 static FALLBACK_GATE: OnceLock<MotorGate> = OnceLock::new();
 
@@ -668,6 +676,19 @@ mod tests {
         assert_eq!(live.counter("sent"), 1);
 
         server.abort();
+    }
+
+    #[test]
+    fn sending_modes_without_a_credential_are_reported() {
+        for mode in [MotorMode::Live, MotorMode::Propose] {
+            assert!(missing_send_credential(mode, None, None));
+            assert!(missing_send_credential(mode, Some(""), Some("  ")));
+            assert!(!missing_send_credential(mode, Some("test-bearer"), None));
+            assert!(!missing_send_credential(mode, None, Some("test-key")));
+        }
+        for mode in [MotorMode::Off, MotorMode::Shadow] {
+            assert!(!missing_send_credential(mode, None, None), "nothing is sent in {mode:?}");
+        }
     }
 
     #[test]

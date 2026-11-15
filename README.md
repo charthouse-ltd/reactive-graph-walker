@@ -77,6 +77,9 @@ Outbound authentication is optional and separate from inbound API keys:
 - `RGW_JULIAN_BEARER` sends `Authorization: Bearer …`.
 - `RGW_JULIAN_KEY` sends `X-RGW-Key: …`.
 - Both may be configured; neither is sent by default. Julian must support the chosen header.
+- In `live` or `propose` mode with neither set, startup logs one warning. It does not refuse to start.
+
+A command counts as sent on a 2xx response, except when the JSON body carries an explicit `"status"` of `"error"` or `"unknown"` (the backend had no handler, or the handler raised). Those are recorded as a failed send; tools report failure and an approved proposal becomes `approved_send_failed`. Any other body, including `"status": "skipped"`, keeps the 2xx meaning.
 
 Julian's existing callback and the shorter `/outcomes` route accept:
 
