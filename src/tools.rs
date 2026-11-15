@@ -608,9 +608,12 @@ fn ip_is_internal(ip: std::net::IpAddr) -> bool {
             if s[0] == 0x2002 {
                 return ip_is_internal(embedded(s[1], s[2])); // 6to4 2002:a.b.c.d::/48
             }
-            (s[0] == 0x2001 && (s[1] & 0xfe00) == 0) // IETF protocol assignments 2001::/23 (Teredo, ORCHID, ...)
-                || (s[0] == 0x2001 && s[1] == 0xdb8) // documentation 2001:db8::/32
-                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0) // documentation 3fff::/20
+            match (s[0], s[1]) {
+                (0x2001, lo) if lo & 0xfe00 == 0 => true, // IETF protocol assignments 2001::/23 (Teredo, ORCHID, ...)
+                (0x2001, 0xdb8) => true,                  // documentation 2001:db8::/32
+                (0x3fff, lo) if lo & 0xf000 == 0 => true, // documentation 3fff::/20
+                _ => false,
+            }
         }
     }
 }
