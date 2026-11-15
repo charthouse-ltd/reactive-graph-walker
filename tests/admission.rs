@@ -25,7 +25,31 @@ fn request(method: &str, path: &str, key: Option<&str>, body: Value) -> Request<
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
-async fn state(pool: sqlx::PgPool, mode: CognitiveMode, limits: Limits) -> Arc<AppState> {
+/// Stand-in expression model: records the system prompt it was sent and replies
+/// with fixed text. The walk context is prompt material, so this is where a test
+/// can observe it; the completion itself must be the model's reply.
+async fn spawn_model() -> anyhow::Result<(String, Arc<std::sync::Mutex<String>>)> {
+    let prompt = Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = prompt.clone();
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let seen = seen.clone();
+            async move {
+                *seen.lock().unwrap() = body["messages"][0]["content"].as_str().unwrap_or_default().to_string();
+                axum::Json(json!({"choices": [{"message": {"role": "assistant", "content": "stand-in reply"}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Ok((url, prompt))
+}
+
+async fn state(pool: sqlx::PgPool, mode: CognitiveMode, limits: Limits, model_url: &str) -> Arc<AppState> {
     let mut model = SelfModel::new();
     model.mode = mode;
     let self_model = Arc::new(tokio::sync::Mutex::new(model));
@@ -40,7 +64,7 @@ async fn state(pool: sqlx::PgPool, mode: CognitiveMode, limits: Limits) -> Arc<A
         pool,
         diverger,
         self_model,
-        ollama_url: String::new(),
+        ollama_url: model_url.to_string(),
         expression_model: String::new(),
         julian_url: String::new(),
         provider: None,
@@ -58,6 +82,7 @@ async fn router_enforces_limits_scopes_and_real_walk_clamps() -> anyhow::Result<
         std::env::set_var("RGW_SEED_MODE", "fixed");
     }
     let pool = common::fixture::fixture_pool("admission_router").await?;
+    let (model_url, model_prompt) = spawn_model().await?;
     for mode in [CognitiveMode::Compliant, CognitiveMode::Autonomous] {
         let state = state(
             pool.clone(),
@@ -67,6 +92,7 @@ async fn router_enforces_limits_scopes_and_real_walk_clamps() -> anyhow::Result<
                 steps: 1,
                 ..Default::default()
             },
+            &model_url,
         )
         .await;
         let app = app_router(state.clone());
@@ -87,7 +113,8 @@ async fn router_enforces_limits_scopes_and_real_walk_clamps() -> anyhow::Result<
             output["total_hops"].as_u64().unwrap() <= 4,
             "at most seed plus one hop per walker: {output}"
         );
-        // Existing chat path must enforce the same caps before its LLM fallback.
+        // Existing chat path must enforce the same caps before its LLM call.
+        model_prompt.lock().unwrap().clear();
         let before = state.self_model.lock().await.total_signals_processed;
         let response = app
             .clone()
@@ -101,7 +128,8 @@ async fn router_enforces_limits_scopes_and_real_walk_clamps() -> anyhow::Result<
         assert_eq!(response.status(), StatusCode::OK);
         let chat: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
-        let context = chat["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(chat["choices"][0]["message"]["content"], "stand-in reply");
+        let context = model_prompt.lock().unwrap().clone();
         assert!(context.contains("[2 walkers,"), "{context}");
         assert!(
             context.contains("2 hops,")
@@ -139,6 +167,7 @@ async fn router_enforces_limits_scopes_and_real_walk_clamps() -> anyhow::Result<
             energy_nodes: 2,
             ..Default::default()
         },
+        "",
     )
     .await;
     state.diverger.seed_energy((1..100).collect(), 0.3).await;
