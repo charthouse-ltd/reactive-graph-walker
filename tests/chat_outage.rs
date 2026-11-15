@@ -60,6 +60,42 @@ async fn no_model_is_a_503_and_nothing_is_recorded_as_said() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn on_the_wire_an_outage_is_a_json_503_without_retry_after() -> anyhow::Result<()> {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+    // The only test in this binary that goes through authentication.
+    unsafe {
+        std::env::set_var("RGW_API_KEY", "test-outage-key");
+    }
+    let pool = fixture::fixture_pool("chat_wire").await?;
+    for bypass in [false, true] {
+        let body = json!({
+            "messages": [{"role": "user", "content": "What do you remember about the hub?"}],
+            "rgw_bypass": bypass,
+        });
+        let response = rgw::api::app_router(state(pool.clone(), NO_MODEL_URL))
+            .oneshot(
+                axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("X-RGW-Key", "test-outage-key")
+                    .body(Body::from(body.to_string()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "bypass={bypass}");
+        // Saturation is also a 503, but it carries Retry-After; an outage does not.
+        assert!(!response.headers().contains_key("retry-after"));
+        assert!(response.headers()["content-type"].to_str()?.starts_with("application/json"));
+        let bytes = to_bytes(response.into_body(), 100_000).await?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes)?,
+            json!({"error": "Service Unavailable"}),
+            "the whole body is the generic error; no walk context, no memory"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_empty_model_reply_is_a_503_and_a_real_reply_is_returned() -> anyhow::Result<()> {
     let pool = fixture::fixture_pool("chat_reply").await?;
     for (content, expected) in [("   ", None), ("hello from the model", Some("hello from the model"))] {

@@ -50,7 +50,7 @@ The existing `RGW_API_KEY` remains a full-access **admin** key. It also approves
 | POST | `/motor/proposals/{id}/approve` | approve | Send held proposal; requires `{"confirm":"yes"}` |
 | POST | `/motor/proposals/{id}/reject` | approve | Reject held proposal; optional note |
 | POST | `/walk` | admin | Walk and optional critic |
-| POST | `/v1/chat/completions` | admin | Walk plus LLM expression; non-streaming. 503 when no model produced text |
+| POST | `/v1/chat/completions` | admin | Walk plus LLM expression; non-streaming. 503 `{"error":"Service Unavailable"}` without `Retry-After` when no model produced text |
 | POST | `/benchmark` | admin | Runs multiple walks; GET with an admin key returns 405 |
 | POST | `/edge`, `/prune` | admin | Create edges or decay/delete edges |
 | POST | `/self/mode`, `/self/save` | admin | Change mode or save self-model |
