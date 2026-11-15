@@ -139,8 +139,10 @@ pub async fn list_models() -> Json<ModelList> {
 /// RGW thinks via graph walk, then forwards to Qwen for expression.
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatRequest>,
+    Json(mut req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, ModeError> {
+    (req.rgw_walkers, req.rgw_steps) = state.admission.limits.walk(req.rgw_walkers, req.rgw_steps);
+    req.max_tokens = Some(req.max_tokens.unwrap_or(1024).clamp(1, state.admission.limits.completion_tokens as u32));
     let self_model = request_self_model(&state.self_model, req.rgw_mode.as_deref()).await?;
     let start = Instant::now();
 
