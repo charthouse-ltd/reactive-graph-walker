@@ -779,3 +779,41 @@ pub async fn schema_ready(pool: &PgPool) -> Result<(), sqlx::Error> {
     if !valid { return Err(sqlx::Error::Protocol("incompatible schema contract".into())); }
     Ok(())
 }
+
+// Julian's episode provenance constraint gives callbacks a durable idempotency key.
+// `detail` is TEXT in Alembic; only our source_type contains this version's JSON.
+pub(crate) async fn save_motor_outcome(
+    pool: &PgPool,
+    record: &crate::motor::OutcomeRecord,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO rgw_episodes (occurred_at, kind, headline, detail, source_type, source_ref)
+        VALUES (NOW() AT TIME ZONE 'UTC', 'motor_outcome', $1, $2, 'motor_outcome', $3)
+        ON CONFLICT (source_type, source_ref) DO UPDATE SET
+            occurred_at = EXCLUDED.occurred_at, headline = EXCLUDED.headline, detail = EXCLUDED.detail")
+        .bind(&record.callback.outcome).bind(serde_json::to_string(record)?)
+        .bind(record.callback.correlation_id.to_string()).execute(pool).await?;
+    Ok(())
+}
+
+pub(crate) async fn load_motor_outcome(
+    pool: &PgPool,
+    id: uuid::Uuid,
+) -> anyhow::Result<Option<crate::motor::OutcomeRecord>> {
+    let detail: Option<String> = sqlx::query_scalar(
+        "SELECT detail FROM rgw_episodes WHERE source_type = 'motor_outcome' AND source_ref = $1",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(detail.map(|s| serde_json::from_str(&s)).transpose()?)
+}
+
+pub(crate) async fn recent_motor_outcomes(pool: &PgPool) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT detail FROM rgw_episodes WHERE source_type = 'motor_outcome'
+        AND detail IS NOT NULL ORDER BY occurred_at DESC, id DESC LIMIT $1",
+    )
+    .bind(crate::motor::PROPOSAL_CAP as i64)
+    .fetch_all(pool)
+    .await?)
+}

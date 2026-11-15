@@ -89,7 +89,17 @@ Julian's existing callback and the shorter `/outcomes` route accept:
 }
 ```
 
-`success` and `lesson` are optional. The UUID must be non-nil; outcome must contain 1–500 characters and lesson at most 500. Accepted callbacks return 202. They are retained in a bounded, process-local ring (100 entries, latest callback per UUID), visible in `/motor/proposals`. They are **not durable** and do not yet update episodic learning: the existing episodic buffer has no command correlation mapping. Unknown UUIDs are accepted for compatibility with delayed callbacks.
+`success` and `lesson` are optional. The UUID must be non-nil; outcome must contain 1–500 characters and lesson at most 500. Accepted callbacks return 202. Both routes write on the request to Julian's existing `rgw_episodes` table, using `kind = source_type = 'motor_outcome'` and `source_ref = correlation_id`. The existing unique provenance constraint makes repeats update one episode. `headline` contains the outcome; `detail` is JSON containing `correlation_id`, `outcome`, nullable `success` and `lesson`, `origin`, `received_at` (Unix seconds), and `reflected` (learning receipt). `occurred_at` tracks the latest callback in UTC; `created_at` retains the original insert time. No new table or Alembic migration is required.
+
+`origin` records the server's action, domain and target. It is matched against retained proposals or the latest 100 dispatches, including live commands before sending. Previously persisted outcome metadata remains available on later callbacks even after restart or eviction from the inspection ring. Unknown IDs are stored with `origin: null` (unmatched) and return 202. Proposals themselves remain process-local: a first callback after restart may therefore be unmatched. Callback bodies cannot supply trusted origin metadata.
+
+The latest 100 outcome rows are reloaded at startup into the bounded `/motor/proposals` inspection ring, oldest first; malformed motor details are logged and skipped. There is no GET `/outcomes` route. Motor episodes also appear in `/recall`. Other episode sources are untouched.
+
+Matched outcomes with explicit `success` feed the existing metacognitive `reflect` hook, including the action and domain. This requires **autonomous cognition and the existing critic-application gate**; compliant mode always records observations only. Missing success is unknown, never inferred from outcome text. Supplied lessons are retained for recall, not installed as executable rules. Learning is deferred if persistence fails or a walk holds the self-model lock; a busy self-model does not prevent storing the outcome. The first eligible callback records a learning receipt; retries and corrected callbacks update the episode without repeatedly training the self-model. Startup reload never replays learning.
+
+Database writes and startup reads have a 750 ms budget. Missing tables, database errors and timeouts are logged without connection details; callbacks still return 202 and remain in memory. There is no background writer or automatic retry: Julian must retry to recover an unpersisted callback. Readiness is unchanged: `rgw_episodes` was already required for `/recall`, so its absence still causes 503; no optional readiness dependency has been introduced.
+
+The learning receipt is committed before reflection, while self-state retains its existing periodic/shutdown persistence. A crash between these operations can lose a learning update; durable outcomes remain available, but are not replayed automatically. This favors avoiding duplicate learning over exactly-once learning. Chris should confirm the new `motor_outcome` episode kind/source and permanent timeline retention with Julian before promotion.
 
 ## Configuration
 
