@@ -388,6 +388,50 @@ pub async fn find_similar_nodes(
     rows.iter().map(|r| Ok((r.try_get("id")?, r.try_get("similarity")?, r.try_get("content")?))).collect()
 }
 
+/// [`find_similar_nodes`] for text that is going into a prompt: rows whose
+/// `source_type` is in `excluded` are skipped, with the same case- and
+/// whitespace-insensitive rule as the walk narrative (a NULL source type is
+/// skipped too). A schema without that column, or an empty list, is unfiltered.
+pub async fn find_similar_documents(
+    pool: &PgPool,
+    embedding: &[f32],
+    limit: i32,
+    threshold: f32,
+    excluded: &[String],
+) -> Result<Vec<(i32, f32, String)>, sqlx::Error> {
+    let has_source_type: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_attribute \
+         WHERE attrelid = to_regclass('memory_vectors') AND attname = 'source_type' AND NOT attisdropped)",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_source_type || excluded.is_empty() {
+        return find_similar_nodes(pool, embedding, limit, threshold).await;
+    }
+    let emb_str = format!(
+        "[{}]",
+        embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+    );
+    let rows = sqlx::query(
+        "SELECT id, (1.0 - (embedding <=> $1::vector))::real AS similarity, \
+                COALESCE(document, '') AS content \
+         FROM memory_vectors \
+         WHERE embedding IS NOT NULL \
+           AND embedding <=> $1::vector < $2 \
+           AND lower(trim(source_type)) <> ALL($4) \
+         ORDER BY embedding <=> $1::vector \
+         LIMIT $3",
+    )
+    .bind(&emb_str)
+    .bind(threshold)
+    .bind(limit)
+    .bind(excluded)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter().map(|r| Ok((r.try_get("id")?, r.try_get("similarity")?, r.try_get("content")?))).collect()
+}
+
 /// Update node metadata (importance, access_count, valence, arousal).
 pub async fn bump_node(
     pool: &PgPool,
