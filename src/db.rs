@@ -630,7 +630,13 @@ pub async fn location_as_of(pool: &PgPool, to: &str) -> Result<Option<LocationAs
     })).transpose()
 }
 
+/// `kind` of the rows RGW writes for motor callbacks. They share the episode
+/// table for its idempotency key, but they are execution records (their
+/// `detail` is internal JSON), not autobiography, so recall never serves them.
+pub const MOTOR_OUTCOME_KIND: &str = "motor_outcome";
+
 /// Episodes occurring in `[from, to]`, chronological, capped at `limit`.
+/// Motor outcome rows are excluded.
 ///
 /// `place`, when given, filters to a case-insensitive substring match on
 /// `location` (so "Porto" matches "Porto, Portugal"). `from`/`to` are ISO8601
@@ -646,6 +652,7 @@ pub async fn recall_window(
         "SELECT {OCCURRED_AT_ISO} AS occurred_at, kind, location, headline, detail \
          FROM rgw_episodes \
          WHERE occurred_at >= $1::timestamptz AND occurred_at <= $2::timestamptz \
+           AND kind <> '{MOTOR_OUTCOME_KIND}' \
            AND ($3::text IS NULL OR location ILIKE $3) \
          ORDER BY occurred_at ASC \
          LIMIT $4"

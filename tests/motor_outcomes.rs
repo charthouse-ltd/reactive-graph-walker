@@ -241,3 +241,37 @@ async fn restore_is_bounded_and_skips_malformed_motor_rows() -> anyhow::Result<(
     assert_eq!(outcomes.last().unwrap()["received_at"], 104);
     Ok(())
 }
+
+#[tokio::test]
+async fn recall_serves_autobiography_but_never_motor_outcome_rows() -> anyhow::Result<()> {
+    let pool = common::fixture::fixture_pool("motor_recall").await?;
+    sqlx::query("INSERT INTO rgw_episodes (occurred_at, kind, location, headline, source_type, source_ref)
+        VALUES (NOW() AT TIME ZONE 'UTC', 'post', 'Lisbon, Portugal', 'Wrote about tides', 'post', '1')")
+        .execute(&pool).await?;
+    let gate = MotorGate::new(MotorMode::Propose);
+    let model = tokio::sync::Mutex::new(SelfModel::new());
+    let id = uuid::Uuid::new_v4();
+    gate.dispatch("test", "http://motor.invalid", MotorCommand {
+        correlation_id: id, action: "search".into(), domain: "science".into(),
+        walker_context: String::new(), expression_seeds: vec![], confidence: 0.8, novelty: 0.5,
+        search_query: None, params: None, audience_id: None,
+    }).await;
+    gate.record_outcome(&pool, &model, rgw::motor::MotorOutcome {
+        correlation_id: id, outcome: "completed".into(), success: Some(true),
+        lesson: Some("internal lesson".into()),
+    }).await;
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rgw_episodes WHERE kind = 'motor_outcome'").fetch_one(&pool).await?;
+    assert_eq!(stored, 1, "the outcome is still stored for inspection and idempotency");
+
+    for place in [None, Some("Lisbon")] {
+        let episodes = rgw::db::recall_window(&pool, "-infinity", "infinity", place, 50).await?;
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].kind, "post");
+        let served = serde_json::to_string(&episodes)?;
+        for internal in ["motor.invalid", "internal lesson", &id.to_string()] {
+            assert!(!served.contains(internal), "recall leaked {internal}");
+        }
+    }
+    Ok(())
+}
