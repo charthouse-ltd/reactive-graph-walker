@@ -1167,6 +1167,19 @@ impl MotorGate {
             Ok::<_, OutcomeError>(())
         })
         .await;
+        match &persisted {
+            Err(_) => tracing::warn!(
+                correlation_id = %record.callback.correlation_id,
+                failure = "timeout",
+                "[motor] Outcome persistence failed"
+            ),
+            Ok(Err(OutcomeError::Storage(_))) => tracing::warn!(
+                correlation_id = %record.callback.correlation_id,
+                failure = "storage",
+                "[motor] Outcome persistence failed"
+            ),
+            _ => {}
+        }
         persisted.map_err(|e| OutcomeError::Storage(e.into()))??;
         self.retain_outcome(record);
         Ok(())
