@@ -1177,7 +1177,7 @@ mod tests {
         settle(&mut obs, &mut sm, &c2.accepted_keys, now);
         assert_eq!(obs.questions[&fnv1a64("q")].attempts, 0, "attempt not consumed when the pool dropped it");
         // accepted → attempt consumed and cooldown set
-        settle(&mut obs, &mut sm, &[key.clone()], now);
+        settle(&mut obs, &mut sm, std::slice::from_ref(&key), now);
         assert_eq!(obs.questions[&fnv1a64("q")].attempts, 1);
         assert!(obs.questions[&fnv1a64("q")].last_release >= now);
     }

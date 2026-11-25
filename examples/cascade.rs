@@ -21,10 +21,9 @@
 //! Run (with DeepSeek):
 //!   DEEPSEEK_API_KEY=sk-... DATABASE_URL=... RUST_LOG=info,rgw=debug ./target/release/examples/cascade
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sqlx::PgPool;
 
@@ -335,10 +334,10 @@ async fn seed_graph(pool: &PgPool) -> anyhow::Result<Vec<i32>> {
 // ── Cascade Engine ───────────────────────────────────────────────
 
 async fn run_cascade(pool: &PgPool, node_ids: &[i32]) -> anyhow::Result<()> {
-    use rgw::core::{self, SelfModel, CognitiveMode, Signal};
-    use rgw::graph::{EmotionalState, WalkerBias};
+    use rgw::core::{self, SelfModel, Signal};
+    use rgw::graph::EmotionalState;
     use rgw::walker;
-    use rgw::diverger::{Diverger, DivergerConfig, EdgeChange};
+    use rgw::diverger::{Diverger, EdgeChange};
 
     let self_model = Arc::new(Mutex::new(SelfModel::new()));
     let julian_url = "";

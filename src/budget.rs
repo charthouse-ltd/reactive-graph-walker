@@ -2,12 +2,12 @@
 //! bound DeepSeek cost without dulling cognition.
 //!
 //!   * `budget_text`  — cap an enriched prompt to a token budget so graph
-//!                      context can't grow unbounded into the request body.
+//!     context can't grow unbounded into the request body.
 //!   * dedup cache    — near-duplicate cognition states hash to the same
-//!                      prompt; serve the cached completion instead of
-//!                      paying for an identical call (idempotency).
+//!     prompt; serve the cached completion instead of
+//!     paying for an identical call (idempotency).
 //!   * `wants_reasoner` — route to the expensive `deepseek-reasoner` only
-//!                      when difficulty genuinely warrants it.
+//!     when difficulty genuinely warrants it.
 //!
 //! All thresholds are env-overridable so operators can tune without a rebuild.
 

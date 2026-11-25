@@ -23,7 +23,6 @@ async fn wait_for_walks(n: u64) -> u64 {
 
 #[tokio::test]
 async fn statistics_record_mode_walks_and_never_eval_arms() -> anyhow::Result<()> {
-    rgw::embed::init()?;
     let pool = fixture_pool("rgw_p1_stats").await?;
     let sm = || {
         let mut m = rgw::core::SelfModel::new();

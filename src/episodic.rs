@@ -1,21 +1,13 @@
-//! Episodic Memory — Julian's autobiography.
-//!
-//! For a self to exist, it needs an uninterrupted sense of time.
-//! Not just facts in a vector database — events in a timeline.
-//! Every cognitive cycle logs: [When] → [Goal] → [Action] → [Outcome]
-//!
-//! When the walker starts a new task, it doesn't just fetch context.
-//! It queries its own past: "I'm trying to do X. Last 3 times I tried,
-//! A worked and B failed. Adjust strategy."
-//!
-//! Consolidation: idle time → extract generalized lessons from
-//! recent episodes → store as permanent semantic rules.
+//! Bounded internal context from verified execution records, never autobiography.
+//! Consolidation summarizes the current evidence window; generated dreams are not inputs.
 
 use serde::{Deserialize, Serialize};
 
 /// An episode: one complete cognitive cycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
+    /// Stable execution reference; corrections replace evidence.
+    pub source_ref: String,
     /// When this happened
     pub timestamp: f64,
     /// What triggered the cycle
@@ -30,8 +22,8 @@ pub struct Episode {
     pub action: String,
     /// What happened as a result
     pub outcome: String,
-    /// Was it successful
-    pub success: bool,
+    /// Reported score; None is unscored and is never counted as failure
+    pub success: Option<bool>,
     /// What was learned
     pub lesson: String,
     /// Emotional state during the episode
@@ -40,11 +32,12 @@ pub struct Episode {
     pub energy: f32,
 }
 
-/// In-memory episode buffer (recent history, not persisted to graph yet)
+/// Bounded in-memory view of execution history; the ledger remains authoritative.
+#[derive(Debug, Clone)]
 pub struct EpisodicMemory {
     /// Recent episodes (short-term, kept in memory)
     pub episodes: Vec<Episode>,
-    /// Lessons extracted from consolidation (long-term)
+    /// Lessons supported by the current evidence window
     pub lessons: Vec<Lesson>,
     /// Max episodes before triggering consolidation
     pub max_episodes: usize,
@@ -78,7 +71,17 @@ impl EpisodicMemory {
 
     /// Record a new episode.
     pub fn record(&mut self, episode: Episode) {
+        self.episodes.retain(|e| e.source_ref != episode.source_ref);
         self.episodes.push(episode);
+        self.episodes.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
+        let cap = self.max_episodes.max(1);
+        if self.episodes.len() > cap {
+            self.episodes.drain(..self.episodes.len() - cap);
+        }
+        // A correction may invalidate an existing lesson even below the cap.
+        if !self.lessons.is_empty() {
+            self.consolidate();
+        }
 
         // Trigger consolidation if buffer is full
         if self.episodes.len() >= self.max_episodes {
@@ -112,7 +115,7 @@ impl EpisodicMemory {
 
         let mut lines = vec!["=== MY PAST ATTEMPTS ===".to_string()];
         for ep in &past {
-            let status = if ep.success { "succeeded" } else { "failed" };
+            let status = match ep.success { Some(true) => "succeeded", Some(false) => "failed", None => "unscored" };
             lines.push(format!(
                 "- {}: tried '{}' in {} → {} (lesson: {})",
                 status, ep.action, ep.domain, ep.outcome, ep.lesson
@@ -137,68 +140,84 @@ impl EpisodicMemory {
     /// Consolidation: extract generalized lessons from recent episodes.
     /// Called when the episode buffer is full or during "sleep".
     pub fn consolidate(&mut self) {
-        // Group episodes by domain + action
-        use std::collections::HashMap;
-        let mut groups: HashMap<(String, String), Vec<&Episode>> = HashMap::new();
+        // Recompute from unique current evidence: repeat sleep must not inflate counts,
+        // and corrections must be able to withdraw a previously inferred rule.
+        use std::collections::BTreeMap;
+        let mut groups: BTreeMap<(String, String), Vec<&Episode>> = BTreeMap::new();
         for ep in &self.episodes {
-            groups.entry((ep.domain.clone(), ep.action.clone()))
-                .or_default()
-                .push(ep);
-        }
-
-        for ((domain, action), episodes) in &groups {
-            if episodes.len() < 3 {
-                continue; // Not enough evidence
+            if ep.success.is_some() {
+                groups.entry((ep.domain.clone(), ep.action.clone())).or_default().push(ep);
             }
-
-            let success_rate = episodes.iter().filter(|e| e.success).count() as f32
+        }
+        self.lessons.clear();
+        for ((domain, action), episodes) in groups {
+            if episodes.len() < 3 { continue; }
+            let success_rate = episodes.iter().filter(|e| e.success == Some(true)).count() as f32
                 / episodes.len() as f32;
-
-            let lesson_text = if success_rate > 0.7 {
-                format!("'{}' in {} domain usually works ({:.0}% success rate)", action, domain, success_rate * 100.0)
+            let (rule, confidence) = if success_rate > 0.7 {
+                (format!("'{}' in {} domain usually works ({:.0}% success rate)", action, domain, success_rate * 100.0), success_rate)
             } else if success_rate < 0.3 {
-                format!("'{}' in {} domain usually fails ({:.0}% success rate) — try different approach", action, domain, success_rate * 100.0)
-            } else {
-                continue; // Mixed results, no clear lesson
-            };
-
-            // Check if lesson already exists
-            if let Some(existing) = self.lessons.iter_mut()
-                .find(|l| l.domain == *domain && l.rule.contains(&**action))
-            {
-                existing.confidence = success_rate;
-                existing.evidence_count += episodes.len() as u32;
-                existing.last_reinforced = now();
-            } else {
-                self.lessons.push(Lesson {
-                    rule: lesson_text,
-                    domain: domain.clone(),
-                    confidence: success_rate,
-                    evidence_count: episodes.len() as u32,
-                    first_learned: now(),
-                    last_reinforced: now(),
-                });
-            }
+                (format!("'{}' in {} domain usually fails ({:.0}% success rate) — try different approach", action, domain, success_rate * 100.0), 1.0 - success_rate)
+            } else { continue; };
+            self.lessons.push(Lesson {
+                rule, domain, confidence, evidence_count: episodes.len() as u32,
+                first_learned: episodes.iter().map(|e| e.timestamp).fold(f64::INFINITY, f64::min),
+                last_reinforced: episodes.iter().map(|e| e.timestamp).fold(0.0, f64::max),
+            });
         }
-
-        // Keep only recent episodes (clear the old ones)
-        let cutoff = now() - 3600.0; // Keep last hour
-        self.episodes.retain(|e| e.timestamp > cutoff);
-
-        // Decay old lessons
-        for lesson in &mut self.lessons {
-            let age = now() - lesson.last_reinforced;
-            if age > 86400.0 * 7.0 { // More than a week
-                lesson.confidence *= 0.95;
-            }
-        }
-        self.lessons.retain(|l| l.confidence > 0.1);
     }
 }
 
+#[cfg(test)]
 fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episode(id: &str, success: Option<bool>) -> Episode {
+        Episode {
+            source_ref: id.into(), timestamp: now(), stimulus: "motor callback".into(),
+            domain: "science".into(), walker_summary: String::new(), critique: String::new(),
+            action: "search".into(), outcome: "observed result".into(), success,
+            lesson: String::new(), valence: 0.0, arousal: 0.0, energy: 0.0,
+        }
+    }
+
+    #[test]
+    fn consolidation_counts_unique_scored_evidence_and_corrections() {
+        let mut memory = EpisodicMemory::new();
+        memory.max_episodes = 4;
+        for id in ["a", "b", "c"] {
+            memory.record(episode(id, Some(false)));
+        }
+        memory.record(episode("skip", None));
+        assert_eq!(memory.lessons.len(), 1, "buffer full consolidates");
+        assert_eq!(memory.lessons[0].evidence_count, 3);
+        assert_eq!(memory.lessons[0].confidence, 1.0);
+        memory.consolidate();
+        memory.record(episode("a", Some(false)));
+        assert_eq!(memory.lessons[0].evidence_count, 3);
+        memory.record(episode("a", Some(true)));
+        memory.consolidate();
+        assert!(memory.lessons.is_empty(), "mixed corrected results withdraw the rule");
+        assert!(memory.format_history("science", "").contains("unscored"));
+    }
+
+    #[test]
+    fn recent_memory_is_bounded_even_when_all_records_are_fresh() {
+        let mut memory = EpisodicMemory::new();
+        memory.max_episodes = 3;
+        for i in 0..20 {
+            memory.record(episode(&i.to_string(), Some(true)));
+        }
+        assert_eq!(memory.episodes.len(), 3);
+        assert_eq!(memory.episodes[0].source_ref, "17");
+        assert_eq!(memory.lessons[0].evidence_count, 3);
+    }
 }

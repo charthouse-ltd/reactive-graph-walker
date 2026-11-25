@@ -938,10 +938,14 @@ struct Snapshot {
     arousal: f32,
     energy: f32,
     focus: String,
+    #[allow(dead_code)] // Preserve captured snapshot data without changing observation behavior.
     focus_intensity: f32,
+    #[allow(dead_code)] // Preserve captured snapshot data without changing observation behavior.
     top_attention: Option<(String, f32)>,
+    #[allow(dead_code)] // Preserve captured snapshot data without changing observation behavior.
     dead_ends_total: u32,
     surprise_count: u32,
+    #[allow(dead_code)] // Preserve captured snapshot data without changing observation behavior.
     last_belief_formed: f64,
 }
 
@@ -1343,12 +1347,10 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
     if s.chars().count() <= max_chars {
         return s;
     }
-    let mut char_count = 0;
-    for (i, _) in s.char_indices() {
+    for (char_count, (i, _)) in s.char_indices().enumerate() {
         if char_count >= max_chars {
             return &s[..i];
         }
-        char_count += 1;
     }
     s
 }
@@ -1530,5 +1532,26 @@ mod tests {
         let loaded: Option<SelfModel> = serde_json::from_str(&serde_json::to_string(&v).unwrap()).ok();
         assert!(loaded.is_some(), "old-format ring must not wipe the model");
         assert!(loaded.unwrap().rule_rollback_entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod production_mode_tests {
+    use super::*;
+    #[test]
+    fn cognitive_mode_defaults_safe_and_rejects_typos() {
+        assert_eq!(CognitiveMode::from_env_value(None).unwrap(), CognitiveMode::Compliant);
+        assert_eq!(CognitiveMode::from_env_value(Some("autonomous")).unwrap(), CognitiveMode::Autonomous);
+        assert!(CognitiveMode::from_env_value(Some("automous")).is_err());
+    }
+}
+
+impl CognitiveMode {
+    pub fn from_env_value(value: Option<&str>) -> anyhow::Result<Self> {
+        match value.unwrap_or("compliant").trim().to_ascii_lowercase().as_str() {
+            "compliant" => Ok(Self::Compliant),
+            "autonomous" => Ok(Self::Autonomous),
+            _ => anyhow::bail!("RGW_COGNITIVE_MODE must be compliant or autonomous"),
+        }
     }
 }

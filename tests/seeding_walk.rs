@@ -1,18 +1,8 @@
 //! Query seeding against an isolated graph with synthetic embeddings.
-//! Needs the local Postgres (see tests/common/fixture.rs); CI does not run this file.
+//! Needs the local Postgres (see tests/common/fixture.rs); CI runs this file offline.
 // tests/seeding_walk.rs
 mod common;
 use common::fixture::*;
-
-/// Load the embedding model once per test binary. `rgw::embed::init` replaces the global
-/// model on every call, and several tests initialising at once against a cold model cache
-/// fail while the files are still downloading; `OnceLock` makes the others wait.
-fn embedder() -> anyhow::Result<()> {
-    static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    INIT.get_or_init(|| rgw::embed::init().map_err(|e| e.to_string()))
-        .clone()
-        .map_err(anyhow::Error::msg)
-}
 
 #[tokio::test]
 async fn candidates_are_ranked_by_cosine_with_degrees() -> anyhow::Result<()> {
@@ -21,7 +11,9 @@ async fn candidates_are_ranked_by_cosine_with_degrees() -> anyhow::Result<()> {
     let ids: Vec<i32> = cands.iter().take(5).map(|c| c.id).collect();
     assert_eq!(ids, vec![B1, B2, B3, B4, HUB]);
     assert!((cands[0].cos - 1.0).abs() < 1e-4);
-    assert!((cands[4].cos - 0.7071).abs() < 1e-3);
+    #[allow(clippy::approx_constant)] // Preserve the rounded fixture expectation and its tolerance.
+    let expected_cos = 0.7071;
+    assert!((cands[4].cos - expected_cos).abs() < 1e-3);
     let deg = |id: i32| cands.iter().find(|c| c.id == id).unwrap().degree;
     assert_eq!((deg(B1), deg(HUB), deg(B4)), (3, 4, 1));
     Ok(())
@@ -57,7 +49,6 @@ fn opts(cue: Vec<f32>, arm: EvalArm) -> WalkOptions {
 
 #[tokio::test]
 async fn query_arm_starts_in_the_cue_cluster_and_restarts_keep_the_invariant() -> anyhow::Result<()> {
-    embedder()?; // signal processing embeds text
     let pool = fixture_pool("rgw_p1_query").await?;
     let (out, results) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Query)).await;
     assert_eq!(results.len(), 4);
@@ -78,7 +69,6 @@ async fn query_arm_starts_in_the_cue_cluster_and_restarts_keep_the_invariant() -
 
 #[tokio::test]
 async fn fixed_arm_starts_where_it_does_today() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_fixed").await?;
     let (out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), opts(axis(1), EvalArm::Fixed)).await;
     assert_eq!(out.seed_mode, "fixed");
@@ -89,7 +79,6 @@ async fn fixed_arm_starts_where_it_does_today() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn drop_arm_removes_one_walker_profile() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_drop").await?;
     let arm = EvalArm::Drop(rgw::graph::WalkerBias::Contrarian);
     let (_out, results) = walk_parallel_with(&pool, &Default::default(), 6, 2, &sm(), opts(axis(1), arm)).await;
@@ -100,7 +89,6 @@ async fn drop_arm_removes_one_walker_profile() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn same_seed_gives_the_same_paths() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_determinism").await?;
     // Paths and the ranked list: invariant I6 of the spec.
     let run = || async {
@@ -113,7 +101,6 @@ async fn same_seed_gives_the_same_paths() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn query_arm_ranks_the_cue_cluster_first() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_rank").await?;
     let (out, _) = walk_parallel_with(&pool, &Default::default(), 4, 5, &sm(), opts(axis(1), EvalArm::Query)).await;
     assert!(out.walked);
@@ -126,7 +113,6 @@ async fn query_arm_ranks_the_cue_cluster_first() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn fixed_arm_ranks_todays_seeds_first() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_rank_fixed").await?;
     // One step each: a start node holds mass 1.0, and no other node can exceed it.
     let (out, _) = walk_parallel_with(&pool, &Default::default(), 2, 1, &sm(), opts(axis(1), EvalArm::Fixed)).await;
@@ -161,7 +147,6 @@ async fn vector_arm_returns_candidates_by_cosine() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn shadow_mode_walks_as_fixed_and_records_the_plan() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_shadow").await?;
     let o = WalkOptions { cue_embedding: Some(axis(1)), seed: Some(1), arm: None,
                           seed_mode: Some(rgw::seeding::SeedMode::Shadow) };
@@ -173,7 +158,6 @@ async fn shadow_mode_walks_as_fixed_and_records_the_plan() -> anyhow::Result<()>
 
 #[tokio::test]
 async fn no_cue_means_a_fixed_walk_in_every_mode() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_nocue").await?;
     let o = WalkOptions { cue_embedding: None, seed: Some(1), arm: None, seed_mode: Some(rgw::seeding::SeedMode::Query) };
     let (out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), o).await;
@@ -184,7 +168,6 @@ async fn no_cue_means_a_fixed_walk_in_every_mode() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_wrong_dimension_cue_falls_back_to_a_fixed_walk() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_baddim").await?;
     let o = WalkOptions { cue_embedding: Some(vec![1.0, 0.0]), seed: Some(1), arm: None, seed_mode: Some(rgw::seeding::SeedMode::Query) };
     let (out, results) = walk_parallel_with(&pool, &Default::default(), 2, 3, &sm(), o).await;
@@ -204,7 +187,6 @@ async fn ppr_arm_ranks_the_cue_cluster_without_walkers() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn leaving_the_preloaded_neighbourhood_is_not_a_dead_end() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_miss").await?;
     // The only seed is LONE. Radius-1 preload covers LONE and A3; A3's other neighbours are not loaded.
     let (_out, results) = walk_parallel_with(&pool, &Default::default(), 4, 6, &sm(), opts(axis(2), EvalArm::Query)).await;
@@ -216,7 +198,6 @@ async fn leaving_the_preloaded_neighbourhood_is_not_a_dead_end() -> anyhow::Resu
 
 #[tokio::test]
 async fn a_planned_walk_cannot_be_made_arbitrarily_long() -> anyhow::Result<()> {
-    embedder()?;
     let pool = fixture_pool("rgw_p1_clamp").await?;
     let (_out, results) = walk_parallel_with(&pool, &Default::default(), 2, 10_000, &sm(), opts(axis(1), EvalArm::Query)).await;
     let longest = results.iter().map(|r| r.path.len()).max().unwrap_or(0);
@@ -225,8 +206,9 @@ async fn a_planned_walk_cannot_be_made_arbitrarily_long() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+#[ignore = "requires downloaded embedding model; run explicitly with --ignored"]
 async fn a_fresh_embedding_bypasses_the_cache() -> anyhow::Result<()> {
-    embedder()?;
+    rgw::embed::init()?;
     let text = "cache probe for the eval timing path";
     let (first, _) = rgw::embed::embed_text_traced(text, true)?;
     let (_, cached) = rgw::embed::embed_text_traced(text, true)?;

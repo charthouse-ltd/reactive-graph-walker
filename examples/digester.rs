@@ -162,7 +162,7 @@ async fn seed_database(pool: &PgPool) -> anyhow::Result<Vec<i32>> {
     println!("╚══════════════════════════════════════════════╝\n");
     println!("Seeding {} nodes across 6 domains...\n", nodes.len());
 
-    for (i, node) in nodes.iter().enumerate() {
+    for node in &nodes {
         let embedding = rgw::embed::embed_text(node.content)?;
         let id = rgw::db::create_memory_node(
             pool, node.content, node.domain, &embedding,
@@ -189,7 +189,7 @@ async fn seed_database(pool: &PgPool) -> anyhow::Result<Vec<i32>> {
 // ── Walking ─────────────────────────────────────────────────────
 
 async fn run_walks(pool: &PgPool) -> anyhow::Result<()> {
-    use rgw::core::{self, SelfModel};
+    use rgw::core::SelfModel;
     use rgw::graph::EmotionalState;
     use rgw::walker;
 

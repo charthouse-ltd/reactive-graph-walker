@@ -5,7 +5,7 @@
 //! 1. Parse the prompt → extract stimulus
 //! 2. Graph walk (parallel, emotionally biased)
 //! 3. Forward to Qwen via Ollama for text expression
-//! 4. Return in OpenAI format
+//! 4. Return in OpenAI format (503 when no model produced text)
 //!
 //! From outside: looks like any LLM.
 //! Inside: graph traversal + LLM expression.
@@ -139,8 +139,10 @@ pub async fn list_models() -> Json<ModelList> {
 /// RGW thinks via graph walk, then forwards to Qwen for expression.
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatRequest>,
+    Json(mut req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, ModeError> {
+    (req.rgw_walkers, req.rgw_steps) = state.admission.limits.walk(req.rgw_walkers, req.rgw_steps);
+    req.max_tokens = Some(req.max_tokens.unwrap_or(1024).clamp(1, state.admission.limits.completion_tokens as u32));
     let self_model = request_self_model(&state.self_model, req.rgw_mode.as_deref()).await?;
     let start = Instant::now();
 
@@ -167,12 +169,11 @@ pub async fn chat_completions(
     // memory store; the honest baseline the full path must beat on identical
     // inputs. Lets a harness flip arms per request.
     if req.rgw_bypass {
-        return bypass_completion(&state, &req, &stimulus, &system_prompt, start)
-            .await.map_err(|status| (status, "Completion failed"));
+        return bypass_completion(&state, &req, &stimulus, &system_prompt, start).await;
     }
 
     // 2. Graph walk — RGW thinks
-    let emotion = req.rgw_emotion.unwrap_or_default();
+    let emotion = req.rgw_emotion.take().unwrap_or_default();
     let walk_start = Instant::now();
 
     if let Some(ref aid) = req.rgw_audience {
@@ -190,7 +191,7 @@ pub async fn chat_completions(
         None
     };
     let walk_opts = walker::WalkOptions { cue_embedding, ..Default::default() };
-    let (walk_output, _walker_results) = walker::walk_parallel_with(
+    let (walk_output, _walker_results) = walker::try_walk_parallel_with(
         &state.pool,
         &emotion,
         req.rgw_walkers,
@@ -198,7 +199,7 @@ pub async fn chat_completions(
         &self_model,
         walk_opts,
     )
-    .await;
+    .await.map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "walk failed"))?;
 
     let walk_ms = walk_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -223,57 +224,23 @@ pub async fn chat_completions(
         .clamp(0.0, 1.0);
 
     let expr_start = Instant::now();
-    let text = if let Some(ref provider) = state.provider {
-        // Intelligent routing: complexity determines local vs cloud.
-        // System context = caller's system prompt + audience model (ToM) + walk.
-        let mut system_with_context = String::new();
-        if !system_prompt.is_empty() {
-            system_with_context.push_str(&system_prompt);
-            system_with_context.push_str("\n\n");
-        }
-        if !audience_context.is_empty() {
-            system_with_context.push_str(&audience_context);
-            system_with_context.push_str("\n\n");
-        }
-        system_with_context.push_str(&walker_context);
-        // No external difficulty signal here; let the complexity score (derived
-        // from walker novelty/disagreement) decide chat vs reasoner via its threshold.
-        let result = provider.generate(
-            &system_with_context,
-            &stimulus,
-            complexity,
-            false,
-            req.max_tokens,
-            req.temperature,
-        ).await;
-
-        if !result.text.is_empty() {
-            tracing::info!(
-                "[rgw] Provider routed: {:?} (complexity={:.2})",
-                result.model_used, complexity
-            );
-            result.text
-        } else {
-            // Provider returned nothing — fall back to Ollama
-            tracing::warn!("[rgw] Provider returned empty, falling back to Ollama");
-            forward_to_ollama(
-                &state.ollama_url, &state.expression_model,
-                &req.messages, &walker_context, req.temperature, req.max_tokens,
-            ).await.unwrap_or_else(|e| {
-                tracing::warn!("Ollama fallback also failed: {}", e);
-                walker_context.clone()
-            })
-        }
-    } else {
-        // No provider configured — direct Ollama (backward compatible)
-        forward_to_ollama(
-            &state.ollama_url, &state.expression_model,
-            &req.messages, &walker_context, req.temperature, req.max_tokens,
-        ).await.unwrap_or_else(|e| {
-            tracing::warn!("Ollama forward failed: {}. Returning walker context as fallback.", e);
-            walker_context.clone()
-        })
-    };
+    // Provider system context = caller's system prompt + audience model (ToM) + walk.
+    // There is no external difficulty signal here; the complexity score (derived
+    // from walker novelty/disagreement) decides chat vs reasoner via its threshold.
+    let mut system_with_context = String::new();
+    if !system_prompt.is_empty() {
+        system_with_context.push_str(&system_prompt);
+        system_with_context.push_str("\n\n");
+    }
+    if !audience_context.is_empty() {
+        system_with_context.push_str(&audience_context);
+        system_with_context.push_str("\n\n");
+    }
+    system_with_context.push_str(&walker_context);
+    // No text means no answer: fail before anything is recorded as said to the audience.
+    let text = express(&state, &req, &system_with_context, &stimulus, complexity, &walker_context)
+        .await
+        .ok_or(NO_MODEL)?;
     let expr_ms = expr_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -307,7 +274,7 @@ pub async fn chat_completions(
         object: "chat.completion".into(),
         created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs(),
         model: "rgw".into(),
         choices: vec![Choice {
@@ -348,11 +315,13 @@ async fn bypass_completion(
     stimulus: &str,
     system_prompt: &str,
     start: Instant,
-) -> Result<Json<ChatResponse>, StatusCode> {
-    // Top-k memory retrieval — the "vector store + LLM" baseline.
+) -> Result<Json<ChatResponse>, ModeError> {
+    // Top-k memory retrieval — the "vector store + LLM" baseline. The excerpts go
+    // into a prompt, so they pass the same source-type privacy filter as the narrative.
     let retr_start = Instant::now();
+    let excluded = walker::narrative_excluded_source_types();
     let memory_context = match crate::embed::embed_text(stimulus) {
-        Ok(emb) => match crate::db::find_similar_nodes(&state.pool, &emb, 5, 0.8).await {
+        Ok(emb) => match crate::db::find_similar_documents(&state.pool, &emb, 5, 0.8, &excluded).await {
             Ok(nodes) if !nodes.is_empty() => {
                 let lines: Vec<String> = nodes
                     .iter()
@@ -369,34 +338,15 @@ async fn bypass_completion(
     let retr_ms = retr_start.elapsed().as_secs_f64() * 1000.0;
 
     let expr_start = Instant::now();
-    let text = if let Some(ref provider) = state.provider {
-        let mut system = String::new();
-        if !system_prompt.is_empty() {
-            system.push_str(system_prompt);
-            system.push_str("\n\n");
-        }
-        system.push_str(&memory_context);
-        let result = provider
-            .generate(&system, stimulus, 0.5, false, req.max_tokens, req.temperature)
-            .await;
-        if !result.text.is_empty() {
-            result.text
-        } else {
-            forward_to_ollama(
-                &state.ollama_url, &state.expression_model,
-                &req.messages, &memory_context, req.temperature, req.max_tokens,
-            )
-            .await
-            .unwrap_or_else(|_| memory_context.clone())
-        }
-    } else {
-        forward_to_ollama(
-            &state.ollama_url, &state.expression_model,
-            &req.messages, &memory_context, req.temperature, req.max_tokens,
-        )
+    let mut system = String::new();
+    if !system_prompt.is_empty() {
+        system.push_str(system_prompt);
+        system.push_str("\n\n");
+    }
+    system.push_str(&memory_context);
+    let text = express(state, req, &system, stimulus, 0.5, &memory_context)
         .await
-        .unwrap_or_else(|_| memory_context.clone())
-    };
+        .ok_or(NO_MODEL)?;
     let expr_ms = expr_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -410,7 +360,7 @@ async fn bypass_completion(
         object: "chat.completion".into(),
         created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs(),
         model: "rgw".into(),
         choices: vec![Choice {
@@ -433,6 +383,51 @@ async fn bypass_completion(
             total_ms,
         }),
     }))
+}
+
+// ── Expression ──────────────────────────────────────────────────
+
+/// Fixed reply when no model produced text. Walk context and retrieved memory
+/// are prompt material; they are never returned in place of an answer.
+const NO_MODEL: ModeError = (StatusCode::SERVICE_UNAVAILABLE, "no language model produced a response");
+
+/// Text from the provider router, else from Ollama. `None` when neither produced
+/// any (unreachable, error status, spend ceiling, empty or whitespace-only text).
+async fn express(
+    state: &AppState,
+    req: &ChatRequest,
+    provider_system: &str,
+    stimulus: &str,
+    complexity: f32,
+    context: &str,
+) -> Option<String> {
+    if let Some(ref provider) = state.provider {
+        let result = provider
+            .generate(provider_system, stimulus, complexity, false, req.max_tokens, req.temperature)
+            .await;
+        if !result.text.trim().is_empty() {
+            tracing::info!(
+                "[rgw] Provider routed: {:?} (complexity={:.2})",
+                result.model_used, complexity
+            );
+            return Some(result.text);
+        }
+        tracing::warn!("[rgw] Provider returned empty, falling back to Ollama");
+    }
+    match forward_to_ollama(
+        &state.ollama_url, &state.expression_model,
+        &req.messages, context, req.temperature, req.max_tokens,
+    ).await {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => {
+            tracing::warn!("[rgw] Ollama returned empty text; no completion");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("[rgw] Ollama forward failed: {}; no completion", e);
+            None
+        }
+    }
 }
 
 // ── Ollama forwarding ───────────────────────────────────────────

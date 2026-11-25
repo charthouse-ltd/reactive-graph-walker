@@ -13,7 +13,7 @@
 //! Every outbound action goes through [`MotorGate`] (RGW_MOTOR_MODE:
 //! off | shadow | propose | live, default shadow). Only the gate sends.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -35,6 +35,7 @@ use std::time::Duration;
 /// what was said and to whom, building an audience model over time.
 #[derive(Debug, Clone, Serialize)]
 pub struct MotorCommand {
+    pub correlation_id: uuid::Uuid,
     /// What to do
     pub action: String,
     /// Which domain this relates to
@@ -129,6 +130,7 @@ pub enum ProposalStatus {
 /// A motor action waiting for (or past) a human decision.
 #[derive(Debug, Clone, Serialize)]
 pub struct Proposal {
+    pub correlation_id: uuid::Uuid,
     pub id: u64,
     pub created_at: u64,
     /// "diverger" | "tool:<name>"
@@ -208,6 +210,11 @@ pub struct MotorGate {
     shadow: Mutex<VecDeque<ShadowRecord>>,
     next_id: AtomicU64,
     counters: Counters,
+    outcomes: Mutex<VecDeque<OutcomeRecord>>,
+    episodic: Mutex<crate::episodic::EpisodicMemory>,
+    origins: Mutex<VecDeque<(uuid::Uuid, MotorOrigin)>>,
+    // Serialize callback read/update/learning, without holding a std mutex across I/O.
+    outcome_writer: tokio::sync::Mutex<()>,
 }
 
 fn now_secs() -> u64 {
@@ -225,6 +232,10 @@ impl MotorGate {
             shadow: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
             counters: Counters::default(),
+            outcomes: Mutex::new(VecDeque::new()),
+            episodic: Mutex::new(crate::episodic::EpisodicMemory::new()),
+            origins: Mutex::new(VecDeque::new()),
+            outcome_writer: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -293,6 +304,7 @@ impl MotorGate {
                     }
                 }
                 q.push_back(Proposal {
+                    correlation_id: cmd.correlation_id,
                     id,
                     created_at: now_secs(),
                     source: source.to_string(),
@@ -307,23 +319,22 @@ impl MotorGate {
                 DispatchOutcome::Queued(id)
             }
             MotorMode::Live => match send(base_url, &cmd, timeout).await {
-                Ok((status, body)) if (200..300).contains(&status) => {
-                    self.counters.sent.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(
-                        "[motor] Sent: {} from {} (domain={}, confidence={:.0}%)",
-                        cmd.action, source, cmd.domain, cmd.confidence * 100.0
-                    );
-                    DispatchOutcome::Sent(status, body)
-                }
-                Ok((status, body)) => {
-                    self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("[motor] Backend returned {} for {} from {}", status, cmd.action, source);
-                    DispatchOutcome::SendFailed(format!(
-                        "HTTP {}: {}",
-                        status,
-                        crate::core::safe_truncate(&body, 200)
-                    ))
-                }
+                Ok((status, body)) => match delivery(status, &body) {
+                    Ok(()) => {
+                        self.remember_sent(&cmd, base_url);
+                        self.counters.sent.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            "[motor] Sent: {} from {} (domain={}, confidence={:.0}%)",
+                            cmd.action, source, cmd.domain, cmd.confidence * 100.0
+                        );
+                        DispatchOutcome::Sent(status, body)
+                    }
+                    Err(reason) => {
+                        self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("[motor] Backend did not execute {} from {}: {}", cmd.action, source, reason);
+                        DispatchOutcome::SendFailed(reason)
+                    }
+                },
                 Err(e) => {
                     self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!("[motor] Failed to reach backend for {}: {}", cmd.action, e);
@@ -366,22 +377,25 @@ impl MotorGate {
         self.counters.approved.fetch_add(1, Ordering::Relaxed);
 
         let (status, result) = match send(&target, &cmd, timeout).await {
-            Ok((code, _)) if (200..300).contains(&code) => {
-                self.counters.sent.fetch_add(1, Ordering::Relaxed);
-                (ProposalStatus::ApprovedSent, format!("HTTP {}", code))
-            }
-            Ok((code, body)) => {
-                self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
-                (
-                    ProposalStatus::ApprovedSendFailed,
-                    format!("HTTP {}: {}", code, crate::core::safe_truncate(&body, 200)),
-                )
-            }
+            Ok((code, body)) => match delivery(code, &body) {
+                Ok(()) => {
+                    self.counters.sent.fetch_add(1, Ordering::Relaxed);
+                    (ProposalStatus::ApprovedSent, format!("HTTP {}", code))
+                }
+                Err(reason) => {
+                    self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                    (ProposalStatus::ApprovedSendFailed, reason)
+                }
+            },
             Err(e) => {
                 self.counters.send_failed.fetch_add(1, Ordering::Relaxed);
                 (ProposalStatus::ApprovedSendFailed, e)
             }
         };
+
+        if status == ProposalStatus::ApprovedSent {
+            self.remember_sent(&cmd, &target);
+        }
 
         let mut q = self.proposals.lock().unwrap_or_else(|e| e.into_inner());
         match q.iter_mut().find(|p| p.id == id) {
@@ -437,6 +451,7 @@ impl MotorGate {
             "pending": pending,
             "decided": decided,
             "shadow": shadow,
+            "outcomes": self.outcomes.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect::<Vec<_>>(),
         })
     }
 
@@ -474,6 +489,14 @@ impl MotorGate {
     }
 }
 
+/// True when the mode can send (`live`, or `propose` once approved) but no
+/// outbound credential is configured. A backend that requires authentication
+/// then rejects every command, which is worth saying once at startup.
+pub fn missing_send_credential(mode: MotorMode, bearer: Option<&str>, key: Option<&str>) -> bool {
+    let set = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
+    matches!(mode, MotorMode::Live | MotorMode::Propose) && !set(bearer) && !set(key)
+}
+
 static GATE: OnceLock<Arc<MotorGate>> = OnceLock::new();
 static FALLBACK_GATE: OnceLock<MotorGate> = OnceLock::new();
 
@@ -490,6 +513,32 @@ pub fn gate() -> &'static MotorGate {
     }
 }
 
+/// Whether a backend response means the action was taken on.
+///
+/// A non-2xx is a failure. A 2xx is a failure only when its JSON body carries an
+/// explicit `"status"` of `"error"` or `"unknown"`: Julian's router answers
+/// HTTP 200 with `"unknown"` for an action it has no handler for and `"error"`
+/// when the handler raised. Every other body (no JSON, no `status`, or any
+/// other value such as `"ok"` or `"skipped"`) keeps the plain 2xx meaning.
+fn delivery(status: u16, body: &str) -> Result<(), String> {
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {}: {}", status, crate::core::safe_truncate(body, 200)));
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else { return Ok(()) };
+    let Some(reported) = value.get("status").and_then(|s| s.as_str()) else { return Ok(()) };
+    let reported = reported.trim().to_ascii_lowercase();
+    if !matches!(reported.as_str(), "error" | "unknown") {
+        return Ok(());
+    }
+    let detail = value.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+    Err(format!(
+        "HTTP {} but backend status={}: {}",
+        status,
+        reported,
+        crate::core::safe_truncate(detail, 200)
+    ))
+}
+
 /// POST a motor command. Crate-private: only MotorGate calls this.
 /// Returns the HTTP status and body for any HTTP response, or an error string.
 pub(crate) async fn send(
@@ -500,11 +549,9 @@ pub(crate) async fn send(
     if base_url.is_empty() {
         return Err("no motor backend URL configured".into());
     }
-    let url = format!("{}/api/admin/rgw/execute", base_url);
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .json(cmd)
-        .timeout(timeout)
+    let bearer = std::env::var("RGW_JULIAN_BEARER").ok();
+    let key = std::env::var("RGW_JULIAN_KEY").ok();
+    let resp = motor_request(base_url, cmd, timeout, bearer.as_deref(), key.as_deref())
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -540,8 +587,31 @@ pub(crate) mod test_support {
         (format!("http://{}", addr), hits, handle)
     }
 
+    /// Capture server answering every POST with HTTP 200 and the given body.
+    pub async fn spawn_reply(body: &'static str) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = axum::Router::new().route(
+            "/api/admin/rgw/execute",
+            axum::routing::post(move || {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    body
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), hits, handle)
+    }
+
     pub fn cmd(action: &str) -> super::MotorCommand {
         super::MotorCommand {
+            correlation_id: uuid::Uuid::new_v4(),
             action: action.into(),
             domain: "test".into(),
             walker_context: String::new(),
@@ -559,6 +629,80 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{cmd, spawn_capture};
     use super::*;
+
+    #[tokio::test]
+    async fn only_successful_sends_have_origins() {
+        let (url, _, server) = spawn_capture().await;
+        for mode in [MotorMode::Off, MotorMode::Shadow, MotorMode::Propose, MotorMode::Live] {
+            let gate = MotorGate::new(mode);
+            let command = cmd("search");
+            let id = command.correlation_id;
+            let result = gate.dispatch("test", &url, command).await;
+            assert_eq!(gate.origin(id).is_some(), mode == MotorMode::Live, "{mode:?}");
+            assert_eq!(gate.origins.lock().unwrap().len(), usize::from(mode == MotorMode::Live));
+            if let DispatchOutcome::Queued(proposal) = result {
+                gate.approve(proposal).await.unwrap();
+                assert!(gate.origin(id).is_some());
+                assert_eq!(gate.origins.lock().unwrap().len(), 1);
+                // The proposal fallback must also enforce its status.
+                gate.origins.lock().unwrap().clear();
+                for status in [ProposalStatus::Pending, ProposalStatus::Rejected,
+                    ProposalStatus::Expired, ProposalStatus::ApprovedSendFailed, ProposalStatus::ApprovedSent] {
+                    gate.proposals.lock().unwrap()[0].status = status;
+                    assert_eq!(gate.origin(id).is_some(), status == ProposalStatus::ApprovedSent);
+                }
+            }
+        }
+        server.abort();
+        for body in [r#"{"status":"error"}"#, r#"{"status":"unknown"}"#] {
+            let (url, _, server) = test_support::spawn_reply(body).await;
+            for mode in [MotorMode::Live, MotorMode::Propose] {
+                let gate = MotorGate::new(mode);
+                let command = cmd("search");
+                let id = command.correlation_id;
+                if let DispatchOutcome::Queued(p) = gate.dispatch("test", &url, command).await {
+                    assert_eq!(gate.approve(p).await.unwrap().status, ProposalStatus::ApprovedSendFailed);
+                }
+                assert!(gate.origin(id).is_none());
+                assert!(gate.origins.lock().unwrap().is_empty());
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn in_flight_sends_cannot_authorize_callbacks() {
+        for mode in [MotorMode::Live, MotorMode::Propose] {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let started_handler = started.clone();
+            let finish_handler = finish.clone();
+            let app = axum::Router::new().route("/api/admin/rgw/execute", axum::routing::post(move || {
+                let started = started_handler.clone();
+                let finish = finish_handler.clone();
+                async move { started.notify_one(); finish.notified().await; "ok" }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let gate = Arc::new(MotorGate::new(mode));
+            let command = cmd("search");
+            let id = command.correlation_id;
+            let sending_gate = gate.clone();
+            let sending = tokio::spawn(async move {
+                if let DispatchOutcome::Queued(p) = sending_gate.dispatch("test", &url, command).await {
+                    sending_gate.approve(p).await.unwrap();
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified()).await.unwrap();
+            assert!(gate.origin(id).is_none());
+            assert!(gate.origins.lock().unwrap().is_empty());
+            finish.notify_one();
+            sending.await.unwrap();
+            assert!(gate.origin(id).is_some());
+            server.abort();
+        }
+    }
 
     #[test]
     fn t1_mode_parsing() {
@@ -607,6 +751,71 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn sending_modes_without_a_credential_are_reported() {
+        for mode in [MotorMode::Live, MotorMode::Propose] {
+            assert!(missing_send_credential(mode, None, None));
+            assert!(missing_send_credential(mode, Some(""), Some("  ")));
+            assert!(!missing_send_credential(mode, Some("test-bearer"), None));
+            assert!(!missing_send_credential(mode, None, Some("test-key")));
+        }
+        for mode in [MotorMode::Off, MotorMode::Shadow] {
+            assert!(!missing_send_credential(mode, None, None), "nothing is sent in {mode:?}");
+        }
+    }
+
+    #[test]
+    fn delivery_fails_only_on_non_2xx_or_an_explicit_refusal() {
+        for body in ["", "ok", "[1]", r#"{"result":1}"#, r#"{"status":"ok","action":"journal"}"#,
+            r#"{"status":"skipped","action":"tweet"}"#, r#"{"status":"draft"}"#, r#"{"status":7}"#] {
+            assert_eq!(delivery(200, body), Ok(()), "{body}");
+        }
+        for (body, word) in [(r#"{"status":"unknown","action":"image_generate","detail":"Unrecognized action."}"#, "unknown"),
+            (r#"{"status":"error","detail":"boom"}"#, "error"), (r#"{"status":" ERROR "}"#, "error")] {
+            let reason = delivery(200, body).unwrap_err();
+            assert!(reason.contains(&format!("status={word}")), "{reason}");
+        }
+        assert!(delivery(200, r#"{"status":"unknown","detail":"Unrecognized action."}"#)
+            .unwrap_err().contains("Unrecognized action."));
+        assert_eq!(delivery(401, "denied"), Err("HTTP 401: denied".into()));
+        assert!(delivery(500, r#"{"status":"ok"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_200_refusal_is_not_recorded_as_sent() {
+        let (url, hits, server) =
+            super::test_support::spawn_reply(r#"{"status":"unknown","action":"image_generate","detail":"Unrecognized action."}"#).await;
+
+        let live = MotorGate::new(MotorMode::Live);
+        let DispatchOutcome::SendFailed(reason) = live.dispatch("tool:image_generate", &url, cmd("image_generate")).await
+        else { panic!("an unhandled action must not be Sent") };
+        assert!(reason.contains("status=unknown"), "{reason}");
+        assert_eq!((live.counter("sent"), live.counter("send_failed")), (0, 1));
+
+        let propose = MotorGate::new(MotorMode::Propose);
+        let DispatchOutcome::Queued(id) = propose.dispatch("diverger", &url, cmd("image_generate")).await
+        else { panic!("expected Queued") };
+        let decided = propose.approve(id).await.unwrap();
+        assert_eq!(decided.status, ProposalStatus::ApprovedSendFailed);
+        assert!(decided.send_result.unwrap().contains("status=unknown"));
+        assert_eq!((propose.counter("sent"), propose.counter("send_failed")), (0, 1));
+
+        let tool = crate::tools::motor_tool_via(&live, &url, "image_generate", serde_json::json!({"prompt": "x"})).await;
+        assert!(!tool.success, "the tool must not report success for an action that did nothing");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_200_skip_or_ok_is_still_sent() {
+        for body in [r#"{"status":"skipped","action":"tweet","detail":"disabled"}"#, r#"{"status":"ok"}"#] {
+            let (url, _hits, server) = super::test_support::spawn_reply(body).await;
+            let live = MotorGate::new(MotorMode::Live);
+            assert!(matches!(live.dispatch("diverger", &url, cmd("tweet")).await, DispatchOutcome::Sent(200, _)));
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn t3_propose_lifecycle() {
         let (url, hits, server) = spawn_capture().await;
@@ -617,6 +826,7 @@ mod tests {
         };
         let p = gate.approve(a).await.unwrap();
         assert_eq!(p.status, ProposalStatus::ApprovedSent);
+        assert!(gate.origin(p.correlation_id).is_some());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         assert_eq!(gate.approve(a).await.unwrap_err(), GateError::AlreadyDecided);
@@ -627,13 +837,16 @@ mod tests {
         };
         let r = gate.reject(b, Some("no".into())).unwrap();
         assert_eq!(r.status, ProposalStatus::Rejected);
+        assert!(gate.origin(r.correlation_id).is_none());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         let DispatchOutcome::Queued(c) = gate.dispatch("diverger", &url, cmd("journal")).await else {
             panic!("expected Queued")
         };
         gate.backdate(c, PROPOSAL_TTL_SECS + 1);
+        let expired_id = gate.proposals.lock().unwrap().iter().find(|p| p.id == c).unwrap().correlation_id;
         assert_eq!(gate.approve(c).await.unwrap_err(), GateError::Expired);
+        assert!(gate.origin(expired_id).is_none());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(gate.counter("expired"), 1);
 
@@ -647,6 +860,7 @@ mod tests {
         };
         let p = gate.approve(d).await.unwrap();
         assert_eq!(p.status, ProposalStatus::ApprovedSendFailed);
+        assert!(gate.origin(p.correlation_id).is_none());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         assert_eq!(gate.approve(999).await.unwrap_err(), GateError::NotFound);
@@ -709,5 +923,401 @@ mod tests {
         if GATE.get().is_none() {
             assert_eq!(gate().mode(), MotorMode::Shadow);
         }
+    }
+}
+
+#[cfg(test)]
+mod correlation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn proposal_and_delivery_keep_correlation_and_auth() {
+        let command = test_support::cmd("journal");
+        let correlation = command.correlation_id;
+        let gate = MotorGate::new(MotorMode::Propose);
+        gate.dispatch("test", "http://127.0.0.1:9", command.clone()).await;
+        assert_eq!(gate.snapshot()["pending"][0]["command"]["correlation_id"], correlation.to_string());
+        assert_eq!(gate.snapshot()["pending"][0]["correlation_id"], correlation.to_string());
+        let request = motor_request("http://127.0.0.1:9", &command, Duration::from_secs(1),
+            Some("test-bearer"), Some("test-julian-key")).build().unwrap();
+        assert_eq!(request.headers()["Authorization"], "Bearer test-bearer");
+        assert_eq!(request.headers()["X-RGW-Key"], "test-julian-key");
+        let body: serde_json::Value = serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["correlation_id"], correlation.to_string());
+    }
+}
+
+fn motor_request(base_url: &str, cmd: &MotorCommand, timeout: Duration,
+    bearer: Option<&str>, key: Option<&str>) -> reqwest::RequestBuilder {
+    let mut request = reqwest::Client::new()
+        .post(format!("{}/api/admin/rgw/execute", base_url.trim_end_matches('/')))
+        .json(cmd).timeout(timeout);
+    if let Some(value) = bearer.filter(|s| !s.trim().is_empty()) {
+        request = request.bearer_auth(value);
+    }
+    if let Some(value) = key.filter(|s| !s.trim().is_empty()) {
+        request = request.header("X-RGW-Key", value);
+    }
+    request
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotorOutcome {
+    pub correlation_id: uuid::Uuid,
+    pub outcome: String,
+    pub success: Option<bool>,
+    pub lesson: Option<String>,
+}
+
+/// Callback rejection is distinct from an unavailable durable store.
+#[derive(Debug)]
+pub enum OutcomeError {
+    Unmatched,
+    Storage(anyhow::Error),
+}
+
+impl std::fmt::Display for OutcomeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unmatched => write!(f, "no sent command matches correlation_id"),
+            Self::Storage(error) => write!(f, "outcome persistence failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OutcomeError {}
+
+/// Only server-side command metadata is attached to callbacks; clients cannot supply it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MotorOrigin {
+    action: String,
+    domain: String,
+    target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct OutcomeRecord {
+    #[serde(flatten)]
+    pub(crate) callback: MotorOutcome,
+    /// Legacy unmatched rows have no origin and cannot authorize new callbacks.
+    origin: Option<MotorOrigin>,
+    received_at: u64,
+    /// First eligible feedback only; corrections must not multiply evidence.
+    reflected: bool,
+}
+
+impl OutcomeRecord {
+    fn can_reflect(&self, model: &crate::core::SelfModel) -> bool {
+        !self.reflected
+            && self.origin.is_some()
+            && self.callback.success.is_some()
+            && model.mode == crate::core::CognitiveMode::Autonomous
+            && crate::metacog::critic_enabled(model)
+    }
+
+    fn reflect(&mut self, model: &mut crate::core::SelfModel) -> bool {
+        if !self.can_reflect(model) {
+            return false;
+        }
+        if let (Some(origin), Some(success)) = (&self.origin, self.callback.success) {
+            crate::metacog::reflect(
+                &format!("{} in {}", origin.action, origin.domain),
+                &self.callback.outcome,
+                success,
+                model,
+            );
+            self.reflected = true;
+            return true;
+        }
+        false
+    }
+}
+
+impl MotorGate {
+    fn remember_sent(&self, cmd: &MotorCommand, target: &str) {
+        let mut origins = self.origins.lock().unwrap_or_else(|e| e.into_inner());
+        origins.retain(|(id, _)| *id != cmd.correlation_id);
+        origins.push_back((cmd.correlation_id, MotorOrigin {
+            action: cmd.action.clone(), domain: cmd.domain.clone(), target: target.to_string(),
+        }));
+        while origins.len() > PROPOSAL_CAP { origins.pop_front(); }
+    }
+
+    fn origin(&self, id: uuid::Uuid) -> Option<MotorOrigin> {
+        // Proposals can outlive the recent dispatch ring (decided entries are evicted first).
+        if let Some(p) = self
+            .proposals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|p| p.correlation_id == id && p.status == ProposalStatus::ApprovedSent)
+        {
+            return Some(MotorOrigin {
+                action: p.command.action.clone(),
+                domain: p.command.domain.clone(),
+                target: p.target.clone(),
+            });
+        }
+        self.origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, origin)| origin.clone())
+    }
+
+    /// Internal context only. This neither reflects into the self-model nor writes episodes.
+    pub fn consolidate_episodes(&self) -> crate::episodic::EpisodicMemory {
+        let mut memory = self.episodic.lock().unwrap_or_else(|e| e.into_inner());
+        memory.consolidate();
+        memory.clone()
+    }
+
+    fn retain_outcome(&self, outcome: OutcomeRecord) {
+        // TODO: walk-id outcomes and path reinforcement need an explicit contract.
+        // An unmatched callback has no verified action/domain; never infer an origin.
+        if let Some(origin) = &outcome.origin {
+            self.episodic.lock().unwrap_or_else(|e| e.into_inner()).record(crate::episodic::Episode {
+                source_ref: outcome.callback.correlation_id.to_string(),
+                timestamp: outcome.received_at as f64,
+                stimulus: "verified motor callback".into(), domain: origin.domain.clone(),
+                walker_summary: String::new(), critique: String::new(), action: origin.action.clone(),
+                outcome: outcome.callback.outcome.clone(), success: outcome.callback.success,
+                lesson: outcome.callback.lesson.clone().unwrap_or_default(),
+                valence: 0.0, arousal: 0.0, energy: 0.0,
+            });
+        }
+        let mut outcomes = self.outcomes.lock().unwrap_or_else(|e| e.into_inner());
+        outcomes.retain(|o| o.callback.correlation_id != outcome.callback.correlation_id);
+        outcomes.push_back(outcome);
+        while outcomes.len() > PROPOSAL_CAP {
+            outcomes.pop_front();
+        }
+    }
+
+    /// Rehydrate inspection and internal episodic context; never replay self-model reflection.
+    pub async fn restore_outcomes(&self, pool: &sqlx::PgPool) {
+        let _writer = self.outcome_writer.lock().await;
+        match tokio::time::timeout(
+            Duration::from_millis(750),
+            crate::db::recent_motor_outcomes(pool),
+        )
+        .await
+        {
+            Ok(Ok(rows)) => {
+                for row in rows.into_iter().rev() {
+                    match serde_json::from_str::<OutcomeRecord>(&row) {
+                        Ok(outcome) => self.retain_outcome(outcome),
+                        Err(_) => tracing::warn!("[motor] Skipped malformed stored outcome"),
+                    }
+                }
+            }
+            _ => tracing::warn!(
+                "[motor] Recent outcomes unavailable; starting with in-memory inspection"
+            ),
+        }
+    }
+
+    /// Acknowledge only matched, durably saved callbacks; failures change no learning state.
+    pub async fn record_outcome(
+        &self,
+        pool: &sqlx::PgPool,
+        model: &tokio::sync::Mutex<crate::core::SelfModel>,
+        callback: MotorOutcome,
+    ) -> Result<(), OutcomeError> {
+        let _writer = self.outcome_writer.lock().await;
+        let previous = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|o| o.callback.correlation_id == callback.correlation_id)
+            .cloned();
+        let mut record = OutcomeRecord {
+            origin: self
+                .origin(callback.correlation_id)
+                .or_else(|| previous.as_ref().and_then(|o| o.origin.clone())),
+            reflected: previous.as_ref().is_some_and(|o| o.reflected),
+            callback,
+            received_at: now_secs(),
+        };
+        let persisted = tokio::time::timeout(Duration::from_millis(750), async {
+            // Consult durable history even when the inspection ring has evicted this UUID.
+            if let Some(prior) =
+                crate::db::load_motor_outcome(pool, record.callback.correlation_id).await.map_err(OutcomeError::Storage)?
+            {
+                record.origin = record.origin.take().or(prior.origin);
+                record.reflected |= prior.reflected;
+            }
+            if record.origin.is_none() {
+                return Err(OutcomeError::Unmatched);
+            }
+            // A long walk may hold the self-model. Still persist its callback;
+            // a later retry can perform the deferred reflection.
+            let mut model = model.try_lock().ok();
+            let mut stored = record.clone();
+            stored.reflected |= model.as_ref().is_some_and(|m| record.can_reflect(m));
+            // Persist the learning receipt first, so retries/restarts cannot replay feedback.
+            crate::db::save_motor_outcome(pool, &stored).await.map_err(OutcomeError::Storage)?;
+            if let Some(model) = model.as_mut() {
+                record.reflect(model);
+            } else {
+                tracing::info!(correlation_id = %record.callback.correlation_id,
+                    "[motor] Outcome stored; reflection deferred while self-model is busy");
+            }
+            Ok::<_, OutcomeError>(())
+        })
+        .await;
+        match &persisted {
+            Err(_) => tracing::warn!(
+                correlation_id = %record.callback.correlation_id,
+                failure = "timeout",
+                "[motor] Outcome persistence failed"
+            ),
+            Ok(Err(OutcomeError::Storage(_))) => tracing::warn!(
+                correlation_id = %record.callback.correlation_id,
+                failure = "storage",
+                "[motor] Outcome persistence failed"
+            ),
+            _ => {}
+        }
+        persisted.map_err(|e| OutcomeError::Storage(e.into()))??;
+        self.retain_outcome(record);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod outcome_learning_tests {
+    use super::*;
+    use crate::core::{CognitiveMode, SelfModStage, SelfModel};
+
+    fn record(success: Option<bool>) -> OutcomeRecord {
+        OutcomeRecord {
+            callback: MotorOutcome {
+                correlation_id: uuid::Uuid::new_v4(),
+                outcome: "finished".into(),
+                success,
+                lesson: Some("remember this".into()),
+            },
+            origin: Some(MotorOrigin {
+                action: "search".into(),
+                domain: "science".into(),
+                target: "".into(),
+            }),
+            received_at: now_secs(),
+            reflected: false,
+        }
+    }
+
+    #[test]
+    fn outcome_learning_obeys_mode_critic_and_known_result() {
+        let mut model = SelfModel::new();
+        let before = serde_json::to_value(&model).unwrap();
+        assert!(!record(Some(true)).reflect(&mut model));
+        assert_eq!(serde_json::to_value(&model).unwrap(), before);
+        model.mode = CognitiveMode::Autonomous;
+        assert!(!record(Some(true)).reflect(&mut model));
+        model.self_mod_stage = SelfModStage::SelectionLive;
+        assert!(!record(None).reflect(&mut model));
+        let mut unmatched = record(Some(false));
+        unmatched.origin = None;
+        assert!(!unmatched.reflect(&mut model));
+        assert_eq!(model.total_signals_processed, 0);
+    }
+
+    #[test]
+    fn outcome_learning_reflects_success_and_failure_once() {
+        for success in [true, false] {
+            let mut model = SelfModel::new();
+            model.mode = CognitiveMode::Autonomous;
+            model.self_mod_stage = SelfModStage::SelectionLive;
+            let mut outcome = record(Some(success));
+            assert!(outcome.reflect(&mut model));
+            assert_eq!(model.total_signals_processed, 1);
+            assert!(model.last_signal.starts_with(if success {
+                "reflection_success:"
+            } else {
+                "reflection_failure:"
+            }));
+            assert!(!outcome.reflect(&mut model));
+            assert_eq!(model.total_signals_processed, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_storage_rejects_callbacks_without_retention_or_learning() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::new());
+        pool.close().await; // No connection attempt, and no database is selected.
+        let gate = MotorGate::new(MotorMode::Propose);
+        let command = test_support::cmd("search");
+        let id = command.correlation_id;
+        let (url, _, server) = test_support::spawn_capture().await;
+        let DispatchOutcome::Queued(proposal) = gate.dispatch("test", &url, command).await else { panic!("queued") };
+        gate.approve(proposal).await.unwrap();
+        server.abort();
+        let mut model = SelfModel::new();
+        model.mode = CognitiveMode::Autonomous;
+        model.self_mod_stage = SelfModStage::SelectionLive;
+        let model = tokio::sync::Mutex::new(model);
+        for outcome in ["completed", "corrected"] {
+            let result = gate.record_outcome(
+                &pool,
+                &model,
+                MotorOutcome {
+                    correlation_id: id,
+                    outcome: outcome.into(),
+                    success: Some(true),
+                    lesson: None,
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(OutcomeError::Storage(_))));
+        }
+        let snapshot = gate.snapshot();
+        assert!(snapshot["outcomes"].as_array().unwrap().is_empty());
+        assert!(gate.consolidate_episodes().episodes.is_empty());
+        assert_eq!(model.lock().await.total_signals_processed, 0);
+        assert!(matches!(gate.record_outcome(&pool, &model, record(None).callback).await,
+            Err(OutcomeError::Storage(_))), "unknown lookup failure must propagate too");
+    }
+
+    #[tokio::test]
+    async fn persistence_timeout_does_not_accept_or_reflect() {
+        // Occupy the only connection slot with a local listener that never
+        // completes the Postgres handshake; no real database is contacted.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::new()
+                .host("127.0.0.1").port(listener.local_addr().unwrap().port())
+                .username("fixture").database("fixture"));
+        let gate = MotorGate::new(MotorMode::Off);
+        let model = tokio::sync::Mutex::new(SelfModel::new());
+        let error = gate.record_outcome(&pool, &model, record(Some(true)).callback).await.unwrap_err();
+        let OutcomeError::Storage(error) = error else { panic!("expected storage timeout") };
+        assert!(error.downcast_ref::<tokio::time::error::Elapsed>().is_some());
+        assert!(gate.snapshot()["outcomes"].as_array().unwrap().is_empty());
+        assert_eq!(model.lock().await.total_signals_processed, 0);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn live_commands_keep_bounded_correlation_only_after_send() {
+        let gate = MotorGate::new(MotorMode::Live);
+        let command = test_support::cmd("search");
+        let id = command.correlation_id;
+        assert!(matches!(gate.dispatch("test", "", command.clone()).await, DispatchOutcome::SendFailed(_)));
+        assert!(gate.origin(id).is_none());
+        let (url, _, server) = test_support::spawn_capture().await;
+        gate.dispatch("test", &url, command).await;
+        let origin = gate.origin(id).unwrap();
+        assert_eq!(origin.action, "search");
+        for _ in 0..PROPOSAL_CAP {
+            gate.dispatch("test", &url, test_support::cmd("search")).await;
+        }
+        assert!(gate.origin(id).is_none());
+        assert_eq!(gate.origins.lock().unwrap().len(), PROPOSAL_CAP);
+        server.abort();
     }
 }

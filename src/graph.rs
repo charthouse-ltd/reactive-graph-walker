@@ -227,6 +227,7 @@ impl WalkerBias {
     ///   goal_strength  — strength of active goal pursuit
     ///   audience_model — model of known audiences
     ///   active_audience_id — audience currently foregrounded for decisions
+    #[allow(clippy::too_many_arguments)] // Preserve the existing caller-facing API.
     pub fn score_edge_with_context(
         &self,
         edge_type: &str,
@@ -629,6 +630,7 @@ impl LearnedBias {
     }
 
     /// Score an edge using learned weights.
+    #[allow(clippy::too_many_arguments)] // Preserve the existing caller-facing API.
     pub fn score_edge(&self, edge_type: &str, edge_weight: f32, emotional_charge: f32,
                        traversal_count: i32, emotion: &EmotionalState,
                        next_domain: &str, current_domain: &str,
@@ -913,8 +915,7 @@ mod tests {
         let a = LearnedBias::default();
         let identical = vec![a.clone(), a.clone(), a.clone()];
         assert_eq!(pool_diversity(&identical), 0.0, "identical profiles → zero diversity");
-        let mut b = LearnedBias::default();
-        b.novelty_seeking = 0.9;
+        let b = LearnedBias { novelty_seeking: 0.9, ..LearnedBias::default() };
         assert!(pool_diversity(&[a, b]) > 0.0, "a spread profile → positive diversity");
     }
 
@@ -984,10 +985,9 @@ mod tests {
 
     #[test]
     fn behavioural_niche_bins_by_fixed_cutpoints() {
-        let mut sc = ProfileFitness::default();
-        sc.walks = 5;
-        sc.novelty = 0.10;
-        sc.surprise_kept = 0.50;
+        let mut sc = ProfileFitness {
+            walks: 5, novelty: 0.10, surprise_kept: 0.50, ..ProfileFitness::default()
+        };
         assert_eq!(behavioural_niche(&sc), Some((0, 2)), "0.10<0.15→0 ; 0.50>=0.40→2");
         sc.novelty = 0.30;
         sc.surprise_kept = 0.05;

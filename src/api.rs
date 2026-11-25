@@ -25,6 +25,7 @@ use crate::walker;
 
 /// Shared application state — one entity, one mind
 pub struct AppState {
+    pub admission: Arc<crate::admission::Admission>,
     pub pool: PgPool,
     pub diverger: Diverger,
     pub self_model: std::sync::Arc<tokio::sync::Mutex<SelfModel>>,
@@ -78,34 +79,51 @@ pub struct HealthResponse {
 /// Start the HTTP server with the Diverger engine
 pub async fn serve(
     pool: PgPool,
+    mut restored_model: SelfModel,
     addr: &str,
     ollama_url: &str,
     expression_model: &str,
     julian_url: &str,
 ) -> anyhow::Result<()> {
+    let admission = Arc::new(crate::admission::Admission::new(crate::admission::Limits::from_env()?));
+    restored_model.mode = CognitiveMode::from_env_value(std::env::var("RGW_COGNITIVE_MODE").ok().as_deref())?;
+    let dream_enabled = enabled(std::env::var("RGW_DREAM_ENABLED").ok().as_deref())?;
+    let critic_apply = enabled(std::env::var("RGW_CRITIC_APPLY").ok().as_deref())?;
+    crate::metacog::configure_critic(critic_apply);
+    tracing::info!(mode = ?restored_model.mode, dream_enabled, critic_apply, "Effective cognitive configuration");
     // Create the self-model FIRST — the continuous state of self-awareness
-    let self_model = std::sync::Arc::new(tokio::sync::Mutex::new(SelfModel::new()));
+    let self_model = std::sync::Arc::new(tokio::sync::Mutex::new(restored_model));
     tracing::info!("[rgw] Self-model initialized. Consciousness online.");
 
     // Motor gate FIRST: every outbound action goes through it. Default shadow.
     let motor_mode = crate::motor::MotorMode::from_env_value(std::env::var("RGW_MOTOR_MODE").ok().as_deref());
     let motor_gate = crate::motor::install_gate(motor_mode);
+    motor_gate.restore_outcomes(&pool).await;
     // Tension-driven background activity (spec: docs/superpowers/specs/2026-11-04-…).
     // Default observe: compute + log, change nothing. See /diverger "tension".
     let tension_engine = crate::tension::install(crate::tension::TensionMode::from_env_value(
         std::env::var("RGW_TENSION_MODE").ok().as_deref(),
     ));
-    tracing::info!("[motor] Motor gate mode: {}", motor_gate.mode().as_str());
+    tracing::info!(motor_mode = motor_gate.mode().as_str(), tension_mode = ?crate::tension::mode(),
+        seed_mode = ?crate::seeding::seed_mode(), "Effective graph and motor modes");
+    if crate::motor::missing_send_credential(motor_gate.mode(),
+        std::env::var("RGW_JULIAN_BEARER").ok().as_deref(), std::env::var("RGW_JULIAN_KEY").ok().as_deref()) {
+        tracing::warn!(motor_mode = motor_gate.mode().as_str(),
+            "[motor] This mode can send, but neither RGW_JULIAN_BEARER nor RGW_JULIAN_KEY is set; \
+             a backend that requires authentication will reject every motor command");
+    }
 
     // Create the Diverger with shared self-model + Julian URL for motor commands
-    let diverger = Diverger::new(pool.clone(), self_model.clone(), julian_url);
+    let diverger = Diverger::with_energy_limit(pool.clone(), self_model.clone(), julian_url, admission.limits.energy_nodes);
     if let Some(e) = &tension_engine {
         e.attach_inbox(diverger.stimulus_sender());
         e.attach_energy_view(diverger.energy_view());
     }
 
-    // ── Start concurrent dream loop (always-on, motor-disconnected) ──
-    crate::dream::start_dream_loop(pool.clone(), self_model.clone());
+    // Dreaming requires explicit operator opt-in.
+    if dream_enabled {
+        crate::dream::start_dream_loop(pool.clone(), self_model.clone(), motor_gate.clone());
+    }
 
     // Seed initial energy from high-importance nodes
     let seeds = db::seed_nodes(&pool, 50).await.unwrap_or_default();
@@ -127,6 +145,7 @@ pub async fn serve(
     };
 
     let state = Arc::new(AppState {
+        admission,
         pool,
         diverger,
         self_model,
@@ -140,59 +159,7 @@ pub async fn serve(
     // RGW_API_KEY is validated in main() before startup (refuse to start without
     // it); require_auth additionally rejects every request if it is missing.
 
-    // ── Public endpoint (no auth) — health only ──
-    // Strict posture: ONLY /health is open (liveness probes work without a key).
-    // Everything else — including read-only introspection — always requires X-RGW-Key.
-    let public = Router::new()
-        .route("/health", get(health));
-
-    // ── Protected endpoints (always require X-RGW-Key) ──
-    // Everything except /health: read-only introspection AND mutations / actions
-    // / LLM-spend. Fail-closed: no key configured → 401. See audit C1/S3.
-    let protected = Router::new()
-        // read-only introspection
-        .route("/stats", get(stats))
-        .route("/recall", get(recall))
-        .route("/metrics", get(metrics_endpoint))
-        .route("/diverger", get(diverger_stats))
-        .route("/learning", get(learning_stats))
-        .route("/self", get(self_state))
-        .route("/metacog/config", get(get_metacog_config).post(set_metacog_config))
-        .route("/selection/stage", post(set_selection_stage))
-        .route("/selection/stats", get(selection_stats))
-        .route("/selection/rollback", post(selection_rollback))
-        .route("/tools", get(list_tools))
-        .route("/music", get(music_endpoint))
-        .route("/music/midi", get(music_midi_endpoint))
-        .route("/music/prompt", get(music_prompt_endpoint))
-        .route("/v1/models", get(openai::list_models))
-        .route("/benchmark", get(benchmark))
-        // mutations / actions / cost
-        .route("/walk", post(walk))
-        .route("/prune", post(prune))
-        .route("/edge", post(create_edge_endpoint))
-        .route("/diverger/notify", post(diverger_notify))
-        .route("/self/mode", post(set_mode_endpoint))
-        .route("/self/save", post(save_self_model_endpoint))
-        .route("/tools/execute", post(execute_tool_endpoint))
-        .route("/speak", post(speak_endpoint))
-        .route("/dream", post(dream_endpoint))
-        .route("/music/generate", post(music_generate_endpoint))
-        // Signal ingest — external events feed into the cognitive loop
-        .route("/ingest/signal", post(ingest_signal_endpoint))
-        .route("/tom/record", post(tom_record_endpoint))
-        // OpenAI-compatible chat (triggers a walk + paid LLM expression)
-        .route("/v1/chat/completions", post(openai::chat_completions))
-        // Motor gate: inspect / approve / reject held actions (human only)
-        .merge(motor_routes(motor_gate))
-        .route_layer(middleware::from_fn(require_auth));
-
-    let app = public
-        .merge(protected)
-        .with_state(state.clone())
-        // Closed CORS. Callers are server-side and do not send Origin.
-        // A permissive layer echoed any Origin.
-        .layer(CorsLayer::new());
+    let app = app_router(state.clone());
 
     // Auto-save self-model every 60 seconds (consciousness persistence)
     {
@@ -213,7 +180,7 @@ pub async fn serve(
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
@@ -282,25 +249,22 @@ pub fn validate_api_key(v: Option<&str>) -> Result<(), String> {
     }
 }
 
-/// Auth middleware for every route except /health.
+/// Auth middleware for every route except the public probes.
 /// Convention shared with the deployed backends: the secret travels as the
 /// `X-RGW-Key` header and matches the `RGW_API_KEY` env var. Fail-closed: if
 /// `RGW_API_KEY` is unset or empty here, every request gets 401 (main() also
 /// refuses to start in that case; this is the second line of defence).
 async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {
-    let Some(expected) = std::env::var("RGW_API_KEY").ok().filter(|s| !s.trim().is_empty()) else {
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-
-    let presented = req
-        .headers()
-        .get("X-RGW-Key")
-        .and_then(|v| v.to_str().ok());
-
-    match presented {
-        Some(key) if constant_time_eq(key.as_bytes(), expected.trim().as_bytes()) => Ok(next.run(req).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+    let keys = ApiKeys::from_env();
+    let presented = req.headers().get("X-RGW-Key").and_then(|v| v.to_str().ok());
+    let scope = route_scope(req.method().as_str(), req.uri().path());
+    let role = keys.authorize(presented, scope)?;
+    if operator_action(scope, req.uri().path()) {
+        // Audit trail: which configured key authorised it, never the key itself.
+        tracing::info!(key = role.as_str(), method = %req.method(), path = req.uri().path(),
+            "[auth] operator action authorised");
     }
+    Ok(next.run(req).await)
 }
 
 /// Length-checked constant-time byte comparison (avoids token-timing leaks).
@@ -317,10 +281,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// GET /health
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let db_ok = sqlx::query("SELECT 1")
-        .fetch_one(&state.pool)
-        .await
-        .is_ok();
+    let db_ok = matches!(tokio::time::timeout(std::time::Duration::from_secs(2),
+        sqlx::query("SELECT 1").fetch_one(&state.pool)).await, Ok(Ok(_)));
 
     Json(HealthResponse {
         status: if db_ok { "ok".into() } else { "db_disconnected".into() },
@@ -426,11 +388,7 @@ async fn walk(
     State(state): State<Arc<AppState>>,
     Json(req): Json<WalkRequest>,
 ) -> Result<Json<WalkOutput>, ModeError> {
-    let n = if req.n_walkers == 0 {
-        rayon::current_num_threads()
-    } else {
-        req.n_walkers
-    };
+    let (n, steps) = state.admission.limits.walk(req.n_walkers, req.steps);
 
     // Rejected before any walk and before the self-model is touched.
     let arm = validate_arm(req.arm.as_deref(), crate::seeding::eval_enabled())?;
@@ -453,15 +411,15 @@ async fn walk(
         arm,
         seed_mode: None,
     };
-    let (mut output, walker_results) = walker::walk_parallel_with(
+    let (mut output, walker_results) = walker::try_walk_parallel_with(
         &state.pool,
         &req.emotional_state,
         n,
-        req.steps,
+        steps,
         &self_model,
         opts,
     )
-    .await;
+    .await.map_err(|e| { tracing::error!(%e, "walk failed"); (StatusCode::INTERNAL_SERVER_ERROR, "walk failed") })?;
 
     // Prompt-ready narrative for the caller's LLM. Measured 2026-11-04 on the
     // Julian graph: injecting this beat no-context (61% vs 50%) while the old
@@ -487,13 +445,15 @@ async fn walk(
             .unwrap_or(50);
         let periodic = sm.critic_sessions_since_llm > interval
             && diagnosis.primary_diagnosis != crate::metacog::DiagnosisLabel::Rest;
-        if (escalate || periodic)
+        if crate::metacog::critic_enabled(&sm) && (escalate || periodic)
             && let Some(ref provider) = state.provider {
                 let summary = crate::metacog::build_session_summary(&output, &walker_results, &sm);
                 let (system, user) = crate::metacog::build_critic_llm_prompt(&diagnosis, &summary);
 
                 // Genuine difficulty routes to the reasoner; periodic calibration stays on chat.
+                drop(sm);
                 let result = provider.generate(&system, &user, 0.5, escalate, Some(256), 0.3).await;
+                let mut sm = self_model.lock().await;
                 crate::metacog::run_llm_critic(&diagnosis, &summary, &mut sm, &result.text).await;
             }
     }
@@ -543,6 +503,12 @@ async fn set_metacog_config(
         return (status, Json(body));
     }
 
+    if req.phase_order.as_ref().is_some_and(|p| p.len() > state.admission.limits.metacog_phases) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "phase_order exceeds configured maximum"})));
+    }
+    if req.phase_order.as_ref().is_some_and(|p| !p.contains(&MetacogPhase::Draft) || !p.contains(&MetacogPhase::Critique)) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "phase_order must include draft and critique"})));
+    }
     let mut sm = state.self_model.lock().await;
     let rules_before = crate::metacog::RuleConfigSnapshot::of(&sm);
 
@@ -576,17 +542,6 @@ async fn set_metacog_config(
     }
 
     if let Some(phases) = req.phase_order {
-        let has_draft = phases.iter().any(|p| p == &MetacogPhase::Draft);
-        let has_critique = phases.iter().any(|p| p == &MetacogPhase::Critique);
-        if !has_draft || !has_critique {
-            // Fields earlier in this patch may already be applied (pre-existing partial apply);
-            // still log them and clear the watch like any operator rule edit.
-            crate::metacog::note_operator_rule_edit(&mut sm, &rules_before);
-            return (StatusCode::OK, Json(serde_json::json!({
-                "status": "error",
-                "error": "phase_order must include both 'draft' and 'critique'"
-            })));
-        }
         sm.metacog_phase_order = phases;
     }
 
@@ -755,12 +710,13 @@ fn metacog_config_json(sm: &SelfModel) -> serde_json::Value {
 }
 
 /// POST /self/save — persist self-model to database
-async fn save_self_model_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn save_self_model_endpoint(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, StatusCode> {
     let sm = state.self_model.lock().await.clone();
-    match db::save_self_model(&state.pool, &sm).await {
-        Ok(_) => Json(serde_json::json!({"status": "saved"})),
-        Err(e) => Json(serde_json::json!({"status": "error", "error": e.to_string()})),
-    }
+    db::save_self_model(&state.pool, &sm).await.map_err(|e| {
+        tracing::error!(%e, "self-model save failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(serde_json::json!({"status": "saved"})))
 }
 
 /// POST /tom/record — record a Theory-of-Mind interaction with an audience.
@@ -785,9 +741,9 @@ struct TomRecordRequest {
 async fn tom_record_endpoint(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TomRecordRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     if req.audience_id.is_empty() {
-        return Json(serde_json::json!({"status": "error", "error": "audience_id required"}));
+        return Err(StatusCode::BAD_REQUEST);
     }
     let mut sm = state.self_model.lock().await;
     // Their prior message is a response to our previous output (ToM prediction error).
@@ -802,12 +758,12 @@ async fn tom_record_endpoint(
         .get(&req.audience_id)
         .map(|a| a.interaction_count)
         .unwrap_or(0);
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "status": "recorded",
         "audience_id": req.audience_id,
         "interactions": interactions,
         "audiences_tracked": sm.audience_model.len(),
-    }))
+    })))
 }
 
 /// GET /tools — list available tools
@@ -825,7 +781,7 @@ struct ToolExecRequest {
 async fn execute_tool_endpoint(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ToolExecRequest>,
-) -> Json<crate::tools::ToolResult> {
+) -> (StatusCode, Json<crate::tools::ToolResult>) {
     let result = crate::tools::execute_tool(&req.tool, req.params, &state.pool).await;
 
     // Feed tool result through self-model
@@ -840,7 +796,11 @@ async fn execute_tool_endpoint(
         crate::core::process(signal, &mut sm);
     }
 
-    Json(result)
+    let status = if result.success { StatusCode::OK }
+        else if result.metadata["held"] == true { StatusCode::ACCEPTED }
+        else if result.metadata["disabled"] == true { StatusCode::CONFLICT }
+        else { StatusCode::BAD_GATEWAY };
+    (status, Json(result))
 }
 
 /// POST /speak — text-to-speech
@@ -925,7 +885,8 @@ async fn music_generate_endpoint(
 
     tracing::info!("[music] Generating via MusicGen: '{}'", crate::core::safe_truncate(&prompt, 80));
 
-    match crate::music::generate_musicgen(&prompt, req.duration_secs).await {
+    let duration_secs = req.duration_secs.clamp(1, state.admission.limits.music_seconds as u32);
+    match crate::music::generate_musicgen(&prompt, duration_secs).await {
         Ok(path) => {
             // Notify self-model: Julian created music
             {
@@ -940,7 +901,7 @@ async fn music_generate_endpoint(
                 "status": "ok",
                 "path": path,
                 "prompt": prompt,
-                "duration_secs": req.duration_secs,
+                "duration_secs": duration_secs,
             })))
         }
         Err(e) => {
@@ -949,11 +910,7 @@ async fn music_generate_endpoint(
                 let mut sm = state.self_model.lock().await;
                 crate::friction::motor_friction("music_generate", &e, &mut sm);
             }
-            Ok(Json(serde_json::json!({
-                "status": "error",
-                "error": e,
-                "prompt": prompt,
-            })))
+            Err(StatusCode::BAD_GATEWAY)
         }
     }
 }
@@ -963,7 +920,7 @@ async fn dream_endpoint(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::dream::DreamReport> {
     let config = crate::dream::DreamConfig::default();
-    let report = crate::dream::dream(&state.pool, &state.self_model, config).await;
+    let report = crate::dream::dream(&state.pool, &state.self_model, &state.motor_gate, config).await;
     Json(report)
 }
 
@@ -1005,35 +962,28 @@ struct RecallParams {
 /// (default 20). `texture` is reserved for a future associative `/walk`
 /// colouring — null in v1. Strictly read-only: reads only the prune-exempt
 /// `rgw_episodes` table; never touches the awake-loop, energy, walk cadence, or
-/// selection. Query/DB errors degrade to an empty answer rather than 500.
+/// selection. Invalid dates return 400; database failures return 500.
 async fn recall(
     State(state): State<Arc<AppState>>,
     Query(params): Query<RecallParams>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     // Open-ended defaults: `infinity` for `to` means "as of now" (no episode is
     // future-dated); `-infinity` for `from` means "since the beginning".
     let to = params.to.filter(|s| !s.is_empty()).unwrap_or_else(|| "infinity".to_string());
     let from = params.from.filter(|s| !s.is_empty()).unwrap_or_else(|| "-infinity".to_string());
     let place = params.place.filter(|s| !s.is_empty());
-    let limit = params.limit.unwrap_or(20);
+    let limit = params.limit.unwrap_or(20).clamp(1, state.admission.limits.recall.min(200) as i32);
 
-    let location = db::location_as_of(&state.pool, &to).await.unwrap_or_else(|e| {
-        tracing::debug!("[recall] location_as_of failed: {}", e);
-        None
-    });
+    let location = db::location_as_of(&state.pool, &to).await.map_err(database_status)?;
     let episodes = db::recall_window(&state.pool, &from, &to, place.as_deref(), limit)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::debug!("[recall] recall_window failed: {}", e);
-            Vec::new()
-        });
+        .await.map_err(database_status)?;
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "where": location.as_ref().and_then(|l| l.location.clone()),
         "where_since": location.as_ref().map(|l| l.occurred_at.clone()),
         "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| serde_json::json!([])),
         "texture": serde_json::Value::Null,
-    }))
+    })))
 }
 
 /// GET /diverger — self-propagating reactive graph stats
@@ -1136,28 +1086,10 @@ async fn create_edge_endpoint(
 }
 
 /// POST /prune — synaptic pruning: decay + delete neglected edges
-async fn prune(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let decay_per_day = 0.02;  // Lose 0.02 weight per day of neglect
-    let min_weight = 0.01;      // Below this = forgotten = deleted
-
-    match db::prune_edges(&state.pool, decay_per_day, min_weight).await {
-        Ok((decayed, deleted)) => {
-            tracing::info!("[prune] Decayed {} edges, deleted {} dead edges", decayed, deleted);
-            Json(serde_json::json!({
-                "status": "ok",
-                "decayed": decayed,
-                "deleted": deleted,
-            }))
-        }
-        Err(e) => {
-            Json(serde_json::json!({
-                "status": "error",
-                "error": e.to_string(),
-            }))
-        }
-    }
+async fn prune(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let (decayed, deleted) = db::prune_edges(&state.pool, 0.02, 0.01).await
+        .map_err(|e| { tracing::error!(%e, "pruning failed"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    Ok(Json(serde_json::json!({"status":"ok", "decayed":decayed, "deleted":deleted})))
 }
 
 /// POST /ingest/signal — inject an external signal into the cognitive loop.
@@ -1265,7 +1197,7 @@ pub(crate) type ModeError = (StatusCode, &'static str);
 /// nor when the query decided the result and no walker ran. An empty fixed walk still
 /// reaches the critic, as before.
 pub(crate) fn critic_applies(arm_present: bool, seed_mode: &str, n_results: usize) -> bool {
-    !arm_present && !(seed_mode == "query" && n_results == 0)
+    !(arm_present || seed_mode == "query" && n_results == 0)
 }
 
 /// The eval arm of a request: `Ok(None)` when none was sent. An arm sent without
@@ -1333,7 +1265,7 @@ struct SetModeRequest {
 async fn set_mode_endpoint(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetModeRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     match parse_mode(&req.mode) {
         Some(mode) => {
             let prev = {
@@ -1343,52 +1275,49 @@ async fn set_mode_endpoint(
                 prev
             };
             tracing::info!("[rgw] Cognitive mode: {:?} → {:?}", prev, mode);
-            Json(serde_json::json!({
+            Ok(Json(serde_json::json!({
                 "status": "ok",
                 "previous": format!("{:?}", prev),
                 "current": format!("{:?}", mode),
-            }))
+            })))
         }
-        None => {
-            Json(serde_json::json!({
-                "status": "error",
-                "error": format!("Unknown mode '{}'. Use 'autonomous' or 'compliant'", req.mode),
-            }))
-        }
+        None => Err(StatusCode::BAD_REQUEST),
     }
 }
 
-/// GET /benchmark — run multiple walk configs and report performance
+/// POST /benchmark — run multiple walk configs and report performance
 async fn benchmark(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let emotion = EmotionalState::default();
     let mut results = Vec::new();
 
     for n_walkers in [1, 2, 4, rayon::current_num_threads().min(8)] {
+        let (n_walkers, steps) = state.admission.limits.walk(n_walkers, 5);
         let mut times = Vec::new();
 
         for _ in 0..3 {
             let start = Instant::now();
-            let (output, _) = walker::walk_parallel(
+            let (output, _) = walker::try_walk_parallel_with(
                 &state.pool,
                 &emotion,
                 n_walkers,
-                5,
+                steps,
                 &state.self_model,
+                walker::WalkOptions::default(),
             )
-            .await;
+            .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             times.push((elapsed, output.total_hops));
         }
 
         let avg_ms = times.iter().map(|(t, _)| t).sum::<f64>() / times.len() as f64;
-        let total_hops = n_walkers * 5;
+        let total_hops = n_walkers * steps;
         let hops_per_sec = total_hops as f64 / (avg_ms / 1000.0);
 
         results.push(serde_json::json!({
             "walkers": n_walkers,
-            "steps": 5,
+            "steps": steps,
             "total_hops": total_hops,
             "avg_ms": (avg_ms * 10.0).round() / 10.0,
             "min_ms": (times.iter().map(|(t, _)| *t).fold(f64::INFINITY, f64::min) * 10.0).round() / 10.0,
@@ -1399,17 +1328,17 @@ async fn benchmark(
     }
 
     let fastest = results.iter().min_by(|a, b| {
-        a["avg_ms"].as_f64().unwrap().partial_cmp(&b["avg_ms"].as_f64().unwrap()).unwrap()
+        a["avg_ms"].as_f64().unwrap_or(f64::INFINITY).total_cmp(&b["avg_ms"].as_f64().unwrap_or(f64::INFINITY))
     }).cloned();
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "cpu_cores": rayon::current_num_threads(),
         "runtime": "rust",
         "results": results,
         "summary": {
             "fastest": fastest,
         },
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -1471,6 +1400,135 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{}", addr), handle)
+    }
+
+
+    #[tokio::test]
+    async fn benchmark_requires_post() {
+        use tower::ServiceExt;
+        let _guard = ApiKeyGuard::set(Some("test-admin-key"));
+        let app = app_router(super::failure_status_tests::state().await);
+        let response = app.oneshot(Request::get("/benchmark")
+            .header("X-RGW-Key", "test-admin-key")
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn registered_router_keeps_probes_available_when_work_and_rate_are_full() {
+        use tower::ServiceExt;
+        use axum::body::{Body, to_bytes};
+        let _guard = ApiKeyGuard::set(Some("test-admin-key"));
+        let mut state = super::failure_status_tests::state().await;
+        Arc::get_mut(&mut state).unwrap().admission = Arc::new(crate::admission::Admission::new(
+            crate::admission::Limits { concurrent_walks: 1, body_bytes: 128,
+                rate_burst: 3, rate_rps: 1, ..Default::default() }));
+        let app = app_router(state.clone());
+        let request = |path: &str, body: String| Request::post(path)
+            .header("X-RGW-Key", "test-admin-key").header("content-type", "application/json")
+            .body(Body::from(body)).unwrap();
+        let oversized = app.clone().oneshot(request("/self/save", "x".repeat(129))).await.unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(oversized.headers()["content-type"], "application/json");
+
+        let lock = state.self_model.lock().await;
+        let mut held = Box::pin(app.clone().oneshot(request("/dream", "{}".into())));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut held).await.is_err());
+        let response = tokio::time::timeout(std::time::Duration::from_millis(100),
+            app.clone().oneshot(request("/walk", "{}".into()))).await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+        let response = app.clone().oneshot(request("/self/save", "{}".into())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "1");
+        for (path, expected) in [("/health", StatusCode::OK), ("/ready", StatusCode::SERVICE_UNAVAILABLE), ("/metrics", StatusCode::OK)] {
+            let response = app.clone().oneshot(Request::get(path).header("X-RGW-Key", "test-admin-key")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+            assert!(!response.headers().contains_key("retry-after"));
+            let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 100_000).await.unwrap()).unwrap();
+            if path == "/ready" { assert_eq!(body["ready"], false); }
+            if path == "/metrics" {
+                for counter in ["admission_rate_rejected", "admission_concurrency_rejected", "admission_body_rejected"] {
+                    assert!(body[counter].as_u64().unwrap() > 0, "{counter}");
+                }
+            }
+        }
+        drop(lock);
+        assert_eq!(held.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn scoped_keys_cover_the_registered_router() {
+        use tower::ServiceExt;
+        use axum::body::Body;
+        let _guard = ApiKeyGuard::set(Some("test-admin-key"));
+        struct OptionalKeys(Vec<(&'static str, Option<String>)>);
+        impl Drop for OptionalKeys {
+            fn drop(&mut self) {
+                for (name, previous) in &self.0 {
+                    // Serialized by API_KEY_LOCK, like the existing auth tests.
+                    unsafe { match previous { Some(v) => std::env::set_var(name, v), None => std::env::remove_var(name) } }
+                }
+            }
+        }
+        let _optional = OptionalKeys(["RGW_READ_KEY", "RGW_INGEST_KEY", "RGW_APPROVE_KEY"]
+            .into_iter().map(|n| (n, std::env::var(n).ok())).collect());
+        for (name, key) in [("RGW_READ_KEY", "test-read-key"), ("RGW_INGEST_KEY", "test-ingest-key"), ("RGW_APPROVE_KEY", "test-approve-key")] {
+            unsafe { std::env::set_var(name, key); }
+        }
+        let app = app_router(super::failure_status_tests::state().await);
+        for path in ["/health", "/ready"] {
+            let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), if path == "/health" { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE });
+            assert!(response.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+        }
+        for (method, path, key, body, expected) in [
+            ("GET", "/self", "test-read-key", "{}", StatusCode::OK),
+            ("POST", "/outcomes", "test-ingest-key",
+                r#"{"correlation_id":"f0f5b293-7f08-4d2b-8461-5fd76c8ae371","outcome":"completed"}"#, StatusCode::SERVICE_UNAVAILABLE),
+            ("POST", "/diverger/outcome", "test-ingest-key",
+                r#"{"correlation_id":"f0f5b293-7f08-4d2b-8461-5fd76c8ae371","outcome":"completed","success":true}"#, StatusCode::SERVICE_UNAVAILABLE),
+            ("POST", "/motor/proposals/1/reject", "test-approve-key", "{}", StatusCode::NOT_FOUND),
+            ("POST", "/self/save", "test-admin-key", "{}", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let request = Request::builder().method(method).uri(path).header("X-RGW-Key", key)
+                .header("content-type", "application/json").body(Body::from(body)).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{method} {path}");
+            assert!(response.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+        }
+        for (method, path, scope) in [
+            ("GET", "/self", Scope::Read), ("GET", "/stats", Scope::Read),
+            ("GET", "/recall", Scope::Read), ("GET", "/metrics", Scope::Read),
+            ("GET", "/diverger", Scope::Read), ("GET", "/learning", Scope::Read),
+            ("GET", "/selection/stats", Scope::Read), ("GET", "/metacog/config", Scope::Read),
+            ("GET", "/tools", Scope::Read), ("GET", "/music", Scope::Read),
+            ("GET", "/music/midi", Scope::Read), ("GET", "/music/prompt", Scope::Read),
+            ("GET", "/v1/models", Scope::Read), ("GET", "/motor/proposals", Scope::Read),
+            ("POST", "/ingest/signal", Scope::Ingest), ("POST", "/diverger/notify", Scope::Ingest),
+            ("POST", "/tom/record", Scope::Ingest), ("POST", "/outcomes", Scope::Ingest),
+            ("POST", "/diverger/outcome", Scope::Ingest),
+            ("POST", "/motor/proposals/1/approve", Scope::Approve),
+            ("POST", "/motor/proposals/1/reject", Scope::Approve),
+            ("POST", "/walk", Scope::Admin), ("POST", "/prune", Scope::Admin),
+            ("POST", "/edge", Scope::Admin), ("POST", "/self/mode", Scope::Admin),
+            ("POST", "/self/save", Scope::Admin), ("POST", "/metacog/config", Scope::Admin),
+            ("POST", "/selection/stage", Scope::Admin), ("POST", "/selection/rollback", Scope::Admin),
+            ("POST", "/tools/execute", Scope::Admin), ("POST", "/speak", Scope::Admin),
+            ("POST", "/dream", Scope::Admin), ("POST", "/music/generate", Scope::Admin),
+            ("POST", "/v1/chat/completions", Scope::Admin), ("POST", "/benchmark", Scope::Admin),
+        ] {
+            for (key, owned) in [("test-read-key", Scope::Read), ("test-ingest-key", Scope::Ingest), ("test-approve-key", Scope::Approve)] {
+                // Wrong scopes must be rejected before JSON validation, handlers, or spend.
+                if owned == scope { continue; }
+                let request = Request::builder().method(method).uri(path).header("X-RGW-Key", key)
+                    .body(Body::empty()).unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path} {owned:?}");
+                assert!(response.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1695,12 +1753,13 @@ mod mode_ceiling_tests {
     async fn state(mode: CognitiveMode) -> Arc<AppState> {
         // Closed pool proves rejection requires no database or running services.
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://localhost/unused").unwrap();
+            .connect_lazy("postgresql://rgw:ci@127.0.0.1:55439/rgw_test").unwrap();
         pool.close().await;
         let mut sm = SelfModel::new();
         sm.mode = mode;
         let self_model = Arc::new(tokio::sync::Mutex::new(sm));
         Arc::new(AppState {
+            admission: Arc::new(crate::admission::Admission::new(Default::default())),
             motor_gate: Arc::new(crate::motor::MotorGate::new(crate::motor::MotorMode::Propose)),
             diverger: Diverger::new(pool.clone(), self_model.clone(), ""),
             pool, self_model, ollama_url: String::new(),
@@ -1773,10 +1832,10 @@ mod mode_ceiling_tests {
                     }
                     if chat {
                         let req = serde_json::from_value(body).unwrap();
-                        assert!(openai::chat_completions(State(state.clone()), Json(req)).await.is_ok());
+                        assert_eq!(openai::chat_completions(State(state.clone()), Json(req)).await.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
                     } else {
                         let req = serde_json::from_value(body).unwrap();
-                        assert!(walk(State(state.clone()), Json(req)).await.is_ok());
+                        assert_eq!(walk(State(state.clone()), Json(req)).await.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
                     }
                     let sm = state.self_model.lock().await;
                     assert_eq!(sm.mode, configured);
@@ -1848,4 +1907,350 @@ mod mode_ceiling_tests {
         assert!(!critic_applies(true, "query", 4), "eval arms are measurements, not sessions");
         assert!(!critic_applies(true, "fixed", 4));
     }
+}
+
+#[cfg(test)]
+mod phase1_config_tests {
+    #[test]
+    fn background_features_require_explicit_enable() {
+        assert!(!super::enabled(None).unwrap());
+        assert!(!super::enabled(Some("false")).unwrap());
+        assert!(super::enabled(Some("true")).unwrap());
+        assert!(super::enabled(Some("yes")).is_err());
+    }
+}
+
+/// Strict booleans avoid silently enabling background writes on typos.
+fn enabled(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.unwrap_or("false").trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => anyhow::bail!("feature flags must be true/false or 1/0"),
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[test]
+    fn keys_are_scoped_and_admin_remains_compatible() {
+        let keys = ApiKeys { admin: Some("test-admin-key".into()), read: Some("test-read-key".into()),
+            ingest: Some("test-ingest-key".into()), approve: Some("test-approve-key".into()) };
+        let routes = [("GET", "/self", Scope::Read), ("POST", "/benchmark", Scope::Admin),
+            ("POST", "/ingest/signal", Scope::Ingest), ("POST", "/outcomes", Scope::Ingest),
+            ("POST", "/diverger/outcome", Scope::Ingest), ("POST", "/tom/record", Scope::Ingest),
+            ("POST", "/motor/proposals/1/approve", Scope::Approve),
+            ("POST", "/motor/proposals/1/reject", Scope::Approve),
+            ("POST", "/self/mode", Scope::Admin), ("POST", "/walk", Scope::Admin)];
+        for (method, path, scope) in routes {
+            assert_eq!(route_scope(method, path), scope);
+            if scope == Scope::Approve {
+                assert_eq!(keys.authorize(Some("test-admin-key"), scope), Err(StatusCode::FORBIDDEN),
+                    "a configured approve key separates approval from admin");
+            } else {
+                assert!(keys.authorize(Some("test-admin-key"), scope).is_ok());
+            }
+            assert_eq!(keys.authorize(None, scope), Err(StatusCode::UNAUTHORIZED));
+            assert_eq!(keys.authorize(Some("invalid"), scope), Err(StatusCode::UNAUTHORIZED));
+            for (key, owned) in [("test-read-key", Scope::Read), ("test-ingest-key", Scope::Ingest),
+                ("test-approve-key", Scope::Approve)] {
+                assert_eq!(keys.authorize(Some(key), scope).map(|_| ()), if owned == scope { Ok(()) } else { Err(StatusCode::FORBIDDEN) });
+            }
+        }
+        let legacy = ApiKeys { admin: Some("test-admin-key".into()), read: None, ingest: None, approve: None };
+        assert!(legacy.authorize(Some("test-admin-key"), Scope::Approve).is_ok(), "single-key deployments keep working");
+        let absent = ApiKeys { admin: None, ..keys };
+        assert_eq!(absent.authorize(Some("test-read-key"), Scope::Read), Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn operator_actions_are_attributed_to_the_key_that_authorised_them() {
+        let split = ApiKeys { admin: Some("test-admin-key".into()), read: Some("test-read-key".into()),
+            ingest: Some("test-ingest-key".into()), approve: Some("test-approve-key".into()) };
+        assert_eq!(split.authorize(Some("test-admin-key"), Scope::Admin), Ok(KeyRole::Admin));
+        assert_eq!(split.authorize(Some("test-admin-key"), Scope::Read), Ok(KeyRole::Admin));
+        assert_eq!(split.authorize(Some("test-read-key"), Scope::Read), Ok(KeyRole::Read));
+        assert_eq!(split.authorize(Some("test-ingest-key"), Scope::Ingest), Ok(KeyRole::Ingest));
+        assert_eq!(split.authorize(Some("test-approve-key"), Scope::Approve), Ok(KeyRole::Approve));
+        let legacy = ApiKeys { admin: Some("test-admin-key".into()), read: None, ingest: None, approve: None };
+        assert_eq!(legacy.authorize(Some("test-admin-key"), Scope::Approve), Ok(KeyRole::Admin),
+            "without an approve key the log shows that the admin key approved");
+        for role in [KeyRole::Admin, KeyRole::Read, KeyRole::Ingest, KeyRole::Approve] {
+            assert!(!role.as_str().contains("test-"), "the label is a role name, never key material");
+        }
+
+        for (method, path) in [("POST", "/motor/proposals/7/approve"), ("POST", "/motor/proposals/7/reject"),
+            ("POST", "/self/mode"), ("POST", "/self/save"), ("POST", "/selection/stage"),
+            ("POST", "/selection/rollback"), ("POST", "/metacog/config"), ("POST", "/prune"),
+            ("POST", "/dream"), ("POST", "/edge"), ("POST", "/tools/execute"), ("POST", "/benchmark")] {
+            assert!(operator_action(route_scope(method, path), path), "{method} {path}");
+        }
+        for (method, path) in [("POST", "/walk"), ("POST", "/v1/chat/completions"), ("GET", "/self"),
+            ("GET", "/metacog/config"), ("POST", "/ingest/signal"), ("POST", "/outcomes")] {
+            assert!(!operator_action(route_scope(method, path), path), "{method} {path}");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope { Read, Ingest, Admin, Approve }
+
+fn route_scope(method: &str, path: &str) -> Scope {
+    if method == "POST" && path.starts_with("/motor/proposals/")
+        && (path.ends_with("/approve") || path.ends_with("/reject")) {
+        Scope::Approve
+    } else if method == "GET" && path != "/benchmark" {
+        Scope::Read
+    } else if method == "POST" && matches!(path,
+        "/ingest/signal" | "/diverger/notify" | "/diverger/outcome" | "/outcomes" | "/tom/record") {
+        Scope::Ingest
+    } else { Scope::Admin }
+}
+
+/// Which configured key authorised a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyRole { Admin, Read, Ingest, Approve }
+
+impl KeyRole {
+    fn as_str(self) -> &'static str {
+        match self { Self::Admin => "admin", Self::Read => "read", Self::Ingest => "ingest", Self::Approve => "approve" }
+    }
+}
+
+/// Requests that change what the instance is allowed to do or decide a motor
+/// proposal: approvals, and every admin route except routine cognition.
+fn operator_action(scope: Scope, path: &str) -> bool {
+    match scope {
+        Scope::Approve => true,
+        Scope::Admin => !matches!(path, "/walk" | "/v1/chat/completions"),
+        Scope::Read | Scope::Ingest => false,
+    }
+}
+
+struct ApiKeys {
+    admin: Option<String>,
+    read: Option<String>,
+    ingest: Option<String>,
+    approve: Option<String>,
+}
+
+impl ApiKeys {
+    fn from_env() -> Self {
+        let key = |name| std::env::var(name).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        Self { admin: key("RGW_API_KEY"), read: key("RGW_READ_KEY"),
+            ingest: key("RGW_INGEST_KEY"), approve: key("RGW_APPROVE_KEY") }
+    }
+
+    fn authorize(&self, presented: Option<&str>, scope: Scope) -> Result<KeyRole, StatusCode> {
+        if self.admin.is_none() { return Err(StatusCode::UNAUTHORIZED); }
+        let presented = presented.ok_or(StatusCode::UNAUTHORIZED)?;
+        let matches = |key: &Option<String>| key.as_ref()
+            .is_some_and(|k| constant_time_eq(presented.as_bytes(), k.as_bytes()));
+        // Evaluate every key before deciding: a key may intentionally grant several scopes.
+        let admin = matches(&self.admin);
+        let read = matches(&self.read);
+        let ingest = matches(&self.ingest);
+        let approve = matches(&self.approve);
+        // Once a dedicated approve key is configured, approval is separated:
+        // the admin key can no longer approve or reject motor proposals.
+        let admin_allowed = admin && !(scope == Scope::Approve && self.approve.is_some());
+        match scope {
+            _ if admin_allowed => Ok(KeyRole::Admin),
+            Scope::Read if read => Ok(KeyRole::Read),
+            Scope::Ingest if ingest => Ok(KeyRole::Ingest),
+            Scope::Approve if approve => Ok(KeyRole::Approve),
+            _ if admin || read || ingest || approve => Err(StatusCode::FORBIDDEN),
+            _ => Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+}
+
+async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    readiness(&state.pool).await
+}
+
+pub async fn readiness(pool: &PgPool) -> (StatusCode, Json<serde_json::Value>) {
+    let ready = matches!(tokio::time::timeout(std::time::Duration::from_secs(2),
+        db::schema_ready(pool)).await, Ok(Ok(())));
+    (if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
+        Json(serde_json::json!({"ready": ready, "schema_version": db::RGW_SCHEMA_CONTRACT})))
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    #[tokio::test]
+    async fn outcomes_validate_bounds_and_do_not_accept_storage_failure() {
+        let state = super::failure_status_tests::state().await;
+        let gate = &state.motor_gate;
+        let id = uuid::Uuid::new_v4();
+        let request: OutcomeRequest = serde_json::from_value(serde_json::json!({
+            "correlation_id": id, "outcome": "completed", "success": true, "lesson": "use the result"
+        })).unwrap();
+        assert_eq!(outcome_endpoint(State(state.clone()), Json(request)).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(serde_json::from_value::<OutcomeRequest>(serde_json::json!({"correlation_id":"invalid", "outcome":"ok"})).is_err());
+        for (outcome, lesson) in [("".to_string(), "".to_string()), ("ok".into(), "x".repeat(501)), ("x".repeat(501), "".into())] {
+            let req = OutcomeRequest { correlation_id: id, outcome, lesson: Some(lesson), success: None };
+            assert_eq!(outcome_endpoint(State(state.clone()), Json(req)).await.0, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(gate.snapshot()["outcomes"].as_array().unwrap().len(), 0);
+    }
+}
+
+#[derive(Deserialize)]
+struct OutcomeRequest {
+    correlation_id: uuid::Uuid,
+    outcome: String,
+    success: Option<bool>,
+    lesson: Option<String>,
+}
+
+async fn outcome_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OutcomeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if req.correlation_id.is_nil() || req.outcome.trim().is_empty() || req.outcome.chars().count() > 500
+        || req.lesson.as_ref().is_some_and(|s| s.chars().count() > 500) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":
+            "non-nil correlation_id and outcome (1..500 characters) required; lesson limit is 500"})));
+    }
+    let result = state.motor_gate.record_outcome(&state.pool, &state.self_model,
+        crate::motor::MotorOutcome { correlation_id: req.correlation_id,
+            outcome: req.outcome, success: req.success, lesson: req.lesson }).await;
+    match result {
+        Ok(()) => (StatusCode::ACCEPTED, Json(serde_json::json!({"status":"accepted", "correlation_id":req.correlation_id}))),
+        Err(crate::motor::OutcomeError::Unmatched) => (StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"no sent command matches correlation_id"}))),
+        Err(crate::motor::OutcomeError::Storage(_)) => (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"outcome persistence unavailable"}))),
+    }
+}
+
+async fn json_errors(req: Request, next: Next) -> Response {
+    use axum::response::IntoResponse;
+    let response = next.run(req).await;
+    let status = response.status();
+    if (status.is_client_error() || status.is_server_error())
+        && !response.headers().get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/json")) {
+        (status, Json(serde_json::json!({"error": status.canonical_reason().unwrap_or("request failed")}))).into_response()
+    } else { response }
+}
+
+#[cfg(test)]
+mod failure_status_tests {
+    use super::*;
+    pub(super) async fn state() -> Arc<AppState> {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgresql://rgw:ci@127.0.0.1:55439/rgw_test").unwrap();
+        pool.close().await;
+        let mut model = SelfModel::new();
+        model.mode = CognitiveMode::Compliant;
+        let self_model = Arc::new(tokio::sync::Mutex::new(model));
+        Arc::new(AppState { admission: Arc::new(crate::admission::Admission::new(Default::default())), diverger: Diverger::new(pool.clone(), self_model.clone(), ""),
+            pool, self_model, ollama_url: String::new(), expression_model: String::new(),
+            julian_url: String::new(), provider: None,
+            motor_gate: Arc::new(crate::motor::MotorGate::new(crate::motor::MotorMode::Off)) })
+    }
+
+    #[tokio::test]
+    async fn failed_mutations_have_error_statuses_and_invalid_patch_is_atomic() {
+        use axum::response::IntoResponse;
+        let state = state().await;
+        assert_eq!(save_self_model_endpoint(State(state.clone())).await.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(prune(State(state.clone())).await.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let recall = recall(State(state.clone()), Query(RecallParams { from: None, to: None, place: None, limit: None })).await;
+        assert_eq!(recall.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let before = serde_json::to_value(&*state.self_model.lock().await).unwrap();
+        let patch = serde_json::from_value(serde_json::json!({"min_energy":0.2,"phase_order":["draft"]})).unwrap();
+        assert_eq!(set_metacog_config(State(state.clone()), Json(patch)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(serde_json::to_value(&*state.self_model.lock().await).unwrap(), before);
+        let mut phases = vec!["draft"; 100];
+        phases.push("critique");
+        let patch = serde_json::from_value(serde_json::json!({"min_energy":0.2,"phase_order":phases})).unwrap();
+        assert_eq!(set_metacog_config(State(state.clone()), Json(patch)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(serde_json::to_value(&*state.self_model.lock().await).unwrap(), before);
+        let result = crate::tools::execute_tool("memory_store", serde_json::json!({"content":"test"}), &state.pool).await;
+        assert!(!result.success);
+        assert_eq!(result.metadata["disabled"], true);
+    }
+
+    #[tokio::test]
+    async fn unavailable_database_is_live_but_not_ready() {
+        let state = state().await;
+        assert!(!health(State(state.clone())).await.0.db_connected);
+        let (status, body) = readiness(&state.pool).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["ready"], false);
+        assert_eq!(body.0["schema_version"], "julian-rgw-1");
+        assert!(!body.0.to_string().contains("postgresql"));
+    }
+}
+
+fn database_status(error: sqlx::Error) -> StatusCode {
+    if let sqlx::Error::Database(ref db) = error
+        && db.code().is_some_and(|code| matches!(code.as_ref(), "22007" | "22008" | "22P02")) {
+        return StatusCode::BAD_REQUEST;
+    }
+    tracing::error!(%error, "database request failed");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+pub fn app_router(state: Arc<AppState>) -> Router {
+    // Public probes expose no database errors or connection details.
+    let public = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route_layer(middleware::from_fn_with_state(state.admission.clone(), crate::admission::admit));
+
+    // ── Protected endpoints (always require X-RGW-Key) ──
+    // Everything except public probes: introspection AND mutations / actions
+    // / LLM-spend. Fail-closed: no key configured → 401. See audit C1/S3.
+    let protected = Router::new()
+        // read-only introspection
+        .route("/stats", get(stats))
+        .route("/recall", get(recall))
+        .route("/metrics", get(metrics_endpoint))
+        .route("/diverger", get(diverger_stats))
+        .route("/learning", get(learning_stats))
+        .route("/self", get(self_state))
+        .route("/metacog/config", get(get_metacog_config).post(set_metacog_config))
+        .route("/selection/stage", post(set_selection_stage))
+        .route("/selection/stats", get(selection_stats))
+        .route("/selection/rollback", post(selection_rollback))
+        .route("/tools", get(list_tools))
+        .route("/music", get(music_endpoint))
+        .route("/music/midi", get(music_midi_endpoint))
+        .route("/music/prompt", get(music_prompt_endpoint))
+        .route("/v1/models", get(openai::list_models))
+        .route("/benchmark", post(benchmark))
+        // mutations / actions / cost
+        .route("/walk", post(walk))
+        .route("/prune", post(prune))
+        .route("/edge", post(create_edge_endpoint))
+        .route("/diverger/notify", post(diverger_notify))
+        .route("/self/mode", post(set_mode_endpoint))
+        .route("/self/save", post(save_self_model_endpoint))
+        .route("/tools/execute", post(execute_tool_endpoint))
+        .route("/speak", post(speak_endpoint))
+        .route("/dream", post(dream_endpoint))
+        .route("/music/generate", post(music_generate_endpoint))
+        // Signal ingest — external events feed into the cognitive loop
+        .route("/ingest/signal", post(ingest_signal_endpoint))
+        .route("/tom/record", post(tom_record_endpoint))
+        .route("/outcomes", post(outcome_endpoint))
+        .route("/diverger/outcome", post(outcome_endpoint))
+        // OpenAI-compatible chat (triggers a walk + paid LLM expression)
+        .route("/v1/chat/completions", post(openai::chat_completions))
+        // Motor gate: inspect / approve / reject held actions (human only)
+        .merge(motor_routes(state.motor_gate.clone()))
+        .route_layer(middleware::from_fn_with_state(state.admission.clone(), crate::admission::admit))
+        .route_layer(middleware::from_fn(require_auth));
+
+    public
+        .merge(protected)
+        .with_state(state.clone())
+        // Closed CORS. Callers are server-side and do not send Origin.
+        // A permissive layer echoed any Origin.
+        .layer(CorsLayer::new())
+        .layer(middleware::from_fn(json_errors))
+
 }

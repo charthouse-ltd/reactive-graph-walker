@@ -39,7 +39,7 @@ pub struct EdgeCache {
     pub flushes: Arc<std::sync::atomic::AtomicU64>,
 }
 
-struct CacheStats {
+pub struct CacheStats {
     hits: u64,
     misses: u64,
     flushes: u64,

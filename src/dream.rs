@@ -80,6 +80,7 @@ pub struct DreamInsight {
 pub async fn dream(
     pool: &PgPool,
     self_model: &Arc<tokio::sync::Mutex<SelfModel>>,
+    motor_gate: &crate::motor::MotorGate,
     config: DreamConfig,
 ) -> DreamReport {
     let start = Instant::now();
@@ -100,6 +101,11 @@ pub async fn dream(
         }
     }
 
+    // Refresh verified ledger records (including callbacks received before restart).
+    // This is independent of Julian's Python toggle. Dreams never write rgw_episodes.
+    motor_gate.restore_outcomes(pool).await;
+    let memory = motor_gate.consolidate_episodes();
+
     // Signal: entering dream state
     {
         let mut sm = self_model.lock().await;
@@ -109,9 +115,22 @@ pub async fn dream(
     }
 
     // Get all nodes for seed selection
-    let all_seeds = db::seed_nodes(pool, (config.n_walks * 2) as i32)
+    let mut all_seeds = db::seed_nodes(pool, (config.n_walks * 2) as i32)
         .await
         .unwrap_or_default();
+
+    // Outcome/lesson domains provide internal exploration context, not factual dream
+    // events or extra coherence votes. No reinforcement along an executed walk path.
+    let mut contextual_seeds = Vec::new();
+    for domain in outcome_context_domains(&memory) {
+        if let Ok(nodes) = db::top_nodes_in_domain(pool, &domain, 1).await {
+            for node in nodes {
+                if !contextual_seeds.contains(&node) { contextual_seeds.push(node); }
+            }
+        }
+    }
+    contextual_seeds.extend(all_seeds.into_iter().filter(|id| !contextual_seeds.contains(id)).collect::<Vec<_>>());
+    all_seeds = contextual_seeds;
 
     if all_seeds.is_empty() {
         return DreamReport {
@@ -248,6 +267,18 @@ pub async fn dream(
     }
 }
 
+/// Prefer domains with consolidated evidence, then recent verified attempts.
+/// Unscored attempts stay context only; they never count towards a lesson.
+fn outcome_context_domains(memory: &crate::episodic::EpisodicMemory) -> Vec<String> {
+    let mut domains = Vec::new();
+    for domain in memory.lessons.iter().map(|l| &l.domain)
+        .chain(memory.episodes.iter().rev().map(|e| &e.domain)) {
+        if !domain.is_empty() && !domains.contains(domain) { domains.push(domain.clone()); }
+        if domains.len() == 5 { break; }
+    }
+    domains
+}
+
 // ── Internal types ──────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -257,6 +288,7 @@ struct DreamConnection {
     source_domain: String,
     target_domain: String,
     walk_weight: f32,
+    #[allow(dead_code)] // Retain walk provenance in the debug representation.
     via_noise: bool,
 }
 
@@ -265,6 +297,7 @@ struct DreamWalkResult {
     node_path: Vec<i32>,
     domains_path: Vec<String>,
     total_weight: f32,
+    #[allow(dead_code)] // Retain the walk summary in the debug representation.
     surprises: usize,
     /// Number of steps that landed on a domain with verified knowledge (compendium match)
     knowledge_anchors: usize,
@@ -563,6 +596,7 @@ pub fn selection_observe(sm: &mut SelfModel, report: &DreamReport) {
 pub fn start_dream_loop(
     pool: PgPool,
     self_model: Arc<tokio::sync::Mutex<SelfModel>>,
+    motor_gate: Arc<crate::motor::MotorGate>,
 ) {
     tokio::spawn(async move {
         let config = DreamConfig {
@@ -593,7 +627,7 @@ pub fn start_dream_loop(
             tokio::time::sleep(std::time::Duration::from_secs_f64(cycle_secs)).await;
 
             // ── Run a dream cycle ──
-            let report = dream(&pool, &self_model, config.clone()).await;
+            let report = dream(&pool, &self_model, &motor_gate, config.clone()).await;
             if report.edges_created > 0 || report.connections_kept > 0 {
                 tracing::info!(
                     "[dream] Cycle: {} edges created, {} connections kept, {} insights (energy={:.2})",
@@ -654,6 +688,24 @@ mod tests {
         c.iter()
             .map(|c| (c.source_node, c.target_node, c.source_domain.clone(), c.target_domain.clone()))
             .collect()
+    }
+
+    #[test]
+    fn dream_context_uses_lessons_and_verified_attempts_without_scoring_skips() {
+        let mut memory = crate::episodic::EpisodicMemory::new();
+        for (id, domain, success) in [("1", "science", Some(false)), ("2", "science", Some(false)),
+            ("3", "science", Some(false)), ("4", "travel", None)] {
+            memory.record(crate::episodic::Episode {
+                source_ref: id.into(), timestamp: id.parse().unwrap(), stimulus: String::new(),
+                domain: domain.into(), walker_summary: String::new(), critique: String::new(),
+                action: "search".into(), outcome: "reported".into(), success,
+                lesson: String::new(), valence: 0.0, arousal: 0.0, energy: 0.0,
+            });
+        }
+        memory.consolidate();
+        assert_eq!(outcome_context_domains(&memory), vec!["science", "travel"]);
+        assert_eq!(memory.lessons.len(), 1);
+        assert_eq!(memory.lessons[0].evidence_count, 3);
     }
 
     #[test]
