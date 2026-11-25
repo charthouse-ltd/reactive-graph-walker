@@ -881,7 +881,6 @@ pub(crate) async fn save_motor_outcome(
     pool: &PgPool,
     record: &crate::motor::OutcomeRecord,
 ) -> anyhow::Result<()> {
-    episodes_outcome_schema_ready(pool).await?;
     sqlx::query("INSERT INTO rgw_episodes (occurred_at, kind, headline, detail, source_type, source_ref)
         VALUES (NOW() AT TIME ZONE 'UTC', 'motor_outcome', $1, $2, 'motor_outcome', $3)
         ON CONFLICT (source_type, source_ref) DO UPDATE SET
