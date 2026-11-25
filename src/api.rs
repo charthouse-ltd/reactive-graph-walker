@@ -1486,9 +1486,9 @@ mod tests {
         for (method, path, key, body, expected) in [
             ("GET", "/self", "test-read-key", "{}", StatusCode::OK),
             ("POST", "/outcomes", "test-ingest-key",
-                r#"{"correlation_id":"f0f5b293-7f08-4d2b-8461-5fd76c8ae371","outcome":"completed"}"#, StatusCode::ACCEPTED),
+                r#"{"correlation_id":"f0f5b293-7f08-4d2b-8461-5fd76c8ae371","outcome":"completed"}"#, StatusCode::SERVICE_UNAVAILABLE),
             ("POST", "/diverger/outcome", "test-ingest-key",
-                r#"{"correlation_id":"f0f5b293-7f08-4d2b-8461-5fd76c8ae371","outcome":"completed","success":true}"#, StatusCode::ACCEPTED),
+                r#"{"correlation_id":"f0f5b293-7f08-4d2b-8461-5fd76c8ae371","outcome":"completed","success":true}"#, StatusCode::SERVICE_UNAVAILABLE),
             ("POST", "/motor/proposals/1/reject", "test-approve-key", "{}", StatusCode::NOT_FOUND),
             ("POST", "/self/save", "test-admin-key", "{}", StatusCode::INTERNAL_SERVER_ERROR),
         ] {
@@ -2080,22 +2080,20 @@ pub async fn readiness(pool: &PgPool) -> (StatusCode, Json<serde_json::Value>) {
 mod outcome_tests {
     use super::*;
     #[tokio::test]
-    async fn outcomes_validate_uuid_and_bounds_and_retain_callback() {
+    async fn outcomes_validate_bounds_and_do_not_accept_storage_failure() {
         let state = super::failure_status_tests::state().await;
         let gate = &state.motor_gate;
         let id = uuid::Uuid::new_v4();
         let request: OutcomeRequest = serde_json::from_value(serde_json::json!({
             "correlation_id": id, "outcome": "completed", "success": true, "lesson": "use the result"
         })).unwrap();
-        assert_eq!(outcome_endpoint(State(state.clone()), Json(request)).await.0, StatusCode::ACCEPTED);
-        assert_eq!(gate.snapshot()["outcomes"][0]["correlation_id"], id.to_string());
-        assert_eq!(gate.snapshot()["outcomes"][0]["success"], true);
+        assert_eq!(outcome_endpoint(State(state.clone()), Json(request)).await.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(serde_json::from_value::<OutcomeRequest>(serde_json::json!({"correlation_id":"invalid", "outcome":"ok"})).is_err());
         for (outcome, lesson) in [("".to_string(), "".to_string()), ("ok".into(), "x".repeat(501)), ("x".repeat(501), "".into())] {
             let req = OutcomeRequest { correlation_id: id, outcome, lesson: Some(lesson), success: None };
             assert_eq!(outcome_endpoint(State(state.clone()), Json(req)).await.0, StatusCode::BAD_REQUEST);
         }
-        assert_eq!(gate.snapshot()["outcomes"].as_array().unwrap().len(), 1);
+        assert_eq!(gate.snapshot()["outcomes"].as_array().unwrap().len(), 0);
     }
 }
 
@@ -2116,10 +2114,16 @@ async fn outcome_endpoint(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":
             "non-nil correlation_id and outcome (1..500 characters) required; lesson limit is 500"})));
     }
-    state.motor_gate.record_outcome(&state.pool, &state.self_model,
+    let result = state.motor_gate.record_outcome(&state.pool, &state.self_model,
         crate::motor::MotorOutcome { correlation_id: req.correlation_id,
             outcome: req.outcome, success: req.success, lesson: req.lesson }).await;
-    (StatusCode::ACCEPTED, Json(serde_json::json!({"status":"accepted", "correlation_id":req.correlation_id})))
+    match result {
+        Ok(()) => (StatusCode::ACCEPTED, Json(serde_json::json!({"status":"accepted", "correlation_id":req.correlation_id}))),
+        Err(crate::motor::OutcomeError::Unmatched) => (StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"no sent command matches correlation_id"}))),
+        Err(crate::motor::OutcomeError::Storage(_)) => (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"outcome persistence unavailable"}))),
+    }
 }
 
 async fn json_errors(req: Request, next: Next) -> Response {

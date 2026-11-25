@@ -614,9 +614,10 @@ async fn compute_knowledge_domains(pool: &PgPool) -> Result<std::collections::Ha
 // Date-anchored autobiography served from `rgw_episodes` — a table owned and
 // migrated by project_julian and read here via runtime `sqlx::query(...)`
 // strings (no `query!` macro), so the build never needs the table to exist.
-// Strictly read-only: these never touch the awake-loop, energy, walk cadence,
-// or selection. `rgw_episodes` is prune-exempt — `prune_nodes`/`prune_edges`
-// must never touch it; it is permanent autobiography.
+// Julian-owned autobiographical content stays strictly read-only. RGW appends
+// only `motor_outcome` rows via `save_motor_outcome`, using the
+// (source_type, source_ref) uniqueness contract for callback retries/updates.
+// The entire table remains prune-exempt: `prune_nodes`/`prune_edges` never touch it.
 // See the autobiographical-timeline design (2026-06-22), §5 / §7.
 
 /// The location in effect at a given instant — the answer to "where was he?".
@@ -793,6 +794,22 @@ mod tests {
 
 #[cfg(test)]
 mod restore_tests {
+    #[tokio::test]
+    async fn outcome_schema_and_writer_propagate_unavailable_storage() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::new());
+        pool.close().await;
+        assert!(super::episodes_outcome_schema_ready(&pool).await.is_err());
+        assert!(super::schema_ready(&pool).await.is_err());
+        let record = serde_json::from_value(serde_json::json!({
+            "correlation_id": uuid::Uuid::new_v4(), "outcome": "done",
+            "success": true, "lesson": null,
+            "origin": {"action":"search", "domain":"science", "target":"test"},
+            "received_at": 0, "reflected": false
+        })).unwrap();
+        assert!(super::save_motor_outcome(&pool, &record).await.is_err());
+    }
+
     #[test]
     fn malformed_snapshot_is_not_confirmed_empty() {
         assert!(super::decode_self_model(Some("broken".into())).is_err());
@@ -822,12 +839,39 @@ pub async fn schema_ready(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT document, embedding FROM memory_vectors LIMIT 0").execute(pool).await?;
     sqlx::query("SELECT id, source_id, target_id, edge_type, weight, emotional_charge, traversal_count, last_traversed, created_at FROM memory_edges LIMIT 0").execute(pool).await?;
     sqlx::query("SELECT key, value, description, category, updated_at FROM runtime_settings LIMIT 0").execute(pool).await?;
-    sqlx::query("SELECT occurred_at, kind, location, lat, lng, headline, detail FROM rgw_episodes LIMIT 0").execute(pool).await?;
+    sqlx::query("SELECT occurred_at, kind, location, lat, lng, headline, detail, source_type, source_ref FROM rgw_episodes LIMIT 0").execute(pool).await?;
+    episodes_outcome_schema_ready(pool).await?;
     let valid: bool = sqlx::query_scalar(
         "SELECT (SELECT atttypid = 'text'::regtype FROM pg_attribute WHERE attrelid = 'runtime_settings'::regclass AND attname = 'value' AND NOT attisdropped)
          AND (SELECT t.typname = 'vector' AND a.atttypmod = 768 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'memory_vectors'::regclass AND a.attname = 'embedding' AND NOT a.attisdropped)")
         .fetch_one(pool).await?;
     if !valid { return Err(sqlx::Error::Protocol("incompatible schema contract".into())); }
+    Ok(())
+}
+
+/// ON CONFLICT needs an immediate, valid, non-partial unique index on exactly
+/// these two key columns. INCLUDE columns and reversed key order are allowed.
+async fn episodes_outcome_schema_ready(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT source_type, source_ref FROM rgw_episodes LIMIT 0")
+        .execute(pool).await?;
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_index i
+            WHERE i.indrelid = 'rgw_episodes'::regclass
+              AND i.indisunique AND i.indisvalid AND i.indimmediate
+              AND i.indpred IS NULL AND i.indexprs IS NULL
+              AND i.indnkeyatts = 2
+              AND (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
+                   FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                   JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                   WHERE k.ord <= i.indnkeyatts AND NOT a.attisdropped)
+                  = ARRAY['source_ref', 'source_type']::text[]
+        )")
+        .fetch_one(pool).await?;
+    if !valid {
+        return Err(sqlx::Error::Protocol("rgw_episodes requires a valid non-partial unique index on (source_type, source_ref)".into()));
+    }
     Ok(())
 }
 
@@ -837,6 +881,7 @@ pub(crate) async fn save_motor_outcome(
     pool: &PgPool,
     record: &crate::motor::OutcomeRecord,
 ) -> anyhow::Result<()> {
+    episodes_outcome_schema_ready(pool).await?;
     sqlx::query("INSERT INTO rgw_episodes (occurred_at, kind, headline, detail, source_type, source_ref)
         VALUES (NOW() AT TIME ZONE 'UTC', 'motor_outcome', $1, $2, 'motor_outcome', $3)
         ON CONFLICT (source_type, source_ref) DO UPDATE SET

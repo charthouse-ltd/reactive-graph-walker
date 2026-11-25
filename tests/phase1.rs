@@ -67,3 +67,74 @@ async fn julian_node_ownership_and_foreign_keys_are_enforced() -> anyhow::Result
     assert_eq!(edges, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn outcome_schema_contract_guards_readiness_and_writes() -> anyhow::Result<()> {
+    use rgw::motor::{DispatchOutcome, MotorCommand, MotorGate, MotorMode, MotorOutcome, OutcomeError};
+    let pool = common::fixture::fixture_pool("phase1_outcome_contract").await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().route("/api/admin/rgw/execute",
+            axum::routing::post(|| async { "ok" }))).await.unwrap();
+    });
+    let gate = MotorGate::new(MotorMode::Live);
+    let id = uuid::Uuid::new_v4();
+    assert!(matches!(gate.dispatch("test", &url, MotorCommand {
+        correlation_id: id, action: "search".into(), domain: "science".into(),
+        walker_context: String::new(), expression_seeds: vec![], confidence: 0.8,
+        novelty: 0.5, search_query: None, params: None, audience_id: None,
+    }).await, DispatchOutcome::Sent(..)));
+    server.abort();
+    let mut model = rgw::core::SelfModel::new();
+    model.mode = rgw::core::CognitiveMode::Autonomous;
+    model.self_mod_stage = rgw::core::SelfModStage::SelectionLive;
+    let model = tokio::sync::Mutex::new(model);
+    let callback = MotorOutcome { correlation_id: id, outcome: "done".into(), success: Some(true), lesson: None };
+    for column in ["source_type", "source_ref"] {
+        sqlx::raw_sql(&format!("ALTER TABLE rgw_episodes RENAME COLUMN {column} TO missing_column")).execute(&pool).await?;
+        assert_eq!(rgw::api::readiness(&pool).await.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(gate.record_outcome(&pool, &model, callback.clone()).await, Err(OutcomeError::Storage(_))));
+        sqlx::raw_sql(&format!("ALTER TABLE rgw_episodes RENAME COLUMN missing_column TO {column}")).execute(&pool).await?;
+    }
+    sqlx::query("ALTER TABLE rgw_episodes DROP CONSTRAINT uq_rgw_episodes_source").execute(&pool).await?;
+    for index in [
+        "",
+        "CREATE INDEX candidate ON rgw_episodes(source_type, source_ref)",
+        "CREATE UNIQUE INDEX candidate ON rgw_episodes(source_type, source_ref) WHERE source_type = 'motor_outcome'",
+        "CREATE UNIQUE INDEX candidate ON rgw_episodes(source_type, headline)",
+        "CREATE UNIQUE INDEX candidate ON rgw_episodes(source_type, source_ref, headline)",
+        "CREATE UNIQUE INDEX candidate ON rgw_episodes(source_type) INCLUDE(source_ref)",
+        "CREATE UNIQUE INDEX candidate ON rgw_episodes(lower(source_type), source_ref)",
+        "ALTER TABLE rgw_episodes ADD CONSTRAINT candidate UNIQUE(source_type, source_ref) DEFERRABLE",
+    ] {
+        if !index.is_empty() { sqlx::raw_sql(index).execute(&pool).await?; }
+        assert_eq!(rgw::api::readiness(&pool).await.0, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{index}");
+        assert!(matches!(gate.record_outcome(&pool, &model, callback.clone()).await, Err(OutcomeError::Storage(_))), "{index}");
+        assert!(gate.snapshot()["outcomes"].as_array().unwrap().is_empty());
+        assert!(gate.consolidate_episodes().episodes.is_empty());
+        assert_eq!(model.lock().await.total_signals_processed, 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rgw_episodes").fetch_one(&pool).await?, 0);
+        sqlx::raw_sql("ALTER TABLE rgw_episodes DROP CONSTRAINT IF EXISTS candidate; DROP INDEX IF EXISTS candidate").execute(&pool).await?;
+    }
+    // A failed concurrent build leaves a real invalid index, without editing catalogs.
+    sqlx::query("INSERT INTO rgw_episodes(occurred_at, kind, headline, source_type, source_ref) VALUES (NOW(), 'test', 'test', 'test', 'duplicate'), (NOW(), 'test', 'test', 'test', 'duplicate')").execute(&pool).await?;
+    assert!(sqlx::query("CREATE UNIQUE INDEX CONCURRENTLY candidate ON rgw_episodes(source_type, source_ref)").execute(&pool).await.is_err());
+    sqlx::query("DELETE FROM rgw_episodes").execute(&pool).await?;
+    assert_eq!(rgw::api::readiness(&pool).await.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(gate.record_outcome(&pool, &model, callback.clone()).await.is_err());
+    sqlx::query("DROP INDEX candidate").execute(&pool).await?;
+    // PostgreSQL accepts reversed keys and INCLUDE columns for conflict inference.
+    sqlx::query("CREATE UNIQUE INDEX candidate ON rgw_episodes(source_ref, source_type) INCLUDE(headline)").execute(&pool).await?;
+    assert_eq!(rgw::api::readiness(&pool).await.0, axum::http::StatusCode::OK);
+    gate.record_outcome(&pool, &model, callback.clone()).await?;
+    assert_eq!(model.lock().await.total_signals_processed, 1);
+    assert_eq!(gate.snapshot()["outcomes"][0]["reflected"], true);
+    let before = gate.snapshot()["outcomes"].clone();
+    sqlx::query("DROP INDEX candidate").execute(&pool).await?;
+    let correction = MotorOutcome { outcome: "failed correction".into(), ..callback };
+    assert!(gate.record_outcome(&pool, &model, correction).await.is_err());
+    assert_eq!(gate.snapshot()["outcomes"], before, "failed correction must not replace a durable record");
+    assert_eq!(model.lock().await.total_signals_processed, 1);
+    Ok(())
+}
